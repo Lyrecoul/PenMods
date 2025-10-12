@@ -14,7 +14,7 @@
 #include <QQuickView>
 #include <QUrl>
 
-#include <lame/lame.h>
+#include <lame.h>
 
 namespace mod {
 

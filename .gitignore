@@ -2,3 +2,7 @@ build/*
 .cache
 .vscode
 .xmake
+Dobby-0.1.2/*
+LAME-3.100/*
+resource/models/YDP02X/*
+aarch64-linux-qt-5.15.2

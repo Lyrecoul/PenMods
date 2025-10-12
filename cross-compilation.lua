@@ -1,0 +1,11 @@
+-- cross-compilation.lua
+toolchain("cross-aarch64")
+set_kind("standalone")
+set_sdkdir("/usr/aarch64-linux-gnu")
+set_toolset("cc", "aarch64-linux-gnu-gcc")
+set_toolset("cxx", "aarch64-linux-gnu-g++")
+set_toolset("ld", "aarch64-linux-gnu-g++")
+set_toolset("ar", "aarch64-linux-gnu-ar")
+set_toolset("strip", "aarch64-linux-gnu-strip")
+set_toolset("ranlib", "aarch64-linux-gnu-ranlib")
+toolchain_end()

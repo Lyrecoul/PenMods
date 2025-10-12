@@ -102,6 +102,13 @@ QVariant FileManager::data(const QModelIndex& index, int role) const {
         case H("webm"):
             name = "mp4";
             break;
+        case H("png"):
+        case H("jpg"):
+        case H("jpeg"):
+        case H("gif"):
+        case H("bmp"):
+            name = "image";
+            break;
         default:
             return "qrc:/images/file-empty.png";
         }

@@ -136,6 +136,7 @@ PEN_HOOK(bool, license_verify) { return true; }
 #include "filemanager/player/MusicPlayer.h"
 #include "filemanager/player/VideoPlayer.h"
 #include "filemanager/reader/TextReader.h"
+#include "filemanager/viewer/ImageViewer.h"
 
 #include "helper/AntiEmbs.h"
 #include "helper/DeveloperSettings.h"
@@ -200,6 +201,7 @@ __attribute__((constructor)) static void BeforeMain() {
     INSTANCE(filemanager::VideoPlayer);
     INSTANCE(filemanager::TextReader);
     INSTANCE(filemanager::FileManager);
+    INSTANCE(filemanager::ImageViewer);
 
     // helper
     INSTANCE(AntiEmbs);

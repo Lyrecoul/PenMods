@@ -62,18 +62,22 @@ target("lame_lib")
     -- Fix configMS.h conflicts and copy as config.h before building
     before_build(function (target)
         os.mkdir("$(builddir)/LAME-3.100")
-        local config_content = io.readfile("$(projectdir)/LAME-3.100/configMS.h")
+        local config_path = "$(builddir)/LAME-3.100/config.h"
+        local new_content = io.readfile("$(projectdir)/LAME-3.100/configMS.h")
         -- Replace conflicting type definitions for GCC to avoid redefinition errors
-        config_content = config_content:gsub("#define int8_t signed char", "#ifndef __INT8_TYPE__\n#define int8_t signed char\n#endif")
-        config_content = config_content:gsub("#define int16_t signed short", "#ifndef __INT16_TYPE__\n#define int16_t signed short\n#endif")
-        config_content = config_content:gsub("#define int32_t signed int", "#ifndef __INT32_TYPE__\n#define int32_t signed int\n#endif")
-        config_content = config_content:gsub("#define int64_t signed long long", "#ifndef __INT64_TYPE__\n#define int64_t signed long long\n#endif")
-        config_content = config_content:gsub("#define uint8_t unsigned char", "#ifndef __UINT8_TYPE__\n#define uint8_t unsigned char\n#endif")
-        config_content = config_content:gsub("#define uint16_t unsigned short", "#ifndef __UINT16_TYPE__\n#define uint16_t unsigned short\n#endif")
-        config_content = config_content:gsub("#define uint32_t unsigned int", "#ifndef __UINT32_TYPE__\n#define uint32_t unsigned int\n#endif")
-        config_content = config_content:gsub("#define uint64_t unsigned long long", "#ifndef __UINT64_TYPE__\n#define uint64_t unsigned long long\n#endif")
-        -- Write modified config.h
-        io.writefile("$(builddir)/LAME-3.100/config.h", config_content)
+        new_content = new_content:gsub("#define int8_t signed char", "#ifndef __INT8_TYPE__\n#define int8_t signed char\n#endif")
+        new_content = new_content:gsub("#define int16_t signed short", "#ifndef __INT16_TYPE__\n#define int16_t signed short\n#endif")
+        new_content = new_content:gsub("#define int32_t signed int", "#ifndef __INT32_TYPE__\n#define int32_t signed int\n#endif")
+        new_content = new_content:gsub("#define int64_t signed long long", "#ifndef __INT64_TYPE__\n#define int64_t signed long long\n#endif")
+        new_content = new_content:gsub("#define uint8_t unsigned char", "#ifndef __UINT8_TYPE__\n#define uint8_t unsigned char\n#endif")
+        new_content = new_content:gsub("#define uint16_t unsigned short", "#ifndef __UINT16_TYPE__\n#define uint16_t unsigned short\n#endif")
+        new_content = new_content:gsub("#define uint32_t unsigned int", "#ifndef __UINT32_TYPE__\n#define uint32_t unsigned int\n#endif")
+        new_content = new_content:gsub("#define uint64_t unsigned long long", "#ifndef __UINT64_TYPE__\n#define uint64_t unsigned long long\n#endif")
+
+        -- Only write the file if it doesn't exist or the content has changed
+        if not os.isfile(config_path) or io.readfile(config_path) ~= new_content then
+            io.writefile(config_path, new_content)
+        end
     end)
     add_defines("HAVE_CONFIG_H", "LAME_LIBRARY_BUILD", "STDC_HEADERS", "HAVE_ERRNO_H", "HAVE_FCNTL_H", "HAVE_LIMITS_H")
     add_cxflags("-w") -- Suppress warnings from LAME source

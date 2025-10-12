@@ -2,6 +2,38 @@
 
 > 这里是 PenMods 的发布仓库。
 
+## Building
+
+### Requirements
+
+- Linux 环境
+- 安装 [编译器](https://github.com/Redbeanw44602/aarch64-linux-gnu-gcc-6.5.0)，Archlinux 系列发行版可以直接安装，其它系统需要自行解压和部署到系统 PATH 环境变量
+- 部署 [Qt 开发框架](https://github.com/Redbeanw44602/aarch64-linux-qt-5.15.2)，需要参考 README 中的方法
+- 安装 xmake、git 等必须开发环境
+
+### External
+
+- [Dobby-0.1.2](https://github.com/Redbeanw44602/Dobby)
+- [LAME-3.100](https://github.com/despoa/LAME)
+
+
+### Xmake
+```shell
+# 配置 xmake
+xmake f --qt="/home/lyrecoul/PenMods/aarch64-linux-qt-5.15.2" --arch=arm64-v8a --build-platform=YDP02X --target-channel=stable --toolchain=cross-aarch64 # 等价于 xmake config ...
+xmake config --menu #（可选）xmake 图形化配置菜单，可以进一步微调各种编译选项
+
+# 编译项目
+xmake build # 开始编译所有目标
+xmake build -v PenMods # 只编译 PenMods lib（启用 -v 选项输出详细编译过程信息）
+xmake build QrcExporter # 编译 Qrc 资源导出模块
+xmake build dobby_lib # 编译 Dobby 静态链接库
+xmake build lame_lib # 编译 LAME 静态链接库
+
+# 其它
+xmake clean # 清理编译产物
+```
+
 ### Supported
  - 设备支持情况
  - 对于同代（按屏幕大小区分代）但不同发行版本较多的笔，不一一适配，仅适配功能最多的型号

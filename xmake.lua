@@ -32,12 +32,9 @@ option('target-channel')
 
 -- Define LAME library target
 target("lame_lib")
-    set_kind("static")
+    set_kind("shared")
     add_includedirs("LAME-3.100/include", {public = true})
     add_includedirs("$(builddir)/LAME-3.100", {public = true}) -- For config.h
-
-    -- Ensure -fPIC is used when this static lib may be linked into a shared library
-    add_cflags("-fPIC")
 
     add_files("LAME-3.100/libmp3lame/bitstream.c")
     add_files("LAME-3.100/libmp3lame/encoder.c")
@@ -214,17 +211,6 @@ target('PenMods')
     set_configdir('$(builddir)/config')
     add_configfiles('src/mod/Version.h.in')
     set_configvar('TARGET_CHANNEL', get_config('target-channel'))
-    
-    set_toolset("sh", "aarch64-linux-gnu-g++")
-
-    -- Verify toolchain binary names before building
-    -- before_build(function (target)
-    -- print("=== PenMods Toolchain Verification ===")
-    -- print("CC:", target:tool("cc"))
-    -- print("CXX:", target:tool("cxx"))
-    -- print("LD:", target:tool("ld"))
-    -- print("SH:", target:tool("sh"))
-    -- end)
 
     if is_mode('release') then
         if is_config('target-channel', 'priv') then
@@ -264,14 +250,3 @@ target('QrcExporter')
     set_warnings('all')
     set_languages('cxx14', 'c99')
     set_exceptions('cxx')
-
-    set_toolset("sh", "aarch64-linux-gnu-g++")
-
-    -- Verify toolchain binary names before building
-    -- before_build(function (target)
-    -- print("=== QrcExporter Toolchain Verification ===")
-    -- print("CC:", target:tool("cc"))
-    -- print("CXX:", target:tool("cxx"))
-    -- print("LD:", target:tool("ld"))
-    -- print("SH:", target:tool("sh"))
-    -- end)

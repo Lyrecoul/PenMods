@@ -1,7 +1,9 @@
 includes("cross-compilation.lua")
 
+add_rules('mode.release', 'mode.debug')
+
 add_requires('spdlog        1.15.3')
-add_requires('elfio         3.12')
+add_requires('elfio         3.11')
 add_requires('nlohmann_json 3.12.0')
 add_requires('boost         1.88.0')
 add_requires('dobby         2023.4.14')
@@ -83,6 +85,7 @@ target('PenMods')
     add_includedirs(
         'src',
         'src/base',
+        'thirdparty/include',
         '$(buildir)/config')
     add_links(
         -- crypt, src/helper/ServiceManager.cpp
@@ -98,7 +101,7 @@ target('PenMods')
     end)
     
 target('QrcExporter')
-    add_rules("qt.shared")
+    add_rules('qt.shared')
     add_files('resource/exporter/**.cpp')
     add_packages(
         'spdlog',

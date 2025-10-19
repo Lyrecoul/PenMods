@@ -107,6 +107,8 @@ QVariant FileManager::data(const QModelIndex& index, int role) const {
         case H("jpeg"):
         case H("gif"):
         case H("bmp"):
+        case H("svg"):
+        case H("ico"):
             name = "image";
             break;
         default:

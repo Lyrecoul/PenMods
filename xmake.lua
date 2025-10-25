@@ -1,5 +1,3 @@
-includes("cross-compilation.lua")
-
 add_rules('mode.release', 'mode.debug')
 
 add_requires('spdlog        1.15.3')
@@ -9,7 +7,7 @@ add_requires('dobby         2023.4.14')
 add_requires('lame          3.100', {
     -- DictPen's buildroot exists lame v3.100,
     -- so we use it as a shared library.
-    configs = {shared = true}
+    configs = {shared = false}
 })
 
 --- options

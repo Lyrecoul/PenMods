@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #pragma once
 
 class QString;
@@ -9,7 +15,7 @@ namespace mod {
 std::string exec(const char* cmd);
 std::string exec(const QString& cmd);
 
-double dec(double d, ushort n);
+double dec(double d, uint16 n);
 
 constexpr uint32 H(const char* str, int h = 0) { return !str[h] ? 5381 : (H(str, h + 1) * 33) ^ str[h]; }
 

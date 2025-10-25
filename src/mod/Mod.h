@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #pragma once
 
 namespace mod {
@@ -13,7 +19,7 @@ class Mod : public QObject, public Singleton<Mod> {
 
     Q_PROPERTY(bool trustedDevice READ isTrustedDevice);
     Q_PROPERTY(QString version READ getVersionStr);
-    Q_PROPERTY(uint cachedSymCount READ getCachedSymCount);
+    Q_PROPERTY(uint32 cachedSymCount READ getCachedSymCount);
     Q_PROPERTY(QString buildInfo READ getBuildInfoStr)
 
 public:
@@ -42,8 +48,6 @@ private:
     explicit Mod();
 
     std::string mClassName = "mod";
-
-    bool mTrustedDevice = false;
 };
 
 } // namespace mod

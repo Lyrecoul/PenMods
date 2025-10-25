@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #pragma once
 
 #include "mod/Config.h"
@@ -68,7 +74,7 @@ private:
 
     void _passAdbVerification();
 
-    std::string _getRandomString(uint length);
+    std::string _getRandomString(uint32 length);
 };
 
 } // namespace mod

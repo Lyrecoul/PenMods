@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #include "system/battery/BatteryInfo.h"
 #include "system/input/InputDaemon.h"
 
@@ -5,7 +11,7 @@
 
 #include <QQmlContext>
 
-#ifdef DICTPEN_YDP02X
+#if PL_BUILD_YDP02X
 constexpr auto DESIGN_BATTERY_FULL = 1000.0;
 #endif
 
@@ -117,7 +123,7 @@ void BatteryInfo::update() {
     setPrediction(type, duration);
 }
 
-uint BatteryInfo::getAutoSuspendDuration() const { return mAutoSuspendDuration; }
+uint32 BatteryInfo::getAutoSuspendDuration() const { return mAutoSuspendDuration; }
 
 QString BatteryInfo::getAutoSuspendDurationStr() const {
     if (mAutoSuspendDuration == 0) {
@@ -127,7 +133,7 @@ QString BatteryInfo::getAutoSuspendDurationStr() const {
 }
 
 void BatteryInfo::setAutoSuspendDurationStr(const QString& str) {
-    uint val = 600;
+    uint32 val = 600;
     if (str == "永不") {
         val = 0;
     } else if (str.contains("分")) {

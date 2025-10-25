@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #pragma once
 
 enum class ASRState : int { AsrIdle, AsrBegin, AsrEnd, QueryBeign, QueryEnd, InternetError };
@@ -41,7 +47,7 @@ struct WifiStatus {
 
 static_assert(sizeof(WifiStatus) == 0x208, "wrong size");
 
-#ifdef DICTPEN_YDP02X
+#if PL_BUILD_YDP02X
 
 enum DictPenFeature : int32_t {
     VERSION_PRO     = 0x0,

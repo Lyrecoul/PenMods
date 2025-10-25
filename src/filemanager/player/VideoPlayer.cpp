@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #include "filemanager/player/VideoPlayer.h"
 
 #include "filemanager/FileManager.h"
@@ -7,13 +13,13 @@
 
 #include <QQmlContext>
 
-FILEMANAGER_BEGIN
+namespace mod::filemanager {
 
 VideoPlayer::VideoPlayer() {
     connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView& view, QQmlContext* context) {
         context->setContextProperty("videoPlayer", this);
     });
-}
+} // namespace mod::filemanager
 
 void VideoPlayer::open(QString dir) { mOpeningFileName = std::move(dir); }
 
@@ -36,5 +42,4 @@ void VideoPlayer::onStatusChanged(const QString& status) {
         break;
     }
 }
-
-FILEMANAGER_END
+} // namespace mod::filemanager

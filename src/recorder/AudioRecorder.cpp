@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #include "recorder/AudioRecorder.h"
 
 #include "base/YPointer.h"
@@ -6,6 +12,8 @@
 #include "common/Utils.h"
 
 #include "system/input/InputDaemon.h"
+
+#include "Version.h"
 
 #include <QAudio>
 #include <QAudioDeviceInfo>
@@ -70,7 +78,7 @@ bool AudioRecorder::start() {
     // Init audio format.
     QAudioFormat format;
     format.setSampleRate(16000);
-#ifdef DICTPEN_YDP02X
+#if PL_BUILD_YDP02X
     format.setChannelCount(2);
 #endif
     format.setSampleSize(16);
@@ -198,30 +206,30 @@ bool AudioRecorder::isWorking() { return mInputAudio != nullptr; }
 
 } // namespace mod
 
-#if !QEMU
+#if !PL_QEMU
 
-PEN_HOOK(uint, _ZN12YSoundCenter4playERK7QStringS2_S2_i, void* self, void* a2, void* a3, void* a4, void* a5) {
+PEN_HOOK(uint32, _ZN12YSoundCenter4playERK7QStringS2_S2_i, void* self, void* a2, void* a3, void* a4, void* a5) {
     if (mod::AudioRecorder::getInstance().isWorking()) {
         return (*(uint32*)PEN_SYM("g_playSeq"))++;
     }
     return origin(self, a2, a3, a4, a5);
 }
 
-PEN_HOOK(uint, _ZN12YSoundCenter8playFileERK7QString, void* self, void* a2) {
+PEN_HOOK(uint32, _ZN12YSoundCenter8playFileERK7QString, void* self, void* a2) {
     if (mod::AudioRecorder::getInstance().isWorking()) {
         return (*(uint32*)PEN_SYM("g_playSeq"))++;
     }
     return origin(self, a2);
 }
 
-PEN_HOOK(uint, _ZN12YSoundCenter12playFileDataERK7QString, void* self, QString* a2) {
+PEN_HOOK(uint32, _ZN12YSoundCenter12playFileDataERK7QString, void* self, QString* a2) {
     if (mod::AudioRecorder::getInstance().isWorking()) {
         return (*(uint32*)PEN_SYM("g_playSeq"))++;
     }
     return origin(self, a2);
 }
 
-PEN_HOOK(uint, _ZN12YSoundCenter9playMusicERK7QStringxd, void* self, void* a2, void* a3, void* a4) {
+PEN_HOOK(uint32, _ZN12YSoundCenter9playMusicERK7QStringxd, void* self, void* a2, void* a3, void* a4) {
     if (mod::AudioRecorder::getInstance().isWorking()) {
         return (*(uint32*)PEN_SYM("g_playSeq"))++;
     }

@@ -1,9 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #include "System.h"
 
 #include <dlfcn.h>
 #include <unistd.h>
 
-MOD_UTIL_BEGIN
+namespace mod::util {
 
 QFileInfo getModuleFileInfo() {
     Dl_info info;
@@ -17,4 +23,4 @@ QFileInfo getApplicationFileInfo() {
     return QFileInfo(path);
 }
 
-MOD_UTIL_END
+} // namespace mod::util

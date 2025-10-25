@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #include "filemanager/player/MusicPlayer.h"
 
 #include "base/YPointer.h"
@@ -8,11 +14,9 @@
 #include <QQmlContext>
 #include <QRandomGenerator>
 
-#include <boost/optional.hpp>
-
 #define PLAYER_FAKE_COLUMN_ID ("fake_column_hsxjsbw")
 
-FILEMANAGER_BEGIN
+namespace mod::filemanager {
 
 bool MusicPlayer::mIsTakeOver{false};
 
@@ -108,7 +112,7 @@ void MusicPlayer::_play(const std::shared_ptr<QFileInfo>& file) {
 
 void MusicPlayer::clickNext() {
     int64 pos = 0;
-    PEN_CALL(void*, "_ZN19YMediaPlayerManager13setCurrentPosERKx", void*, llong const&)
+    PEN_CALL(void*, "_ZN19YMediaPlayerManager13setCurrentPosERKx", void*, int64 const&)
     (YPointer<YMediaPlayerManager>::getInstance(), pos);
     PEN_CALL(void*, "_ZN19YMediaPlayerManager11closeRepeatEv", void*)(YPointer<YMediaPlayerManager>::getInstance());
     if (mPlayList.empty()) return;
@@ -135,9 +139,9 @@ void MusicPlayer::clickRand() {
     (YPointer<YMediaPlayerManager>::getInstance(), &pos);
     PEN_CALL(void*, "_ZN19YMediaPlayerManager11closeRepeatEv", void*)(YPointer<YMediaPlayerManager>::getInstance());
     if (mPlayList.empty()) return;
-    boost::optional<size_t> newIdx;
+    std::optional<size_t> newIdx;
     while (!newIdx) {
-        uint switched = QRandomGenerator::global()->bounded((int)mPlayList.size()); // safe, limited by fm.
+        uint32 switched = QRandomGenerator::global()->bounded((int)mPlayList.size()); // safe, limited by fm.
         if (mCurrentPlaying.mIndex != switched || mPlayList.size() == 1) {
             newIdx = switched;
             break;
@@ -159,8 +163,8 @@ void MusicPlayer::onSoundEnd() {
         play(mCurrentPlaying.mIndex);
         break;
     case AudioSequence::SINGLE_SHOT:
-        auto state                                                                   = PlayState::STOPPED;
-        *(uint*)(*((uint64*)YPointer<YMediaPlayerManager>::getInstance() + 4) + 100) = 0;
+        auto state                                                                     = PlayState::STOPPED;
+        *(uint32*)(*((uint64*)YPointer<YMediaPlayerManager>::getInstance() + 4) + 100) = 0;
         PEN_CALL(void*, "_ZN19YMediaPlayerManager12setPlayStateERKN12YEnumWrapper10Play_StateE", void*, void*)
         (YPointer<YMediaPlayerManager>::getInstance(), &state);
         break;
@@ -172,8 +176,7 @@ AudioSequence MusicPlayer::getCurrentAudioSequence() {
         YPointer<YSettingManager>::getInstance()
     );
 }
-
-FILEMANAGER_END
+} // namespace mod::filemanager
 
 // Hooks
 
@@ -198,9 +201,9 @@ PEN_HOOK(uint64, _ZN19YMediaPlayerManager13onClickedNextEb, void* self, bool a2)
     return 0;
 }
 
-PEN_HOOK(void*, _ZN19YMediaPlayerManager10onSoundEndEj, void* self, uint a2) {
+PEN_HOOK(void*, _ZN19YMediaPlayerManager10onSoundEndEj, void* self, uint32 a2) {
     if (!MusicPlayer::mIsTakeOver) return origin(self, a2);
-    if (*(uint *)(*((uint64 *)self + 4) + 100) == a2 // Is current sequence equal?
+    if (*(uint32 *)(*((uint64 *)self + 4) + 100) == a2 // Is current sequence equal?
             && PEN_CALL(PlayState, "_ZNK19YMediaPlayerManager9playStateEv",
                 void*)(self) == PlayState::PLAYING) // Is in `Playing` state? To prevent unexcept onSoundEnd...
         MusicPlayer::getInstance().onSoundEnd();

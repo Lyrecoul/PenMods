@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #pragma once
 
 #include "common/Utils.h"
@@ -24,7 +30,7 @@ class BatteryInfo : public QObject, public Singleton<BatteryInfo> {
 public:
     Q_INVOKABLE void update();
 
-    uint getAutoSuspendDuration() const;
+    uint32 getAutoSuspendDuration() const;
 
     QString getStatus() const;
 
@@ -52,7 +58,7 @@ public:
 
     void setCurrent(const QString&);
 
-    // auto str -> uint typed.
+    // auto str -> uint32 typed.
     void setAutoSuspendDurationStr(const QString&);
 
 signals:
@@ -95,7 +101,7 @@ private:
         QString duration;
     } mPrediction;
 
-    uint mAutoSuspendDuration;
+    uint32 mAutoSuspendDuration;
 };
 
 } // namespace mod

@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #include "filemanager/FileManager.h"
 #include "filemanager/player/MusicPlayer.h"
 
@@ -15,7 +21,7 @@
 #include <QTimer>
 #include <QUrl>
 
-FILEMANAGER_BEGIN
+namespace mod::filemanager {
 
 static const char* HIDDEN_FLAG = ".HIDDEN_DIR";
 static size_t      MAX_FILES   = 65535;
@@ -446,8 +452,7 @@ void FileManager::refreshPlayList() {
         }
     });
 }
-
-FILEMANAGER_END
+} // namespace mod::filemanager
 
 PEN_HOOK(void, _ZN13YMediaManager13entryMyImportEv, uint64) {}
 

@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #pragma once
 
 namespace mod {
@@ -13,7 +19,7 @@ public:
 protected:
     explicit Logger(const std::string& name) : logger(name) {
         sinks().emplace_back(_getLoggingSink());
-        // #ifdef DEBUG
+        // #ifdef PL_DEBUG
         set_level(spdlog::level::debug);
         // #endif
         set_pattern("[%H:%M:%S.%e] [%n] [%l] %v");

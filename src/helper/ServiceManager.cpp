@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #include "ServiceManager.h"
 
 #include "common/Event.h"
@@ -160,11 +166,11 @@ bool ServiceManager::setSshRootPasswd(const QString& val) {
 
 void ServiceManager::_passAdbVerification() { exec("touch /tmp/.adb_auth_verified"); }
 
-std::string ServiceManager::_getRandomString(uint length) {
+std::string ServiceManager::_getRandomString(uint32 length) {
     auto*       generator = QRandomGenerator::global();
     const char* sigs      = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     std::string ret;
-    for (uint i = 0; i < length; i++) {
+    for (uint32 i = 0; i < length; i++) {
         ret += sigs[generator->bounded(26 * 2)];
     }
     return ret;

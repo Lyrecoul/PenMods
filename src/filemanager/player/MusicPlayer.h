@@ -1,14 +1,18 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #pragma once
 
 #include "base/YEnum.h"
 
 #include "common/service/Logger.h"
 
-#include "filemanager/Config.h"
-
 #include <QDir>
 
-FILEMANAGER_BEGIN
+namespace mod::filemanager {
 
 using PlayFile = std::shared_ptr<QFileInfo>;
 using PlayList = std::vector<PlayFile>;
@@ -53,5 +57,4 @@ private:
 
     void _play(const PlayFile& file);
 };
-
-FILEMANAGER_END
+} // namespace mod::filemanager

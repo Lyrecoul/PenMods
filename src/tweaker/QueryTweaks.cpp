@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #include "tweaker/QueryTweaks.h"
 
 #include "common/Event.h"
@@ -42,7 +48,7 @@ void QueryTweaks::setTypeByHand(bool val) {
 
 } // namespace mod
 
-#ifdef DICTPEN_YDP02X
+#if PL_BUILD_YDP02X
 PEN_HOOK(
     uint64,
     _ZN14YResultManager11entryResultERK7QStringS2_S2_N12YEnumWrapper9PageIndexEib,

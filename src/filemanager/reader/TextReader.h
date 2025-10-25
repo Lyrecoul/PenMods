@@ -1,8 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #pragma once
 
-#include "filemanager/Config.h"
-
-FILEMANAGER_BEGIN
+namespace mod::filemanager {
 
 class TextReader : public QObject, public Singleton<TextReader> {
     Q_OBJECT
@@ -26,6 +30,5 @@ private:
 
     QString mOpeningFileName;
     QString mContent;
-};
-
-FILEMANAGER_END
+}; // namespace mod::filemanager
+} // namespace mod::filemanager

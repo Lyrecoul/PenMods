@@ -1,10 +1,10 @@
-#pragma once
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
 
-using ushort = unsigned short;
-using uint   = unsigned int;
-using ulong  = unsigned long;
-using llong  = long long;
-using ullong = unsigned long long;
+#pragma once
 
 using uchar = unsigned char;
 using schar = signed char;

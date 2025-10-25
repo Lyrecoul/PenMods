@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #include "filemanager/reader/TextReader.h"
 #include "filemanager/FileManager.h"
 
@@ -6,13 +12,13 @@
 #include <QFile>
 #include <QQmlContext>
 
-FILEMANAGER_BEGIN
+namespace mod::filemanager {
 
 TextReader::TextReader() {
     connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView& view, QQmlContext* context) {
         context->setContextProperty("textReader", this);
     });
-}
+} // namespace mod::filemanager
 
 void TextReader::open(QString dir) { mOpeningFileName = std::move(dir); }
 
@@ -29,5 +35,4 @@ QString TextReader::getContent() {
 }
 
 QString TextReader::getTitle() { return mOpeningFileName; }
-
-FILEMANAGER_END
+} // namespace mod::filemanager

@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #include "torch/Torch.h"
 
 #include "common/Event.h"
@@ -5,7 +11,7 @@
 
 #include <QQmlContext>
 
-#ifdef DICTPEN_YDP02X
+#if PL_BUILD_YDP02X
 constexpr auto LED_DEFAULT_GPIO_ID = 15;
 #endif
 
@@ -22,12 +28,12 @@ bool Torch::getStatus() { return exec(QString("cat /sys/class/gpio/gpio%1/value"
 void Torch::setStatus(bool stat) {
     if (getStatus() != stat) {
         if (stat) {
-#ifdef DICTPEN_YDP02X
-            PEN_CALL(void*, "led_on", uint)(LED_DEFAULT_GPIO_ID);
+#if PL_BUILD_YDP02X
+            PEN_CALL(void*, "led_on", uint32)(LED_DEFAULT_GPIO_ID);
 #endif
         } else {
-#ifdef DICTPEN_YDP02X
-            PEN_CALL(void*, "led_off", uint)(LED_DEFAULT_GPIO_ID);
+#if PL_BUILD_YDP02X
+            PEN_CALL(void*, "led_off", uint32)(LED_DEFAULT_GPIO_ID);
 #endif
         }
         emit statusChanged();

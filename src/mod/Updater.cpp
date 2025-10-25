@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
 #include "Updater.h"
 
 #include "base/YPointer.h"
@@ -14,7 +20,7 @@
 #define UH_TEMP_PATH    "/tmp/modupdate/"
 #define UH_TEMP_DIRNAME "modupdate"
 
-#ifdef DICTPEN_YDP02X
+#if PL_BUILD_YDP02X
 #define UH_MAIN_URL "https://dictpen-backend.0xffffffffffffffff.xyz/"
 #endif
 
@@ -32,7 +38,7 @@ QString Version::toString() const {
     return QString("%1.%2.%3").arg(QString::number(mMajor), QString::number(mMinor), QString::number(mRevision));
 }
 
-uint Version::toNumber() const { return mMajor * 100 + mMinor * 10 + mRevision; }
+uint32 Version::toNumber() const { return mMajor * 100 + mMinor * 10 + mRevision; }
 
 bool Version::operator==(const Version b) const {
     return mMajor == b.mMajor && mMinor == b.mMinor && mRevision == b.mRevision;
@@ -45,7 +51,7 @@ bool Version::operator<(const Version b) const { return toNumber() < b.toNumber(
 void Updater::check() {
 
     info("Starting to check update...");
-    auto power = PEN_CALL(uint, "_ZN15YBatteryManager5powerEv", void*)(YPointer<YBatteryManager>::getInstance());
+    auto power = PEN_CALL(uint32, "_ZN15YBatteryManager5powerEv", void*)(YPointer<YBatteryManager>::getInstance());
     if (power < 10) {
         error("Checking for updates stalled: Low battery.");
         _setOtaStatus(ERROR_LOW_BATTERY);

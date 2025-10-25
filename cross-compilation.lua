@@ -1,12 +1,20 @@
 -- cross-compilation.lua
 toolchain("cross-aarch64")
 set_kind("standalone")
-set_sdkdir("/usr/aarch64-linux-gnu")
-set_toolset("cc", "aarch64-linux-gnu-gcc")
-set_toolset("cxx", "aarch64-linux-gnu-g++")
-set_toolset("ld", "aarch64-linux-gnu-g++")
-set_toolset("sh", "aarch64-linux-gnu-g++")
-set_toolset("ar", "aarch64-linux-gnu-ar")
-set_toolset("strip", "aarch64-linux-gnu-strip")
-set_toolset("ranlib", "aarch64-linux-gnu-ranlib")
+
+-- Use Zig for cross-compilation
+set_toolset("cc", "zig cc")
+set_toolset("cxx", "zig c++")
+set_toolset("ld", "zig c++")
+set_toolset("sh", "zig c++")
+set_toolset("ar", "zig ar")
+set_toolset("ranlib", "zig ranlib")
+set_toolset("strip", "zig strip")
+
+-- Specify target triple for aarch64 Linux
+add_cxflags("--target=aarch64-linux-gnu")
+add_cxxflags("--target=aarch64-linux-gnu")
+add_ldflags("--target=aarch64-linux-gnu")
+add_shflags("--target=aarch64-linux-gnu")
+
 toolchain_end()

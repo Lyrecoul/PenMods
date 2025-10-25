@@ -7,3 +7,4 @@ LAME-3.100
 resource/models/YDP02X
 aarch64-linux-qt-5.15.2
 compile_commands.json
+xmake

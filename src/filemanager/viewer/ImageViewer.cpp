@@ -1,12 +1,12 @@
 #include "filemanager/viewer/ImageViewer.h"
-#include "filemanager/Config.h"
+
 #include "filemanager/FileManager.h"
 
 #include "common/Event.h"
 
 #include <QQmlContext>
 
-FILEMANAGER_BEGIN
+namespace mod::filemanager {
 
 ImageViewer::ImageViewer(QObject *parent) : QObject(parent) {
     connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView &view, QQmlContext *context) {
@@ -25,4 +25,4 @@ void ImageViewer::open(const QString &path) {
     emit sourceChanged();
 }
 
-FILEMANAGER_END
+} // namespace mod::filemanager

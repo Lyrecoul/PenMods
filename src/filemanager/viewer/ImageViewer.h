@@ -1,8 +1,6 @@
 #pragma once
 
-#include "filemanager/Config.h"
-
-FILEMANAGER_BEGIN
+namespace mod::filemanager {
 
 class ImageViewer : public QObject, public Singleton<ImageViewer> {
     Q_OBJECT
@@ -23,4 +21,4 @@ private:
     QString m_openingFileName;
 };
 
-FILEMANAGER_END
+} // namespace mod::filemanager

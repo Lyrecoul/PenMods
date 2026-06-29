@@ -77,6 +77,8 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
     Q_PROPERTY(bool tavilyEnabled READ getTavilyEnabled WRITE setTavilyEnabled NOTIFY tavilyConfigChanged)
     Q_PROPERTY(bool tavilyConfigured READ getTavilyConfigured NOTIFY tavilyConfigChanged)
 
+    Q_PROPERTY(bool shellToolEnabled READ getShellToolEnabled WRITE setShellToolEnabled NOTIFY shellToolConfigChanged)
+
 public:
     // 基础接口
     Q_INVOKABLE void    sendMessage(const QString& message, const QString& fileRefs = QString());
@@ -94,6 +96,12 @@ public:
 
     // Tool Call 接口
     Q_INVOKABLE void submitToolResult(const QString& toolCallId, const QString& toolName, const QString& result);
+
+    // Shell Tool 接口
+    Q_INVOKABLE void    approveShellCommand(const QString& toolCallId);
+    Q_INVOKABLE void    denyShellCommand(const QString& toolCallId);
+    Q_INVOKABLE QString getShellToolConfig();
+    Q_INVOKABLE void    setShellToolConfig(const QString& configJson);
 
     // 多会话管理
     Q_INVOKABLE QString      getSessions();
@@ -142,6 +150,9 @@ public:
     bool getTavilyConfigured() const { return !m_tavilyApiKey.isEmpty(); }
     void setTavilyEnabled(bool v);
 
+    bool getShellToolEnabled() const { return m_shellToolEnabled; }
+    void setShellToolEnabled(bool v);
+
     void setApiKey(const QString& key);
     void setApiEndpoint(const QString& endpoint);
     void setModel(const QString& model);
@@ -173,6 +184,12 @@ signals:
     void tavilySearchStarted(const QString& toolCallId, const QString& query);
     void
     tavilySearchFinished(const QString& toolCallId, bool success, const QString& summary, const QString& resultText);
+    void shellToolConfigChanged();
+    void shellCommandPending(const QString& toolCallId, const QString& command);
+    void shellCommandStarted(const QString& toolCallId, const QString& command);
+    void
+    shellCommandFinished(const QString& toolCallId, bool success, const QString& summary, const QString& resultText);
+    void toolBatchFlushed();
 
 private:
     friend Singleton<ChatBot>;
@@ -251,6 +268,35 @@ private:
     void injectToolDefinitions(QJsonObject& requestBody);
     void dispatchToolCalls(const QString& toolCallsJson);
     void executeTavilySearch(const QString& toolCallId, const QString& query);
+
+    // Shell tool
+    bool        m_shellToolEnabled   = false;
+    int         m_shellToolTimeoutMs = 10000;
+    int         m_shellToolMaxOutput = 4096;
+    QStringList m_shellToolBlocklist;
+
+    struct PendingShellExec {
+        QString toolCallId;
+        QString command;
+    };
+    QVector<PendingShellExec> m_pendingShellExecs;
+
+    void    initShellTool();
+    bool    isCommandBlocked(const QString& command);
+    void    executeShellCommand(const QString& toolCallId, const QString& command);
+    QString truncateOutput(const QString& output, int maxBytes);
+
+    // 批量 tool result 收集（多个 tool_calls 时，等全部完成后统一提交）
+    struct ToolCallEntry {
+        QString id;
+        QString name;
+        bool    resolved = false;
+        QString result;
+    };
+    QVector<ToolCallEntry> m_toolCallBatch;
+
+    void submitToolResultBatched(const QString& toolCallId, const QString& toolName, const QString& result);
+    void tryFlushToolBatch();
 };
 
 } // namespace mod::chatbot

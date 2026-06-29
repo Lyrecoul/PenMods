@@ -22,6 +22,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QNetworkReply>
+#include <QProcess>
 #include <QQmlContext>
 #include <QRegularExpression>
 #include <QTextDocument>
@@ -76,6 +77,7 @@ ChatBot::ChatBot()
     initModels();
     initPrompts();
     initTavily();
+    initShellTool();
     initSessions();
 }
 
@@ -97,6 +99,7 @@ void ChatBot::reloadConfig() {
     initModels();
     initPrompts();
     initTavily();
+    initShellTool();
 
     emit apiKeyChanged();
     emit apiEndpointChanged();
@@ -124,6 +127,7 @@ void ChatBot::sanitizeConfig() {
     initModels();
     initPrompts();
     initTavily();
+    initShellTool();
 
     emit apiKeyChanged();
     emit apiEndpointChanged();
@@ -520,6 +524,50 @@ void ChatBot::submitToolResult(const QString& toolCallId, const QString& toolNam
     makeApiRequest(apiMessages);
 }
 
+void ChatBot::submitToolResultBatched(const QString& toolCallId, const QString& toolName, const QString& result) {
+    for (auto& entry : m_toolCallBatch) {
+        if (entry.id == toolCallId) {
+            entry.resolved = true;
+            entry.result   = result;
+            break;
+        }
+    }
+    tryFlushToolBatch();
+}
+
+void ChatBot::tryFlushToolBatch() {
+    for (const auto& entry : m_toolCallBatch) {
+        if (!entry.resolved) return;
+    }
+
+    // 所有 tool call 都已完成，按顺序提交结果
+    for (const auto& entry : m_toolCallBatch) {
+        MessageData toolMsg;
+        toolMsg.role       = "tool";
+        toolMsg.toolCallId = entry.id;
+        toolMsg.content    = entry.result;
+        currentMessages().append(toolMsg);
+        if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
+    }
+    m_toolCallBatch.clear();
+
+    QJsonArray  apiMessages;
+    QJsonObject sysMsg;
+    sysMsg["role"]    = "system";
+    sysMsg["content"] = m_defaultPrompt;
+    apiMessages.append(sysMsg);
+    for (const auto& msg : currentMessages()) {
+        apiMessages.append(messageToJson(msg));
+    }
+
+    m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+    saveSessions();
+    emit messagesChanged();
+    emit toolBatchFlushed();
+
+    makeApiRequest(apiMessages);
+}
+
 // -----------------------------------------------------------------------
 // makeApiRequest：构建请求体并发送
 // -----------------------------------------------------------------------
@@ -550,8 +598,8 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
         }
     }
 
-    // 注入 Tavily 工具定义
-    if (m_capToolCall && m_tavilyEnabled && !m_tavilyApiKey.isEmpty()) {
+    // 注入工具定义
+    if (m_capToolCall && ((m_tavilyEnabled && !m_tavilyApiKey.isEmpty()) || m_shellToolEnabled)) {
         injectToolDefinitions(requestBody);
     }
 
@@ -1498,31 +1546,64 @@ void ChatBot::setTavilyConfig(const QString& configJson) {
 }
 
 void ChatBot::injectToolDefinitions(QJsonObject& requestBody) {
-    QJsonObject funcParam;
-    funcParam["type"] = "object";
+    QJsonArray tools;
 
-    QJsonObject queryProp;
-    queryProp["type"]        = "string";
-    queryProp["description"] = "The search query in the user's language";
+    if (m_tavilyEnabled && !m_tavilyApiKey.isEmpty()) {
+        QJsonObject funcParam;
+        funcParam["type"] = "object";
 
-    QJsonObject properties;
-    properties["query"] = queryProp;
+        QJsonObject queryProp;
+        queryProp["type"]        = "string";
+        queryProp["description"] = "The search query in the user's language";
 
-    funcParam["properties"] = properties;
-    funcParam["required"]   = QJsonArray({"query"});
+        QJsonObject properties;
+        properties["query"] = queryProp;
 
-    QJsonObject func;
-    func["name"]        = "tavily_search";
-    func["description"] = "Search the web for up-to-date information. Use when the user asks about current events, "
-                          "recent facts, or anything outside your training data.";
-    func["parameters"] = funcParam;
+        funcParam["properties"] = properties;
+        funcParam["required"]   = QJsonArray({"query"});
 
-    QJsonObject tool;
-    tool["type"]     = "function";
-    tool["function"] = func;
+        QJsonObject func;
+        func["name"]        = "tavily_search";
+        func["description"] = "Search the web for up-to-date information. Use when the user asks about current events, "
+                              "recent facts, or anything outside your training data.";
+        func["parameters"]  = funcParam;
 
-    requestBody["tools"]       = QJsonArray({tool});
-    requestBody["tool_choice"] = "auto";
+        QJsonObject tool;
+        tool["type"]     = "function";
+        tool["function"] = func;
+        tools.append(tool);
+    }
+
+    if (m_shellToolEnabled) {
+        QJsonObject funcParam;
+        funcParam["type"] = "object";
+
+        QJsonObject commandProp;
+        commandProp["type"]        = "string";
+        commandProp["description"] = "The shell command to execute (runs via /bin/sh -c)";
+
+        QJsonObject properties;
+        properties["command"] = commandProp;
+
+        funcParam["properties"] = properties;
+        funcParam["required"]   = QJsonArray({"command"});
+
+        QJsonObject func;
+        func["name"]        = "shell_exec";
+        func["description"] = "Execute a shell command on the user's Linux device. Requires user approval. "
+                              "Use for file operations, system queries, diagnostics, package management, etc.";
+        func["parameters"]  = funcParam;
+
+        QJsonObject tool;
+        tool["type"]     = "function";
+        tool["function"] = func;
+        tools.append(tool);
+    }
+
+    if (!tools.isEmpty()) {
+        requestBody["tools"]       = tools;
+        requestBody["tool_choice"] = "auto";
+    }
 }
 
 void ChatBot::dispatchToolCalls(const QString& toolCallsJson) {
@@ -1532,24 +1613,51 @@ void ChatBot::dispatchToolCalls(const QString& toolCallsJson) {
         return;
     }
 
-    bool hasTavily = false;
-    for (const auto& val : doc.array()) {
+    QJsonArray arr = doc.array();
+    m_toolCallBatch.clear();
+
+    // 注册所有已知工具调用到 batch 中
+    for (const auto& val : arr) {
+        QJsonObject tc   = val.toObject();
+        QString     id   = tc["id"].toString();
+        QString     name = tc["function"].toObject()["name"].toString();
+        if (name == "tavily_search" || name == "shell_exec") {
+            m_toolCallBatch.append({id, name, false, ""});
+        }
+    }
+
+    if (m_toolCallBatch.isEmpty()) {
+        emit toolCallReceived(toolCallsJson);
+        return;
+    }
+
+    // 分发执行
+    for (const auto& val : arr) {
         QJsonObject tc   = val.toObject();
         QString     name = tc["function"].toObject()["name"].toString();
+        QString     id   = tc["id"].toString();
+        QString     args = tc["function"].toObject()["arguments"].toString();
+
         if (name == "tavily_search") {
-            hasTavily          = true;
-            QString       id   = tc["id"].toString();
-            QString       args = tc["function"].toObject()["arguments"].toString();
             QString       query;
             QJsonDocument argsDoc = QJsonDocument::fromJson(args.toUtf8());
             if (argsDoc.isObject()) query = argsDoc.object()["query"].toString();
             if (query.isEmpty()) query = args;
             executeTavilySearch(id, query);
-        }
-    }
+        } else if (name == "shell_exec") {
+            QString       command;
+            QJsonDocument argsDoc = QJsonDocument::fromJson(args.toUtf8());
+            if (argsDoc.isObject()) command = argsDoc.object()["command"].toString();
+            if (command.isEmpty()) command = args;
 
-    if (!hasTavily) {
-        emit toolCallReceived(toolCallsJson);
+            if (isCommandBlocked(command)) {
+                submitToolResultBatched(id, "shell_exec", "该命令被安全策略拦截，无法执行。请换一种方式。");
+                emit shellCommandFinished(id, false, "命令被安全策略拦截", command);
+            } else {
+                m_pendingShellExecs.append({id, command});
+                emit shellCommandPending(id, command);
+            }
+        }
     }
 }
 
@@ -1577,7 +1685,7 @@ void ChatBot::executeTavilySearch(const QString& toolCallId, const QString& quer
         if (reply->error() != QNetworkReply::NoError) {
             QString errMsg = reply->errorString();
             warn("Tavily 搜索失败: {}", errMsg.toStdString());
-            submitToolResult(toolCallId, "tavily_search", "搜索失败: " + errMsg);
+            submitToolResultBatched(toolCallId, "tavily_search", "搜索失败: " + errMsg);
             emit tavilySearchFinished(toolCallId, false, errMsg, errMsg);
             return;
         }
@@ -1585,14 +1693,14 @@ void ChatBot::executeTavilySearch(const QString& toolCallId, const QString& quer
         QByteArray    raw = reply->readAll();
         QJsonDocument doc = QJsonDocument::fromJson(raw);
         if (!doc.isObject()) {
-            submitToolResult(toolCallId, "tavily_search", "搜索失败: 响应格式错误");
+            submitToolResultBatched(toolCallId, "tavily_search", "搜索失败: 响应格式错误");
             emit tavilySearchFinished(toolCallId, false, "响应格式错误", "响应格式错误");
             return;
         }
 
         QJsonArray results = doc.object()["results"].toArray();
         if (results.isEmpty()) {
-            submitToolResult(toolCallId, "tavily_search", "未找到相关结果");
+            submitToolResultBatched(toolCallId, "tavily_search", "未找到相关结果");
             emit tavilySearchFinished(toolCallId, true, "未找到结果", "未找到相关结果");
             return;
         }
@@ -1608,10 +1716,166 @@ void ChatBot::executeTavilySearch(const QString& toolCallId, const QString& quer
                                  .arg(r["content"].toString());
         }
 
-        submitToolResult(toolCallId, "tavily_search", formatted);
+        submitToolResultBatched(toolCallId, "tavily_search", formatted);
         emit tavilySearchFinished(toolCallId, true, QString("找到 %1 条结果").arg(count), formatted);
         info("Tavily 搜索完成，找到 {} 条结果", count);
     });
+}
+
+// -----------------------------------------------------------------------
+// Shell Tool
+// -----------------------------------------------------------------------
+
+void ChatBot::initShellTool() {
+    json aiCfg = mod::Config::getInstance().read("ai");
+    if (!aiCfg.contains("shell_tool") || !aiCfg["shell_tool"].is_object()) return;
+
+    const auto& st       = aiCfg["shell_tool"];
+    m_shellToolEnabled   = st.value("enabled", false);
+    m_shellToolTimeoutMs = st.value("timeout_ms", 10000);
+    m_shellToolMaxOutput = st.value("max_output_bytes", 4096);
+
+    m_shellToolBlocklist.clear();
+    if (st.contains("blocklist") && st["blocklist"].is_array()) {
+        for (const auto& item : st["blocklist"]) {
+            if (item.is_string()) m_shellToolBlocklist.append(QString::fromStdString(item.get<std::string>()));
+        }
+    } else {
+        m_shellToolBlocklist = QStringList{"rm -rf /",
+                                           "rm -rf /*",
+                                           "mkfs",
+                                           "dd if=",
+                                           ":(){ :|:&",
+                                           "> /dev/sd",
+                                           "chmod -R 777 /",
+                                           "shutdown",
+                                           "reboot",
+                                           "init 0",
+                                           "init 6",
+                                           "halt",
+                                           "fdisk",
+                                           "mount -o remount"};
+    }
+    emit shellToolConfigChanged();
+    info("Shell tool 配置已加载, enabled={}", m_shellToolEnabled);
+}
+
+void ChatBot::setShellToolEnabled(bool v) {
+    if (m_shellToolEnabled == v) return;
+    m_shellToolEnabled = v;
+
+    json aiCfg = mod::Config::getInstance().read("ai");
+    if (aiCfg.is_null()) aiCfg = json::object();
+    if (!aiCfg.contains("shell_tool") || !aiCfg["shell_tool"].is_object()) aiCfg["shell_tool"] = json::object();
+    aiCfg["shell_tool"]["enabled"] = v;
+    mod::Config::getInstance().write("ai", aiCfg, true);
+    emit shellToolConfigChanged();
+}
+
+QString ChatBot::getShellToolConfig() {
+    json obj;
+    obj["enabled"]          = m_shellToolEnabled;
+    obj["timeout_ms"]       = m_shellToolTimeoutMs;
+    obj["max_output_bytes"] = m_shellToolMaxOutput;
+    json bl                 = json::array();
+    for (const auto& s : m_shellToolBlocklist) bl.push_back(s.toStdString());
+    obj["blocklist"] = bl;
+    return QString::fromStdString(obj.dump(2));
+}
+
+void ChatBot::setShellToolConfig(const QString& configJson) {
+    QJsonDocument doc = QJsonDocument::fromJson(configJson.toUtf8());
+    if (!doc.isObject()) return;
+
+    QJsonObject obj = doc.object();
+    if (obj.contains("enabled")) m_shellToolEnabled = obj["enabled"].toBool();
+    if (obj.contains("timeout_ms")) m_shellToolTimeoutMs = obj["timeout_ms"].toInt(10000);
+    if (obj.contains("max_output_bytes")) m_shellToolMaxOutput = obj["max_output_bytes"].toInt(4096);
+    if (obj.contains("blocklist") && obj["blocklist"].isArray()) {
+        m_shellToolBlocklist.clear();
+        for (const auto& v : obj["blocklist"].toArray()) {
+            m_shellToolBlocklist.append(v.toString());
+        }
+    }
+
+    json aiCfg = mod::Config::getInstance().read("ai");
+    if (aiCfg.is_null()) aiCfg = json::object();
+    if (!aiCfg.contains("shell_tool") || !aiCfg["shell_tool"].is_object()) aiCfg["shell_tool"] = json::object();
+    aiCfg["shell_tool"]["enabled"]          = m_shellToolEnabled;
+    aiCfg["shell_tool"]["timeout_ms"]       = m_shellToolTimeoutMs;
+    aiCfg["shell_tool"]["max_output_bytes"] = m_shellToolMaxOutput;
+    json bl                                 = json::array();
+    for (const auto& s : m_shellToolBlocklist) bl.push_back(s.toStdString());
+    aiCfg["shell_tool"]["blocklist"] = bl;
+    mod::Config::getInstance().write("ai", aiCfg, true);
+    emit shellToolConfigChanged();
+    info("Shell tool 配置已保存");
+}
+
+bool ChatBot::isCommandBlocked(const QString& command) {
+    QString trimmed = command.trimmed();
+    for (const auto& pattern : m_shellToolBlocklist) {
+        if (trimmed.contains(pattern, Qt::CaseInsensitive)) return true;
+    }
+    return false;
+}
+
+QString ChatBot::truncateOutput(const QString& output, int maxBytes) {
+    if (output.toUtf8().size() <= maxBytes) return output;
+    QByteArray truncated = output.toUtf8().left(maxBytes);
+    return QString::fromUtf8(truncated) + "\n... [输出已截断]";
+}
+
+void ChatBot::approveShellCommand(const QString& toolCallId) {
+    for (int i = 0; i < m_pendingShellExecs.size(); ++i) {
+        if (m_pendingShellExecs[i].toolCallId == toolCallId) {
+            auto pending = m_pendingShellExecs.takeAt(i);
+            executeShellCommand(pending.toolCallId, pending.command);
+            return;
+        }
+    }
+    warn("approveShellCommand: toolCallId 未找到: {}", toolCallId.toStdString());
+}
+
+void ChatBot::denyShellCommand(const QString& toolCallId) {
+    for (int i = 0; i < m_pendingShellExecs.size(); ++i) {
+        if (m_pendingShellExecs[i].toolCallId == toolCallId) {
+            auto pending = m_pendingShellExecs.takeAt(i);
+            submitToolResultBatched(toolCallId, "shell_exec", "用户拒绝执行该命令。请换一种方式或询问用户。");
+            emit shellCommandFinished(toolCallId, false, "用户拒绝执行", pending.command);
+            return;
+        }
+    }
+    warn("denyShellCommand: toolCallId 未找到: {}", toolCallId.toStdString());
+}
+
+void ChatBot::executeShellCommand(const QString& toolCallId, const QString& command) {
+    info("执行 shell 命令: {}", command.toStdString());
+    emit shellCommandStarted(toolCallId, command);
+
+    QProcess process;
+    process.start("/bin/sh", QStringList{"-c", command});
+
+    bool finished = process.waitForFinished(m_shellToolTimeoutMs);
+    bool timedOut = !finished;
+    if (timedOut) process.kill();
+
+    QString stdoutStr = truncateOutput(QString::fromUtf8(process.readAllStandardOutput()), m_shellToolMaxOutput);
+    QString stderrStr = truncateOutput(QString::fromUtf8(process.readAllStandardError()), m_shellToolMaxOutput / 2);
+    int     exitCode  = timedOut ? -1 : process.exitCode();
+
+    QString resultText;
+    if (timedOut) resultText = QString("命令超时（%1ms）。\n").arg(m_shellToolTimeoutMs);
+    resultText += QString("Exit code: %1\n").arg(exitCode);
+    if (!stdoutStr.isEmpty()) resultText += "stdout:\n" + stdoutStr + "\n";
+    if (!stderrStr.isEmpty()) resultText += "stderr:\n" + stderrStr + "\n";
+
+    bool    success = (exitCode == 0 && !timedOut);
+    QString summary = success ? "执行成功" : timedOut ? "执行超时" : QString("退出码: %1").arg(exitCode);
+
+    submitToolResultBatched(toolCallId, "shell_exec", resultText);
+    emit shellCommandFinished(toolCallId, success, summary, resultText);
+    info("Shell 命令完成, exitCode={}, timedOut={}", exitCode, timedOut);
 }
 
 } // namespace mod::chatbot

@@ -74,6 +74,9 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
     Q_PROPERTY(bool capToolCall READ getCapToolCall NOTIFY activeModelCapabilitiesChanged)
     Q_PROPERTY(bool capReasoning READ getCapReasoning NOTIFY activeModelCapabilitiesChanged)
 
+    Q_PROPERTY(bool tavilyEnabled READ getTavilyEnabled WRITE setTavilyEnabled NOTIFY tavilyConfigChanged)
+    Q_PROPERTY(bool tavilyConfigured READ getTavilyConfigured NOTIFY tavilyConfigChanged)
+
 public:
     // 基础接口
     Q_INVOKABLE void    sendMessage(const QString& message, const QString& fileRefs = QString());
@@ -116,6 +119,10 @@ public:
     Q_INVOKABLE bool    setActivePrompt(const QString& promptId);
     Q_INVOKABLE QString getActivePrompt();
 
+    // Tavily 网络搜索
+    Q_INVOKABLE QString getTavilyConfig();
+    Q_INVOKABLE void    setTavilyConfig(const QString& configJson);
+
     // Getter/Setter
     QString      getApiKey() const;
     QString      getApiEndpoint() const;
@@ -130,6 +137,10 @@ public:
     bool getCapAudio() const { return m_capAudio; }
     bool getCapToolCall() const { return m_capToolCall; }
     bool getCapReasoning() const { return m_capReasoning; }
+
+    bool getTavilyEnabled() const { return m_tavilyEnabled; }
+    bool getTavilyConfigured() const { return !m_tavilyApiKey.isEmpty(); }
+    void setTavilyEnabled(bool v);
 
     void setApiKey(const QString& key);
     void setApiEndpoint(const QString& endpoint);
@@ -158,6 +169,10 @@ signals:
     void sessionsChanged();
     void sessionSwitched(const QString& sessionId);
     void activeModelCapabilitiesChanged();
+    void tavilyConfigChanged();
+    void tavilySearchStarted(const QString& toolCallId, const QString& query);
+    void
+    tavilySearchFinished(const QString& toolCallId, bool success, const QString& summary, const QString& resultText);
 
 private:
     friend Singleton<ChatBot>;
@@ -225,6 +240,17 @@ private:
 
     void initPrompts();
     void savePrompts();
+
+    // Tavily 网络搜索
+    QString m_tavilyApiKey;
+    QString m_tavilySearchDepth;
+    int     m_tavilyMaxResults = 5;
+    bool    m_tavilyEnabled    = false;
+
+    void initTavily();
+    void injectToolDefinitions(QJsonObject& requestBody);
+    void dispatchToolCalls(const QString& toolCallsJson);
+    void executeTavilySearch(const QString& toolCallId, const QString& query);
 };
 
 } // namespace mod::chatbot

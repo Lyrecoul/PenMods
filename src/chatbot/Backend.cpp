@@ -75,6 +75,7 @@ ChatBot::ChatBot()
 
     initModels();
     initPrompts();
+    initTavily();
     initSessions();
 }
 
@@ -95,6 +96,7 @@ void ChatBot::reloadConfig() {
 
     initModels();
     initPrompts();
+    initTavily();
 
     emit apiKeyChanged();
     emit apiEndpointChanged();
@@ -121,6 +123,7 @@ void ChatBot::sanitizeConfig() {
 
     initModels();
     initPrompts();
+    initTavily();
 
     emit apiKeyChanged();
     emit apiEndpointChanged();
@@ -547,6 +550,11 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
         }
     }
 
+    // 注入 Tavily 工具定义
+    if (m_capToolCall && m_tavilyEnabled && !m_tavilyApiKey.isEmpty()) {
+        injectToolDefinitions(requestBody);
+    }
+
     QJsonDocument requestDoc(requestBody);
     QByteArray    requestData = requestDoc.toJson(QJsonDocument::Compact);
     debug("请求数据: {}", QString(requestData).toStdString());
@@ -674,7 +682,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                 m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
                 saveSessions();
                 emit messagesChanged();
-                emit toolCallReceived(toolCallsJson);
+                dispatchToolCalls(toolCallsJson);
             } else if (!m_currentStreamBuffer.isEmpty()) {
                 MessageData assistantMsg;
                 assistantMsg.role    = "assistant";
@@ -714,7 +722,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                 m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
                 saveSessions();
                 emit messagesChanged();
-                emit toolCallReceived(toolCallsJson);
+                dispatchToolCalls(toolCallsJson);
             } else if (message.contains("content") && message["content"].isString()) {
                 QString     content = message["content"].toString();
                 MessageData assistantMsg;
@@ -1427,6 +1435,183 @@ QVariantList ChatBot::getSessionMessages(const QString& sessionId) {
         messageList.append(m);
     }
     return messageList;
+}
+
+// -----------------------------------------------------------------------
+// Tavily 网络搜索
+// -----------------------------------------------------------------------
+
+void ChatBot::initTavily() {
+    json aiCfg = mod::Config::getInstance().read("ai");
+    if (!aiCfg.contains("tavily") || !aiCfg["tavily"].is_object()) return;
+
+    const auto& t       = aiCfg["tavily"];
+    m_tavilyApiKey      = QString::fromStdString(t.value("api_key", ""));
+    m_tavilySearchDepth = QString::fromStdString(t.value("search_depth", "advanced"));
+    m_tavilyMaxResults  = t.value("max_results", 5);
+    m_tavilyEnabled     = t.value("enabled", false);
+    emit tavilyConfigChanged();
+    info("Tavily 配置已加载, enabled={}, configured={}", m_tavilyEnabled, !m_tavilyApiKey.isEmpty());
+}
+
+void ChatBot::setTavilyEnabled(bool v) {
+    if (m_tavilyEnabled == v) return;
+    m_tavilyEnabled = v;
+
+    json aiCfg = mod::Config::getInstance().read("ai");
+    if (aiCfg.is_null()) aiCfg = json::object();
+    if (!aiCfg.contains("tavily") || !aiCfg["tavily"].is_object()) aiCfg["tavily"] = json::object();
+    aiCfg["tavily"]["enabled"] = v;
+    mod::Config::getInstance().write("ai", aiCfg, true);
+    emit tavilyConfigChanged();
+}
+
+QString ChatBot::getTavilyConfig() {
+    json obj;
+    obj["apiKey"]      = m_tavilyApiKey.toStdString();
+    obj["searchDepth"] = m_tavilySearchDepth.toStdString();
+    obj["maxResults"]  = m_tavilyMaxResults;
+    obj["enabled"]     = m_tavilyEnabled;
+    return QString::fromStdString(obj.dump(2));
+}
+
+void ChatBot::setTavilyConfig(const QString& configJson) {
+    QJsonDocument doc = QJsonDocument::fromJson(configJson.toUtf8());
+    if (!doc.isObject()) return;
+
+    QJsonObject obj = doc.object();
+    if (obj.contains("apiKey")) m_tavilyApiKey = obj["apiKey"].toString();
+    if (obj.contains("searchDepth")) m_tavilySearchDepth = obj["searchDepth"].toString();
+    if (obj.contains("maxResults")) m_tavilyMaxResults = obj["maxResults"].toInt(5);
+    if (obj.contains("enabled")) m_tavilyEnabled = obj["enabled"].toBool();
+
+    json aiCfg = mod::Config::getInstance().read("ai");
+    if (aiCfg.is_null()) aiCfg = json::object();
+    if (!aiCfg.contains("tavily") || !aiCfg["tavily"].is_object()) aiCfg["tavily"] = json::object();
+    aiCfg["tavily"]["api_key"]      = m_tavilyApiKey.toStdString();
+    aiCfg["tavily"]["search_depth"] = m_tavilySearchDepth.toStdString();
+    aiCfg["tavily"]["max_results"]  = m_tavilyMaxResults;
+    aiCfg["tavily"]["enabled"]      = m_tavilyEnabled;
+    mod::Config::getInstance().write("ai", aiCfg, true);
+    emit tavilyConfigChanged();
+    info("Tavily 配置已保存");
+}
+
+void ChatBot::injectToolDefinitions(QJsonObject& requestBody) {
+    QJsonObject funcParam;
+    funcParam["type"] = "object";
+
+    QJsonObject queryProp;
+    queryProp["type"]        = "string";
+    queryProp["description"] = "The search query in the user's language";
+
+    QJsonObject properties;
+    properties["query"] = queryProp;
+
+    funcParam["properties"] = properties;
+    funcParam["required"]   = QJsonArray({"query"});
+
+    QJsonObject func;
+    func["name"]        = "tavily_search";
+    func["description"] = "Search the web for up-to-date information. Use when the user asks about current events, "
+                          "recent facts, or anything outside your training data.";
+    func["parameters"] = funcParam;
+
+    QJsonObject tool;
+    tool["type"]     = "function";
+    tool["function"] = func;
+
+    requestBody["tools"]       = QJsonArray({tool});
+    requestBody["tool_choice"] = "auto";
+}
+
+void ChatBot::dispatchToolCalls(const QString& toolCallsJson) {
+    QJsonDocument doc = QJsonDocument::fromJson(toolCallsJson.toUtf8());
+    if (!doc.isArray()) {
+        emit toolCallReceived(toolCallsJson);
+        return;
+    }
+
+    bool hasTavily = false;
+    for (const auto& val : doc.array()) {
+        QJsonObject tc   = val.toObject();
+        QString     name = tc["function"].toObject()["name"].toString();
+        if (name == "tavily_search") {
+            hasTavily          = true;
+            QString       id   = tc["id"].toString();
+            QString       args = tc["function"].toObject()["arguments"].toString();
+            QString       query;
+            QJsonDocument argsDoc = QJsonDocument::fromJson(args.toUtf8());
+            if (argsDoc.isObject()) query = argsDoc.object()["query"].toString();
+            if (query.isEmpty()) query = args;
+            executeTavilySearch(id, query);
+        }
+    }
+
+    if (!hasTavily) {
+        emit toolCallReceived(toolCallsJson);
+    }
+}
+
+void ChatBot::executeTavilySearch(const QString& toolCallId, const QString& query) {
+    info("Tavily 搜索: {}", query.toStdString());
+    emit tavilySearchStarted(toolCallId, query);
+
+    QJsonObject body;
+    body["query"]        = query;
+    body["search_depth"] = m_tavilySearchDepth;
+    body["max_results"]  = m_tavilyMaxResults;
+
+    QNetworkRequest request;
+    request.setUrl(QUrl("https://api.tavily.com/search"));
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    request.setRawHeader("Authorization", QString("Bearer %1").arg(m_tavilyApiKey).toUtf8());
+    request.setRawHeader("User-Agent", "PenMods ChatBot/1.0");
+
+    QByteArray     data  = QJsonDocument(body).toJson(QJsonDocument::Compact);
+    QNetworkReply* reply = m_networkManager->post(request, data);
+
+    connect(reply, &QNetworkReply::finished, [this, reply, toolCallId, query]() {
+        reply->deleteLater();
+
+        if (reply->error() != QNetworkReply::NoError) {
+            QString errMsg = reply->errorString();
+            warn("Tavily 搜索失败: {}", errMsg.toStdString());
+            submitToolResult(toolCallId, "tavily_search", "搜索失败: " + errMsg);
+            emit tavilySearchFinished(toolCallId, false, errMsg, errMsg);
+            return;
+        }
+
+        QByteArray    raw = reply->readAll();
+        QJsonDocument doc = QJsonDocument::fromJson(raw);
+        if (!doc.isObject()) {
+            submitToolResult(toolCallId, "tavily_search", "搜索失败: 响应格式错误");
+            emit tavilySearchFinished(toolCallId, false, "响应格式错误", "响应格式错误");
+            return;
+        }
+
+        QJsonArray results = doc.object()["results"].toArray();
+        if (results.isEmpty()) {
+            submitToolResult(toolCallId, "tavily_search", "未找到相关结果");
+            emit tavilySearchFinished(toolCallId, true, "未找到结果", "未找到相关结果");
+            return;
+        }
+
+        QString formatted = QString("网络搜索结果（查询: \"%1\"）：\n\n").arg(query);
+        int     count     = 0;
+        for (const auto& val : results) {
+            QJsonObject r  = val.toObject();
+            formatted     += QString("%1. %2 (%3)\n   %4\n\n")
+                                 .arg(++count)
+                                 .arg(r["title"].toString())
+                                 .arg(r["url"].toString())
+                                 .arg(r["content"].toString());
+        }
+
+        submitToolResult(toolCallId, "tavily_search", formatted);
+        emit tavilySearchFinished(toolCallId, true, QString("找到 %1 条结果").arg(count), formatted);
+        info("Tavily 搜索完成，找到 {} 条结果", count);
+    });
 }
 
 } // namespace mod::chatbot

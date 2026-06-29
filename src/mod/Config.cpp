@@ -161,7 +161,13 @@ Config::Config() : Logger("Config") {
                     {"content", "你是一个有用的助手，使用中文回复用户的问题。"}
                 }
             })},
-            {"activePromptId", "default"}
+            {"activePromptId", "default"},
+            {"tavily", {
+                {"api_key",      ""},
+                {"search_depth", "advanced"},
+                {"max_results",  5},
+                {"enabled",      false}
+            }}
         }}
     };
 

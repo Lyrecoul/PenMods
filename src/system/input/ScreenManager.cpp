@@ -6,6 +6,7 @@
 
 #include "system/input/ScreenManager.h"
 #include "system/input/InputDaemon.h"
+#include "system/sound/AudioDaemon.h"
 
 #include "filemanager/player/MusicPlayer.h"
 
@@ -21,12 +22,15 @@ ScreenManager::ScreenManager() {
 
     mCfg = Config::getInstance().read(mClassName);
 
-    mAutoSleepDuration = mCfg["sleep_duration"];
-    mIntelSleep        = mCfg["intel_sleep"];
+    mAutoSleepDuration    = mCfg["sleep_duration"];
+    mIntelSleep           = mCfg["intel_sleep"];
+    mIntelSleepAudioLock  = mCfg["intel_sleep_audio_lock"];
 
     connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView& view, QQmlContext* context) {
         context->setContextProperty("screenManager", this);
     });
+
+    connect(&AudioDaemon::getInstance(), &AudioDaemon::stateChanged, this, &ScreenManager::onAudioDaemonStateChanged);
 }
 
 void ScreenManager::onPlayStateChanged(PlayState state) {
@@ -110,6 +114,29 @@ void ScreenManager::setIntelSleep(bool val) {
         mCfg["intel_sleep"] = val;
         WRITE_CFG;
         emit intelSleepChanged();
+    }
+}
+
+bool ScreenManager::getIntelSleepAudioLock() const { return mIntelSleepAudioLock; }
+
+void ScreenManager::setIntelSleepAudioLock(bool val) {
+    if (mIntelSleepAudioLock != val) {
+        mIntelSleepAudioLock         = val;
+        mCfg["intel_sleep_audio_lock"] = val;
+        WRITE_CFG;
+        emit intelSleepAudioLockChanged();
+        onAudioDaemonStateChanged();
+    }
+}
+
+void ScreenManager::onAudioDaemonStateChanged() {
+    bool audioActive = AudioDaemon::getInstance().state() == AudioDaemonState::PLAYING;
+    if (mIntelSleepAudioLock && audioActive && !mAudioLockActive) {
+        mAudioLockActive = true;
+        rtSetAutoScreenOff(false);
+    } else if (mAudioLockActive && (!audioActive || !mIntelSleepAudioLock)) {
+        mAudioLockActive = false;
+        rtSetAutoScreenOff(true);
     }
 }
 

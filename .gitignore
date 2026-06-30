@@ -2,3 +2,6 @@ build/*
 .cache
 .vscode
 .xmake
+mathjax-server/node_modules
+mathjax-server/dist
+mathjax-server/package-lock.json

@@ -1,0 +1,36 @@
+{
+  "name": "mathjax-server",
+  "version": "1.0.0",
+  "description": "Lightweight MathJax LaTeX to SVG rendering server for embedded systems.",
+  "main": "bundle.js",
+  "bin": "bundle.js",
+  "scripts": {
+    "start": "node index.js",
+    "build:js": "esbuild index.js --bundle --platform=node --outfile=bundle.js --external:typescript --external:@resvg/resvg-js",
+    "build": "npm run build:js && pkg . --targets node16-linux-arm64 --output dist/mathjax-server && rm -f bundle.js"
+  },
+  "pkg": {
+    "assets": [
+      "node_modules/@resvg/resvg-js/**/*",
+      "node_modules/@resvg/resvg-js-linux-arm64-gnu/**/*"
+    ]
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "express": "^4.19.2",
+    "mathjax-full": "^3.2.2",
+    "node-fetch": "^2.7.0"
+  },
+  "optionalDependencies": {
+    "@resvg/resvg-js-linux-arm64-gnu": "^2.6.2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.27.2",
+    "pkg": "^5.8.1"
+  },
+  "allowScripts": {
+    "esbuild@0.27.7": true
+  }
+}

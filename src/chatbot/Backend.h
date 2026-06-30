@@ -79,6 +79,10 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
 
     Q_PROPERTY(bool shellToolEnabled READ getShellToolEnabled WRITE setShellToolEnabled NOTIFY shellToolConfigChanged)
 
+    Q_PROPERTY(
+        bool mathRenderEnabled READ getMathRenderEnabled WRITE setMathRenderEnabled NOTIFY mathRenderConfigChanged)
+    Q_PROPERTY(QString mathServerPath READ getMathServerPath WRITE setMathServerPath NOTIFY mathRenderConfigChanged)
+
 public:
     // 基础接口
     Q_INVOKABLE void    sendMessage(const QString& message, const QString& fileRefs = QString());
@@ -131,6 +135,10 @@ public:
     Q_INVOKABLE QString getTavilyConfig();
     Q_INVOKABLE void    setTavilyConfig(const QString& configJson);
 
+    // 数学公式渲染
+    Q_INVOKABLE QString getMathRenderConfig();
+    Q_INVOKABLE void    setMathRenderConfig(const QString& configJson);
+
     // Getter/Setter
     QString      getApiKey() const;
     QString      getApiEndpoint() const;
@@ -152,6 +160,11 @@ public:
 
     bool getShellToolEnabled() const { return m_shellToolEnabled; }
     void setShellToolEnabled(bool v);
+
+    bool    getMathRenderEnabled() const { return m_mathRenderEnabled; }
+    QString getMathServerPath() const { return m_mathServerPath; }
+    void    setMathRenderEnabled(bool v);
+    void    setMathServerPath(const QString& path);
 
     void setApiKey(const QString& key);
     void setApiEndpoint(const QString& endpoint);
@@ -190,6 +203,7 @@ signals:
     void
     shellCommandFinished(const QString& toolCallId, bool success, const QString& summary, const QString& resultText);
     void toolBatchFlushed();
+    void mathRenderConfigChanged();
 
 private:
     friend Singleton<ChatBot>;
@@ -285,6 +299,12 @@ private:
     bool    isCommandBlocked(const QString& command);
     void    executeShellCommand(const QString& toolCallId, const QString& command);
     QString truncateOutput(const QString& output, int maxBytes);
+
+    // 数学公式渲染
+    bool    m_mathRenderEnabled = false;
+    QString m_mathServerPath;
+
+    void initMathRender();
 
     // 批量 tool result 收集（多个 tool_calls 时，等全部完成后统一提交）
     struct ToolCallEntry {

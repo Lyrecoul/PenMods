@@ -78,6 +78,7 @@ ChatBot::ChatBot()
     initPrompts();
     initTavily();
     initShellTool();
+    initMathRender();
     initSessions();
 }
 
@@ -100,6 +101,7 @@ void ChatBot::reloadConfig() {
     initPrompts();
     initTavily();
     initShellTool();
+    initMathRender();
 
     emit apiKeyChanged();
     emit apiEndpointChanged();
@@ -128,6 +130,7 @@ void ChatBot::sanitizeConfig() {
     initPrompts();
     initTavily();
     initShellTool();
+    initMathRender();
 
     emit apiKeyChanged();
     emit apiEndpointChanged();
@@ -1876,6 +1879,70 @@ void ChatBot::executeShellCommand(const QString& toolCallId, const QString& comm
     submitToolResultBatched(toolCallId, "shell_exec", resultText);
     emit shellCommandFinished(toolCallId, success, summary, resultText);
     info("Shell 命令完成, exitCode={}, timedOut={}", exitCode, timedOut);
+}
+
+// -----------------------------------------------------------------------
+// 数学公式渲染
+// -----------------------------------------------------------------------
+
+void ChatBot::initMathRender() {
+    json aiCfg = mod::Config::getInstance().read("ai");
+    if (!aiCfg.contains("math_render") || !aiCfg["math_render"].is_object()) return;
+
+    const auto& mr      = aiCfg["math_render"];
+    m_mathRenderEnabled = mr.value("enabled", false);
+    m_mathServerPath    = QString::fromStdString(mr.value("server_path", std::string()));
+    emit mathRenderConfigChanged();
+    info("Math render 配置已加载, enabled={}, path={}", m_mathRenderEnabled, m_mathServerPath.toStdString());
+}
+
+void ChatBot::setMathRenderEnabled(bool v) {
+    if (m_mathRenderEnabled == v) return;
+    m_mathRenderEnabled = v;
+
+    json aiCfg = mod::Config::getInstance().read("ai");
+    if (aiCfg.is_null()) aiCfg = json::object();
+    if (!aiCfg.contains("math_render") || !aiCfg["math_render"].is_object()) aiCfg["math_render"] = json::object();
+    aiCfg["math_render"]["enabled"] = v;
+    mod::Config::getInstance().write("ai", aiCfg, true);
+    emit mathRenderConfigChanged();
+}
+
+void ChatBot::setMathServerPath(const QString& path) {
+    if (m_mathServerPath == path) return;
+    m_mathServerPath = path;
+
+    json aiCfg = mod::Config::getInstance().read("ai");
+    if (aiCfg.is_null()) aiCfg = json::object();
+    if (!aiCfg.contains("math_render") || !aiCfg["math_render"].is_object()) aiCfg["math_render"] = json::object();
+    aiCfg["math_render"]["server_path"] = path.toStdString();
+    mod::Config::getInstance().write("ai", aiCfg, true);
+    emit mathRenderConfigChanged();
+}
+
+QString ChatBot::getMathRenderConfig() {
+    json obj;
+    obj["enabled"]     = m_mathRenderEnabled;
+    obj["server_path"] = m_mathServerPath.toStdString();
+    return QString::fromStdString(obj.dump(2));
+}
+
+void ChatBot::setMathRenderConfig(const QString& configJson) {
+    QJsonDocument doc = QJsonDocument::fromJson(configJson.toUtf8());
+    if (!doc.isObject()) return;
+
+    QJsonObject obj = doc.object();
+    if (obj.contains("enabled")) m_mathRenderEnabled = obj["enabled"].toBool();
+    if (obj.contains("server_path")) m_mathServerPath = obj["server_path"].toString();
+
+    json aiCfg = mod::Config::getInstance().read("ai");
+    if (aiCfg.is_null()) aiCfg = json::object();
+    if (!aiCfg.contains("math_render") || !aiCfg["math_render"].is_object()) aiCfg["math_render"] = json::object();
+    aiCfg["math_render"]["enabled"]     = m_mathRenderEnabled;
+    aiCfg["math_render"]["server_path"] = m_mathServerPath.toStdString();
+    mod::Config::getInstance().write("ai", aiCfg, true);
+    emit mathRenderConfigChanged();
+    info("Math render 配置已保存");
 }
 
 } // namespace mod::chatbot

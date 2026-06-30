@@ -11,6 +11,7 @@ npx esbuild index.js \
     --bundle \
     --platform=node \
     --external:typescript \
+    --external:@resvg/resvg-js \
     --outfile=bundle.js
 
 echo "[2/2] Packaging for $TARGET..."

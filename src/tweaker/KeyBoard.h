@@ -12,14 +12,19 @@ namespace mod {
 
 class KeyBoard : public QObject, public Singleton<KeyBoard> {
     Q_OBJECT
+    Q_PROPERTY(bool autoSendScan READ autoSendScan WRITE setAutoSendScan NOTIFY autoSendScanChanged)
 public:
-signals:
+    bool autoSendScan() const { return m_autoSendScan; }
+    void setAutoSendScan(bool value);
 
+signals:
     void scanFinished(QString result);
+    void autoSendScanChanged();
 
 private:
     friend Singleton<KeyBoard>;
     explicit KeyBoard();
+    bool m_autoSendScan = false;
 };
 
 } // namespace mod

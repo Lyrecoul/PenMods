@@ -20,10 +20,22 @@ KeyBoard::KeyBoard() {
     });
 }
 
+void KeyBoard::setAutoSendScan(bool value) {
+    if (m_autoSendScan != value) {
+        m_autoSendScan = value;
+        emit autoSendScanChanged();
+    }
+}
+
 } // namespace mod
 
+static bool shouldBlockScan() {
+    bool inputPageShowing = PEN_CALL(bool, "_ZNK7YGlobal16inputPageShowingEv", void*)(mod::YPointer<YGlobal>::getInstance());
+    return inputPageShowing || mod::KeyBoard::getInstance().autoSendScan();
+}
+
 PEN_HOOK(bool, _ZN11YSystemBase12onScanFinishERK7QStringi, uint64 self, QString const& content, ScanType scanType) {
-    if (PEN_CALL(bool, "_ZNK7YGlobal16inputPageShowingEv", void*)(mod::YPointer<YGlobal>::getInstance())) {
+    if (shouldBlockScan()) {
         emit mod::KeyBoard::getInstance().scanFinished(content);
         return false;
     }
@@ -31,14 +43,14 @@ PEN_HOOK(bool, _ZN11YSystemBase12onScanFinishERK7QStringi, uint64 self, QString 
 }
 
 PEN_HOOK(uint64, _ZN11YSystemBase8ocrStartEv, uint64 self, uint64 a2, uint64 a3, uint64 a4, uint64 a5) {
-    if (PEN_CALL(bool, "_ZNK7YGlobal16inputPageShowingEv", void*)(mod::YPointer<YGlobal>::getInstance())) {
+    if (shouldBlockScan()) {
         return false;
     }
     return origin(self, a2, a3, a4, a5);
 }
 
 PEN_HOOK(uint64, _ZN11YSystemBase7ocrStopEi, uint64 self, int a2, uint64 a3, uint64 a4, uint64 a5) {
-    if (PEN_CALL(bool, "_ZNK7YGlobal16inputPageShowingEv", void*)(mod::YPointer<YGlobal>::getInstance())) {
+    if (shouldBlockScan()) {
         return false;
     }
     return origin(self, a2, a3, a4, a5);
@@ -53,7 +65,7 @@ PEN_HOOK(
     uint64 a4,
     uint64 a5
 ) {
-    if (PEN_CALL(bool, "_ZNK7YGlobal16inputPageShowingEv", void*)(mod::YPointer<YGlobal>::getInstance())) {
+    if (shouldBlockScan()) {
         return false;
     }
     return origin(self, a5, a2, a3, a4);

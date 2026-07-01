@@ -14,6 +14,7 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QObject>
+#include <QProcess>
 #include <QQueue>
 #include <QTimer>
 #include <QVector>
@@ -209,6 +210,10 @@ private:
     friend Singleton<ChatBot>;
     explicit ChatBot();
 
+public:
+    ~ChatBot();
+
+private:
     QNetworkAccessManager* m_networkManager;
     QList<QNetworkReply*>  m_activeReplies;
 
@@ -295,9 +300,21 @@ private:
     };
     QVector<PendingShellExec> m_pendingShellExecs;
 
+    // 异步 Shell 执行追踪（避免主线程阻塞）
+    struct ActiveShellExec {
+        QString   toolCallId;
+        QString   command;
+        QProcess* process    = nullptr;
+        QTimer*   timer      = nullptr;
+        QString   stdoutBuf;
+        QString   stderrBuf;
+    };
+    QMap<QString, ActiveShellExec*> m_activeShellExecs;
+
     void    initShellTool();
     bool    isCommandBlocked(const QString& command);
     void    executeShellCommand(const QString& toolCallId, const QString& command);
+    void    cleanupShellExec(const QString& toolCallId);
     QString truncateOutput(const QString& output, int maxBytes);
 
     // 数学公式渲染

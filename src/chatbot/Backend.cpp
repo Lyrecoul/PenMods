@@ -61,9 +61,9 @@ ChatBot::ChatBot()
   m_temperature(0.7),
   m_defaultPrompt("你是一个有用的助手，使用中文回复用户的问题。"),
   m_isStreaming(true),
+  m_extraParams(json::object()),
   m_currentStreamBuffer(""),
-  m_responseBuffer(""),
-  m_extraParams(json::object()) {
+  m_responseBuffer("") {
     info("ChatBot 初始化完成");
 
     auto& config = mod::Config::getInstance();
@@ -80,6 +80,27 @@ ChatBot::ChatBot()
     initShellTool();
     initMathRender();
     initSessions();
+}
+
+ChatBot::~ChatBot() {
+    // 清理所有正在执行的 shell 命令
+    for (auto it = m_activeShellExecs.constBegin(); it != m_activeShellExecs.constEnd(); ++it) {
+        auto* e = it.value();
+        if (e->timer) {
+            e->timer->stop();
+            e->timer->deleteLater();
+        }
+        if (e->process) {
+            e->process->disconnect(this);
+            if (e->process->state() != QProcess::NotRunning) {
+                e->process->kill();
+                e->process->waitForFinished(200);
+            }
+            e->process->deleteLater();
+        }
+        delete e;
+    }
+    m_activeShellExecs.clear();
 }
 
 // -----------------------------------------------------------------------
@@ -1853,32 +1874,151 @@ void ChatBot::denyShellCommand(const QString& toolCallId) {
 }
 
 void ChatBot::executeShellCommand(const QString& toolCallId, const QString& command) {
-    info("执行 shell 命令: {}", command.toStdString());
+    // 如果该 toolCallId 已有活跃执行，先清理
+    if (m_activeShellExecs.contains(toolCallId)) {
+        warn("executeShellCommand: toolCallId {} 已有正在执行的命令，将被替换", toolCallId.toStdString());
+        cleanupShellExec(toolCallId);
+    }
+
+    info("启动异步 shell 命令: {}", command.toStdString());
     emit shellCommandStarted(toolCallId, command);
 
-    QProcess process;
-    process.start("/bin/sh", QStringList{"-c", command});
+    auto* exec         = new ActiveShellExec;
+    exec->toolCallId   = toolCallId;
+    exec->command      = command;
+    exec->process      = new QProcess(this);
+    exec->process->setProgram("/bin/sh");
+    exec->process->setArguments({"-c", command});
+    exec->process->setProcessChannelMode(QProcess::SeparateChannels);
 
-    bool finished = process.waitForFinished(m_shellToolTimeoutMs);
-    bool timedOut = !finished;
-    if (timedOut) process.kill();
+    // 收集 stdout
+    connect(exec->process, &QProcess::readyReadStandardOutput, this, [this, toolCallId]() {
+        auto* e = m_activeShellExecs.value(toolCallId);
+        if (!e) return;
+        e->stdoutBuf += QString::fromUtf8(e->process->readAllStandardOutput());
+    });
 
-    QString stdoutStr = truncateOutput(QString::fromUtf8(process.readAllStandardOutput()), m_shellToolMaxOutput);
-    QString stderrStr = truncateOutput(QString::fromUtf8(process.readAllStandardError()), m_shellToolMaxOutput / 2);
-    int     exitCode  = timedOut ? -1 : process.exitCode();
+    // 收集 stderr
+    connect(exec->process, &QProcess::readyReadStandardError, this, [this, toolCallId]() {
+        auto* e = m_activeShellExecs.value(toolCallId);
+        if (!e) return;
+        e->stderrBuf += QString::fromUtf8(e->process->readAllStandardError());
+    });
 
-    QString resultText;
-    if (timedOut) resultText = QString("命令超时（%1ms）。\n").arg(m_shellToolTimeoutMs);
-    resultText += QString("Exit code: %1\n").arg(exitCode);
-    if (!stdoutStr.isEmpty()) resultText += "stdout:\n" + stdoutStr + "\n";
-    if (!stderrStr.isEmpty()) resultText += "stderr:\n" + stderrStr + "\n";
+    // 进程正常结束
+    connect(exec->process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, [this, toolCallId](int exitCode, QProcess::ExitStatus status) {
+        auto* e = m_activeShellExecs.value(toolCallId);
+        if (!e) return;
 
-    bool    success = (exitCode == 0 && !timedOut);
-    QString summary = success ? "执行成功" : timedOut ? "执行超时" : QString("退出码: %1").arg(exitCode);
+        // 停掉超时定时器
+        if (e->timer) {
+            e->timer->stop();
+            e->timer->deleteLater();
+            e->timer = nullptr;
+        }
 
-    submitToolResultBatched(toolCallId, "shell_exec", resultText);
-    emit shellCommandFinished(toolCallId, success, summary, resultText);
-    info("Shell 命令完成, exitCode={}, timedOut={}", exitCode, timedOut);
+        QString stdoutStr = truncateOutput(e->stdoutBuf, m_shellToolMaxOutput);
+        QString stderrStr = truncateOutput(e->stderrBuf, m_shellToolMaxOutput / 2);
+
+        bool    crashed = (status != QProcess::NormalExit);
+        QString resultText;
+        resultText += QString("Exit code: %1\n").arg(exitCode);
+        if (crashed) resultText += "（进程崩溃）\n";
+        if (!stdoutStr.isEmpty()) resultText += "stdout:\n" + stdoutStr + "\n";
+        if (!stderrStr.isEmpty()) resultText += "stderr:\n" + stderrStr + "\n";
+
+        bool    success = (exitCode == 0 && !crashed);
+        QString summary = success ? "执行成功" : crashed ? "进程崩溃" : QString("退出码: %1").arg(exitCode);
+
+        QString cmd = e->command;
+        cleanupShellExec(toolCallId);
+
+        submitToolResultBatched(toolCallId, "shell_exec", resultText);
+        emit shellCommandFinished(toolCallId, success, summary, resultText);
+        info("Shell 命令完成 [{}], exitCode={}, crashed={}", cmd.toStdString(), exitCode, crashed);
+    });
+
+    // 进程启动失败
+    connect(exec->process, &QProcess::errorOccurred, this, [this, toolCallId](QProcess::ProcessError err) {
+        if (err != QProcess::FailedToStart) return;
+        auto* e = m_activeShellExecs.value(toolCallId);
+        if (!e) return;
+
+        if (e->timer) {
+            e->timer->stop();
+            e->timer->deleteLater();
+            e->timer = nullptr;
+        }
+
+        QString cmd = e->command;
+        cleanupShellExec(toolCallId);
+
+        submitToolResultBatched(toolCallId, "shell_exec", "命令启动失败，请检查命令是否正确。");
+        emit shellCommandFinished(toolCallId, false, "启动失败", cmd);
+        warn("Shell 命令启动失败 [{}]", cmd.toStdString());
+    });
+
+    // 超时定时器
+    if (m_shellToolTimeoutMs > 0) {
+        exec->timer = new QTimer(this);
+        exec->timer->setSingleShot(true);
+        connect(exec->timer, &QTimer::timeout, this, [this, toolCallId]() {
+            auto* e = m_activeShellExecs.value(toolCallId);
+            if (!e) return;
+
+            warn("Shell 命令超时 [{}]: {}", toolCallId.toStdString(), e->command.toStdString());
+
+            // 杀掉进程。kill() 会在同线程同步触发 finished 信号，
+            // finished 处理器会调用 cleanupShellExec 删除 e，所以 kill 后 e 可能已失效。
+            if (e->process->state() != QProcess::NotRunning) {
+                e->process->kill();
+            }
+
+            // 检查 entry 是否还在（可能在 kill() 同步触发的 finished 信号中被清理了）
+            e = m_activeShellExecs.value(toolCallId);
+            if (!e) return;
+
+            // finished 信号未处理（进程已自行结束但信号未传递），直接处理
+            QString resultText = QString("命令超时（%1ms）。\n").arg(m_shellToolTimeoutMs);
+            resultText += "stdout:\n" + e->stdoutBuf + "\n";
+            resultText += "stderr:\n" + e->stderrBuf + "\n";
+
+            QString cmd = e->command;
+            cleanupShellExec(toolCallId);
+
+            submitToolResultBatched(toolCallId, "shell_exec", resultText);
+            emit shellCommandFinished(toolCallId, false, "执行超时", resultText);
+            warn("Shell 命令超时（进程已结束） [{}]", cmd.toStdString());
+        });
+        exec->timer->start(m_shellToolTimeoutMs);
+    }
+
+    m_activeShellExecs.insert(toolCallId, exec);
+    exec->process->start();
+    info("Shell 命令已在后台启动 [toolCallId={}]: {}", toolCallId.toStdString(), command.toStdString());
+}
+
+void ChatBot::cleanupShellExec(const QString& toolCallId) {
+    auto* e = m_activeShellExecs.take(toolCallId);
+    if (!e) return;
+
+    if (e->timer) {
+        e->timer->stop();
+        e->timer->deleteLater();
+    }
+
+    if (e->process) {
+        e->process->disconnect(this);
+        if (e->process->state() != QProcess::NotRunning) {
+            e->process->kill();
+            // 异步场景下不使用 waitForFinished，避免阻塞
+            e->process->waitForFinished(200);
+        }
+        e->process->deleteLater();
+    }
+
+    delete e;
 }
 
 // -----------------------------------------------------------------------

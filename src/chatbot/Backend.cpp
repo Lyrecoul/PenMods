@@ -560,6 +560,8 @@ void ChatBot::submitToolResultBatched(const QString& toolCallId, const QString& 
 }
 
 void ChatBot::tryFlushToolBatch() {
+    if (m_cancelled) return;
+
     for (const auto& entry : m_toolCallBatch) {
         if (!entry.resolved) return;
     }
@@ -597,6 +599,8 @@ void ChatBot::tryFlushToolBatch() {
 // -----------------------------------------------------------------------
 
 void ChatBot::makeApiRequest(const QJsonArray& messages) {
+    m_cancelled = false;
+
     if (m_apiKey.isEmpty()) {
         emit errorOccurred("API 密钥未设置\n请进入「设置」页面配置有效的 API 密钥后重试");
         return;
@@ -747,23 +751,27 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                 QString     toolCallsJson = QString::fromStdString(tcArr.dump());
                 MessageData assistantMsg;
                 assistantMsg.role          = "assistant";
-                assistantMsg.content       = m_currentStreamBuffer;
+                if (!m_cancelled) assistantMsg.content = m_currentStreamBuffer;
                 assistantMsg.toolCallsJson = toolCallsJson;
-                currentMessages().append(assistantMsg);
-                if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
-                m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
-                saveSessions();
-                emit messagesChanged();
+                if (!m_cancelled) {
+                    currentMessages().append(assistantMsg);
+                    if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
+                    m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+                    saveSessions();
+                    emit messagesChanged();
+                }
                 dispatchToolCalls(toolCallsJson);
             } else if (!m_currentStreamBuffer.isEmpty()) {
-                MessageData assistantMsg;
-                assistantMsg.role    = "assistant";
-                assistantMsg.content = m_currentStreamBuffer;
-                currentMessages().append(assistantMsg);
-                if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
-                m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
-                saveSessions();
-                emit messagesChanged();
+                if (!m_cancelled) {
+                    MessageData assistantMsg;
+                    assistantMsg.role    = "assistant";
+                    assistantMsg.content = m_currentStreamBuffer;
+                    currentMessages().append(assistantMsg);
+                    if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
+                    m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+                    saveSessions();
+                    emit messagesChanged();
+                }
             }
         } else {
             QByteArray    response = reply->readAll();
@@ -787,28 +795,38 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                 QString       toolCallsJson = QString(tcDoc.toJson(QJsonDocument::Compact));
                 MessageData   assistantMsg;
                 assistantMsg.role          = "assistant";
-                assistantMsg.content       = message["content"].toString();
+                if (!m_cancelled) assistantMsg.content = message["content"].toString();
                 assistantMsg.toolCallsJson = toolCallsJson;
-                currentMessages().append(assistantMsg);
-                if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
-                m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
-                saveSessions();
-                emit messagesChanged();
+                if (!m_cancelled) {
+                    currentMessages().append(assistantMsg);
+                    if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
+                    m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+                    saveSessions();
+                    emit messagesChanged();
+                }
                 dispatchToolCalls(toolCallsJson);
             } else if (message.contains("content") && message["content"].isString()) {
                 QString     content = message["content"].toString();
-                MessageData assistantMsg;
-                assistantMsg.role    = "assistant";
-                assistantMsg.content = content;
-                currentMessages().append(assistantMsg);
-                if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
-                m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
-                saveSessions();
-                emit messageReceived(content, true);
-                emit messagesChanged();
+                if (!m_cancelled) {
+                    MessageData assistantMsg;
+                    assistantMsg.role    = "assistant";
+                    assistantMsg.content = content;
+                    currentMessages().append(assistantMsg);
+                    if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
+                    m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+                    saveSessions();
+                    emit messageReceived(content, true);
+                    emit messagesChanged();
+                }
             }
         }
     } else {
+        if (reply->error() == QNetworkReply::OperationCanceledError && m_cancelled) {
+            m_activeReplies.removeAll(reply);
+            reply->deleteLater();
+            return;
+        }
+
         if (isStream) emit streamEnd();
 
         int        httpStatus   = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
@@ -938,6 +956,33 @@ void ChatBot::clearHistory() {
     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
     saveSessions();
     emit messagesChanged();
+}
+
+void ChatBot::cancelRequest() {
+    m_cancelled = true;
+
+    for (QNetworkReply* reply : m_activeReplies) {
+        if (reply && !reply->isFinished()) reply->abort();
+    }
+    m_activeReplies.clear();
+
+    QStringList shellKeys;
+    for (auto it = m_activeShellExecs.constBegin(); it != m_activeShellExecs.constEnd(); ++it)
+        shellKeys.append(it.key());
+    for (const auto& key : shellKeys)
+        cleanupShellExec(key);
+
+    while (!m_pendingShellExecs.isEmpty()) {
+        auto pending = m_pendingShellExecs.takeFirst();
+        emit shellCommandFinished(pending.toolCallId, false, "用户取消了请求", pending.command);
+    }
+
+    m_currentStreamBuffer.clear();
+    m_responseBuffer.clear();
+    m_toolCallsBuffer.clear();
+    m_toolCallBatch.clear();
+
+    emit requestCancelled();
 }
 
 void ChatBot::saveMessages() {
@@ -1631,6 +1676,8 @@ void ChatBot::injectToolDefinitions(QJsonObject& requestBody) {
 }
 
 void ChatBot::dispatchToolCalls(const QString& toolCallsJson) {
+    if (m_cancelled) return;
+
     QJsonDocument doc = QJsonDocument::fromJson(toolCallsJson.toUtf8());
     if (!doc.isArray()) {
         emit toolCallReceived(toolCallsJson);
@@ -1657,6 +1704,7 @@ void ChatBot::dispatchToolCalls(const QString& toolCallsJson) {
 
     // 分发执行
     for (const auto& val : arr) {
+        if (m_cancelled) return;
         QJsonObject tc   = val.toObject();
         QString     name = tc["function"].toObject()["name"].toString();
         QString     id   = tc["id"].toString();
@@ -1702,9 +1750,17 @@ void ChatBot::executeTavilySearch(const QString& toolCallId, const QString& quer
 
     QByteArray     data  = QJsonDocument(body).toJson(QJsonDocument::Compact);
     QNetworkReply* reply = m_networkManager->post(request, data);
+    m_activeReplies.append(reply);
 
     connect(reply, &QNetworkReply::finished, [this, reply, toolCallId, query]() {
+        if (!m_activeReplies.contains(reply)) {
+            reply->deleteLater();
+            return;
+        }
+        m_activeReplies.removeAll(reply);
         reply->deleteLater();
+
+        if (m_cancelled) return;
 
         if (reply->error() != QNetworkReply::NoError) {
             QString errMsg = reply->errorString();

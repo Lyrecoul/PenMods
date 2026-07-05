@@ -98,6 +98,7 @@ public:
     Q_INVOKABLE void    editMessage(int index, const QString& newContent);
     Q_INVOKABLE void    deleteMessage(int index);
     Q_INVOKABLE void    regenerateMessage(int index);
+    Q_INVOKABLE void    cancelRequest();
 
     // Tool Call 接口
     Q_INVOKABLE void submitToolResult(const QString& toolCallId, const QString& toolName, const QString& result);
@@ -180,6 +181,7 @@ signals:
     void streamChunk(const QString& content);
     void streamEnd();
     void errorOccurred(const QString& error);
+    void requestCancelled();
     // Tool Call 信号：toolCallsJson 为完整 tool_calls 数组的 JSON 字符串
     void toolCallReceived(const QString& toolCallsJson);
     void apiKeyChanged();
@@ -216,6 +218,7 @@ public:
 private:
     QNetworkAccessManager* m_networkManager;
     QList<QNetworkReply*>  m_activeReplies;
+    bool                   m_cancelled = false;
 
     QString m_apiKey;
     QString m_apiEndpoint;

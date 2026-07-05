@@ -131,6 +131,9 @@ Config::Config() : Logger("Config") {
             {"cycle_interval", 300},
             {"last_wallpaper", ""}
         }},
+        {"capture", {
+            {"enabled", false}
+        }},
         {"ai", {
             {"speech_assistant", false},
             {"streaming", true},
@@ -151,7 +154,9 @@ Config::Config() : Logger("Config") {
                         {"toolCall",  false},
                         {"reasoning", false}
                     }},
-                    {"extraParams", ""}
+                    {"extraParams", ""},
+                    {"proxyVisionModelId", ""},
+                    {"proxyVisionPrompt", "请详细描述这张图片的内容。如果图片中有文字，请完整转录。"}
                 }
             })},
             {"activeModelId", "deepseek-v4-flash"},
@@ -168,6 +173,16 @@ Config::Config() : Logger("Config") {
                 {"search_depth", "advanced"},
                 {"max_results",  5},
                 {"enabled",      false}
+            }},
+            {"shell_tool", {
+                {"enabled",   false},
+                {"timeout_ms", 10000},
+                {"max_output_bytes", 4096},
+                {"blocklist", json::array()}
+            }},
+            {"math_render", {
+                {"enabled",     false},
+                {"server_path", ""}
             }}
         }}
     };

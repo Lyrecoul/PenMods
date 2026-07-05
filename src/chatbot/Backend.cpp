@@ -15,6 +15,7 @@
 
 #include <QDateTime>
 #include <QDir>
+#include <QEventLoop>
 #include <QFile>
 #include <QHttpMultiPart>
 #include <QHttpPart>
@@ -497,16 +498,52 @@ void ChatBot::sendMessageWithMedia(const QString& message, const QString& mediaP
         }
     }
 
-    QJsonArray apiMessages = buildApiMessages(currentMessages(), message, parts);
+    bool hasImageParts = false;
+    for (const auto& p : parts) {
+        if (p.type == "image_url") {
+            hasImageParts = true;
+            break;
+        }
+    }
+
+    QString effectiveMessage = message;
+
+    if (!m_capVision && hasImageParts) {
+        if (!m_proxyVisionModelId.isEmpty()) {
+            emit proxyVisionStarted();
+            QString desc = callVisionProxy(parts);
+            if (!desc.isEmpty()) {
+                effectiveMessage = "[图片描述]\n" + desc + "\n\n[用户消息]\n" + message;
+                // 保留非 image 的 parts（如 text、audio）
+                parts.erase(std::remove_if(parts.begin(), parts.end(), [](const MessagePart& p) {
+                    return p.type == "image_url";
+                }), parts.end());
+            } else {
+                emit errorOccurred("视觉代理模型调用失败，已移除图片仅发送文字");
+                parts.erase(std::remove_if(parts.begin(), parts.end(), [](const MessagePart& p) {
+                    return p.type == "image_url";
+                }), parts.end());
+                effectiveMessage = "[图片分析失败]\n" + message;
+            }
+        } else {
+            emit errorOccurred("当前模型不支持视觉，请先在模型设置中配置「视觉代理模型」");
+            parts.erase(std::remove_if(parts.begin(), parts.end(), [](const MessagePart& p) {
+                return p.type == "image_url";
+            }), parts.end());
+        }
+        emit proxyVisionCompleted(effectiveMessage);
+    }
+
+    QJsonArray apiMessages = buildApiMessages(currentMessages(), effectiveMessage, parts);
 
     // 记录用户消息（含多模态）
     MessageData userMsg;
     userMsg.role  = "user";
     userMsg.parts = parts;
-    if (!message.isEmpty()) {
+    if (!effectiveMessage.isEmpty()) {
         MessagePart textPart;
         textPart.type = "text";
-        textPart.text = message;
+        textPart.text = effectiveMessage;
         userMsg.parts.prepend(textPart);
     }
     currentMessages().append(userMsg);
@@ -517,6 +554,156 @@ void ChatBot::sendMessageWithMedia(const QString& message, const QString& mediaP
     emit messagesChanged();
 
     makeApiRequest(apiMessages);
+}
+
+// -----------------------------------------------------------------------
+// callVisionProxy: 用视觉代理模型提取图片文字描述（同步）
+// 自动检测 OpenAI / Anthropic 格式
+// -----------------------------------------------------------------------
+
+QString ChatBot::callVisionProxy(const QVector<MessagePart>& parts) {
+    std::string proxyId = m_proxyVisionModelId.toStdString();
+
+    json proxyModel;
+    for (const auto& model : m_modelsData["models"]) {
+        if (model["id"] == proxyId) {
+            proxyModel = model;
+            break;
+        }
+    }
+    if (proxyModel.empty()) {
+        warn("代理视觉模型未找到: {}", proxyId);
+        return {};
+    }
+
+    QString proxyEndpoint = QString::fromStdString(proxyModel["endpoint"]);
+    QString proxyApiKey   = QString::fromStdString(proxyModel["apiKey"]);
+    QString proxyModelId  = QString::fromStdString(proxyModel["modelId"]);
+
+    bool isAnthropic = proxyEndpoint.contains("/messages");
+
+    // 构造请求体
+    QJsonArray messages;
+    QJsonObject userMsg;
+    userMsg["role"] = "user";
+
+    if (isAnthropic) {
+        // Anthropic 格式
+        QJsonArray contentArray;
+        for (const auto& p : parts) {
+            if (p.type == "image_url") {
+                QString base64Data = p.url;
+                if (base64Data.startsWith("data:image/jpeg;base64,"))
+                    base64Data = base64Data.mid(23);
+                else                 if (base64Data.startsWith("data:image/png;base64,"))
+                    base64Data = base64Data.mid(22);
+
+                QJsonObject imgObj;
+                imgObj["type"] = "image";
+                QJsonObject source;
+                source["type"]       = "base64";
+                source["media_type"] = "image/jpeg";
+                source["data"]       = base64Data;
+                imgObj["source"]     = source;
+                contentArray.append(imgObj);
+            }
+        }
+        QJsonObject textObj;
+        textObj["type"] = "text";
+        textObj["text"] = m_proxyVisionPrompt;
+        contentArray.append(textObj);
+        userMsg["content"] = contentArray;
+    } else {
+        // OpenAI 格式
+        QJsonArray contentArray;
+        for (const auto& p : parts) {
+            if (p.type == "image_url") {
+                QJsonObject imgObj;
+                imgObj["type"] = "image_url";
+                QJsonObject imgUrl;
+                imgUrl["url"] = p.url;
+                imgObj["image_url"] = imgUrl;
+                contentArray.append(imgObj);
+            }
+        }
+        QJsonObject textObj;
+        textObj["type"] = "text";
+        textObj["text"] = m_proxyVisionPrompt;
+        contentArray.append(textObj);
+        userMsg["content"] = contentArray;
+    }
+    messages.append(userMsg);
+
+    QJsonObject requestBody;
+    requestBody["model"]    = proxyModelId;
+    requestBody["messages"] = messages;
+    requestBody["stream"]   = false;
+    if (isAnthropic)
+        requestBody["max_tokens"] = 4096;
+    if (proxyModel.contains("temperature") && proxyModel["temperature"].is_number())
+        requestBody["temperature"] = proxyModel["temperature"].get<double>();
+
+    QJsonDocument jsonDoc(requestBody);
+    QByteArray    data = jsonDoc.toJson();
+
+    QUrl            proxyUrl(proxyEndpoint);
+    QNetworkRequest request(proxyUrl);
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    if (isAnthropic) {
+        request.setRawHeader("x-api-key", proxyApiKey.toUtf8());
+        request.setRawHeader("anthropic-version", "2023-06-01");
+    } else if (!proxyApiKey.isEmpty()) {
+        request.setRawHeader("Authorization", ("Bearer " + proxyApiKey).toUtf8());
+    }
+
+    info("调用视觉代理模型 {} ({} {}): {}",
+         proxyId, isAnthropic ? "Anthropic" : "OpenAI", proxyEndpoint.toStdString(),
+         m_proxyVisionPrompt.left(30).toStdString());
+
+    QNetworkReply* reply = m_networkManager->post(request, data);
+    QObject::connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
+
+    QEventLoop loop;
+    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    loop.exec();
+
+    if (reply->error() != QNetworkReply::NoError) {
+        warn("视觉代理模型调用失败: {}", reply->errorString().toStdString());
+        return {};
+    }
+
+    QByteArray  responseData = reply->readAll();
+    QJsonObject responseJson = QJsonDocument::fromJson(responseData).object();
+
+    if (responseJson.contains("error")) {
+        warn("视觉代理模型返回错误: {}", responseJson["error"].toObject()["message"].toString().toStdString());
+        return {};
+    }
+
+    QString desc;
+    if (isAnthropic) {
+        QJsonArray content = responseJson["content"].toArray();
+        if (content.isEmpty()) {
+            warn("视觉代理模型返回空 content，完整响应: {}", responseData.constData());
+            return {};
+        }
+        desc = content[0].toObject()["text"].toString();
+    } else {
+        QJsonArray choices = responseJson["choices"].toArray();
+        if (choices.isEmpty()) {
+            warn("视觉代理模型返回空 choices，完整响应: {}", responseData.constData());
+            return {};
+        }
+        desc = choices[0].toObject()["message"].toObject()["content"].toString();
+    }
+
+    if (desc.isEmpty()) {
+        warn("视觉代理模型返回空文本");
+        return {};
+    }
+
+    info("视觉代理模型返回 {} 个字符", desc.length());
+    return desc.trimmed();
 }
 
 // -----------------------------------------------------------------------
@@ -1104,6 +1291,18 @@ void ChatBot::setIsStreaming(bool streaming) {
     emit isStreamingChanged();
 }
 
+void ChatBot::setProxyVisionModelId(const QString& v) {
+    if (m_proxyVisionModelId == v) return;
+    m_proxyVisionModelId = v;
+    emit proxyVisionSettingsChanged();
+}
+
+void ChatBot::setProxyVisionPrompt(const QString& v) {
+    if (m_proxyVisionPrompt == v) return;
+    m_proxyVisionPrompt = v;
+    emit proxyVisionSettingsChanged();
+}
+
 // -----------------------------------------------------------------------
 // 多模型管理
 // -----------------------------------------------------------------------
@@ -1125,6 +1324,8 @@ void ChatBot::initModels() {
         defaultModel["modelId"]       = m_model.toStdString();
         defaultModel["temperature"]   = m_temperature;
         defaultModel["extraParams"]   = json::object();
+        defaultModel["proxyVisionModelId"] = "";
+        defaultModel["proxyVisionPrompt"]  = "请详细描述这张图片的内容。如果图片中有文字，请完整转录。";
         m_modelsData["models"]        = json::array({defaultModel});
         m_modelsData["activeModelId"] = m_model.toStdString();
         saveModels();
@@ -1160,6 +1361,11 @@ void ChatBot::applyModelConfig(const json& modelObj) {
     else m_extraParams = json::object();
 
     m_maxContextSize = modelObj.value("maxContextSize", 0);
+
+    m_proxyVisionModelId = QString::fromStdString(modelObj.value("proxyVisionModelId", ""));
+    m_proxyVisionPrompt  = QString::fromStdString(
+        modelObj.value("proxyVisionPrompt", "请详细描述这张图片的内容。如果图片中有文字，请完整转录。")
+    );
 
     m_capText      = true;
     m_capVision    = false;
@@ -1233,6 +1439,12 @@ bool ChatBot::addModel(const QString& modelJson) {
         newModel["extraParams"] = json::object();
     }
 
+    // proxyVision
+    newModel["proxyVisionModelId"] = input["proxyVisionModelId"].toString().toStdString();
+    newModel["proxyVisionPrompt"]  = input["proxyVisionPrompt"]
+                                         .toString()
+                                         .toStdString();
+
     bool updated = false;
     for (auto& model : m_modelsData["models"]) {
         if (model["id"] == id) {
@@ -1271,6 +1483,16 @@ bool ChatBot::removeModel(const QString& modelId) {
                 emit apiKeyChanged();
                 emit modelChanged();
                 emit temperatureChanged();
+            }
+            // 清理其他模型对被删除模型的视觉代理引用
+            for (auto& model : models) {
+                if (model.value("proxyVisionModelId", "") == id)
+                    model["proxyVisionModelId"] = "";
+            }
+            // 若当前活动模型的代理引用恰好是被删除的模型，通知 QML
+            if (m_proxyVisionModelId == modelId) {
+                m_proxyVisionModelId.clear();
+                emit proxyVisionSettingsChanged();
             }
             saveModels();
             emit modelsChanged();

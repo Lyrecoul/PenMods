@@ -180,6 +180,8 @@ PEN_HOOK(bool, license_verify) { return true; }
 
 #include "plugin/PluginManager.h"
 
+#include "capture/CameraCapture.h"
+
 using namespace mod;
 
 __attribute__((constructor)) static void BeforeMain() {
@@ -263,6 +265,9 @@ __attribute__((constructor)) static void BeforeMain() {
     
     // wallpaper
     INSTANCE(WallpaperManager)
+
+    // capture
+    INSTANCE(capture::CameraCapture)
 
 #undef INSTANCE
 }

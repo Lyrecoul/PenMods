@@ -75,6 +75,9 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
     Q_PROPERTY(bool capToolCall READ getCapToolCall NOTIFY activeModelCapabilitiesChanged)
     Q_PROPERTY(bool capReasoning READ getCapReasoning NOTIFY activeModelCapabilitiesChanged)
 
+    Q_PROPERTY(QString proxyVisionModelId READ getProxyVisionModelId WRITE setProxyVisionModelId NOTIFY proxyVisionSettingsChanged)
+    Q_PROPERTY(QString proxyVisionPrompt READ getProxyVisionPrompt WRITE setProxyVisionPrompt NOTIFY proxyVisionSettingsChanged)
+
     Q_PROPERTY(bool tavilyEnabled READ getTavilyEnabled WRITE setTavilyEnabled NOTIFY tavilyConfigChanged)
     Q_PROPERTY(bool tavilyConfigured READ getTavilyConfigured NOTIFY tavilyConfigChanged)
 
@@ -156,6 +159,11 @@ public:
     bool getCapToolCall() const { return m_capToolCall; }
     bool getCapReasoning() const { return m_capReasoning; }
 
+    QString getProxyVisionModelId() const { return m_proxyVisionModelId; }
+    void    setProxyVisionModelId(const QString& v);
+    QString getProxyVisionPrompt() const { return m_proxyVisionPrompt; }
+    void    setProxyVisionPrompt(const QString& v);
+
     bool getTavilyEnabled() const { return m_tavilyEnabled; }
     bool getTavilyConfigured() const { return !m_tavilyApiKey.isEmpty(); }
     void setTavilyEnabled(bool v);
@@ -196,6 +204,9 @@ signals:
     void sessionsChanged();
     void sessionSwitched(const QString& sessionId);
     void activeModelCapabilitiesChanged();
+    void proxyVisionSettingsChanged();
+    void proxyVisionStarted();
+    void proxyVisionCompleted(const QString& description);
     void tavilyConfigChanged();
     void tavilySearchStarted(const QString& toolCallId, const QString& query);
     void
@@ -237,6 +248,9 @@ private:
     bool m_capToolCall    = false;
     bool m_capReasoning   = false;
     int  m_maxContextSize = 0;
+
+    QString m_proxyVisionModelId;
+    QString m_proxyVisionPrompt = "请详细描述这张图片的内容。如果图片中有文字，请完整转录。";
 
     QVector<MessageData>&       currentMessages();
     const QVector<MessageData>& currentMessages() const;
@@ -337,6 +351,8 @@ private:
 
     void submitToolResultBatched(const QString& toolCallId, const QString& toolName, const QString& result);
     void tryFlushToolBatch();
+
+    QString callVisionProxy(const QVector<MessagePart>& parts);
 };
 
 } // namespace mod::chatbot

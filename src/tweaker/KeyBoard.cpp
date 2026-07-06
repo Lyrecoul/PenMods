@@ -7,6 +7,7 @@
 #include "tweaker/KeyBoard.h"
 
 #include "common/Event.h"
+#include "mod/Config.h"
 
 #include "base/YPointer.h"
 
@@ -15,6 +16,10 @@
 namespace mod {
 
 KeyBoard::KeyBoard() {
+    auto& config  = mod::Config::getInstance();
+    json  aiCfg   = config.read("ai");
+    m_autoSendScanConfig = aiCfg.contains("auto_send_scan") ? aiCfg["auto_send_scan"].get<bool>() : true;
+
     connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView& view, QQmlContext* context) {
         context->setContextProperty("keyBoard", this);
     });
@@ -24,6 +29,18 @@ void KeyBoard::setAutoSendScan(bool value) {
     if (m_autoSendScan != value) {
         m_autoSendScan = value;
         emit autoSendScanChanged();
+    }
+}
+
+void KeyBoard::setAutoSendScanConfig(bool value) {
+    if (m_autoSendScanConfig != value) {
+        m_autoSendScanConfig = value;
+        auto& config = mod::Config::getInstance();
+        json aiCfg   = config.read("ai");
+        if (aiCfg.is_null()) aiCfg = json::object();
+        aiCfg["auto_send_scan"] = value;
+        config.write("ai", aiCfg, true);
+        emit autoSendScanConfigChanged();
     }
 }
 

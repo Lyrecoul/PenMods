@@ -135,6 +135,7 @@ Config::Config() : Logger("Config") {
             {"enabled", false}
         }},
         {"ai", {
+            {"auto_send_scan", true},
             {"speech_assistant", false},
             {"streaming", true},
             {"models", json::array({

@@ -26,9 +26,18 @@ KeyBoard::KeyBoard() {
 }
 
 void KeyBoard::setAutoSendScan(bool value) {
+    if (value && m_inputPageShowing)
+        return;
     if (m_autoSendScan != value) {
         m_autoSendScan = value;
         emit autoSendScanChanged();
+    }
+}
+
+void KeyBoard::setInputPageShowing(bool value) {
+    if (m_inputPageShowing != value) {
+        m_inputPageShowing = value;
+        emit inputPageShowingChanged();
     }
 }
 

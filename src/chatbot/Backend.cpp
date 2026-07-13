@@ -2185,7 +2185,28 @@ void ChatBot::denyShellCommand(const QString& toolCallId) {
     for (int i = 0; i < m_pendingShellExecs.size(); ++i) {
         if (m_pendingShellExecs[i].toolCallId == toolCallId) {
             auto pending = m_pendingShellExecs.takeAt(i);
-            // 不提交 tool result 给 AI，等待用户输入新消息解释拒绝原因
+
+            // 将所有未完成的 batch 条目标记为已拒绝，并写入 history，
+            // 避免下次 sendMessage/editMessage 时 API 看到 tool_calls 却无对应 tool_result 而报 Bad request
+            for (auto& entry : m_toolCallBatch) {
+                if (!entry.resolved) {
+                    entry.resolved = true;
+                    entry.result   = "用户拒绝了该操作";
+                }
+            }
+            for (const auto& entry : m_toolCallBatch) {
+                MessageData toolMsg;
+                toolMsg.role       = "tool";
+                toolMsg.toolCallId = entry.id;
+                toolMsg.content    = entry.result;
+                currentMessages().append(toolMsg);
+                if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
+            }
+            m_toolCallBatch.clear();
+            m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+            saveSessions();
+            emit messagesChanged();
+
             emit shellCommandFinished(toolCallId, false, "用户拒绝执行", pending.command);
             cancelRequest();
             return;

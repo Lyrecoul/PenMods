@@ -230,6 +230,7 @@ private:
     QNetworkAccessManager* m_networkManager;
     QList<QNetworkReply*>  m_activeReplies;
     bool                   m_cancelled = false;
+    int                    m_requestSeq = 0;
 
     QString m_apiKey;
     QString m_apiEndpoint;

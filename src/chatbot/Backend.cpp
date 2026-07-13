@@ -786,17 +786,25 @@ void ChatBot::tryFlushToolBatch() {
 // -----------------------------------------------------------------------
 
 void ChatBot::makeApiRequest(const QJsonArray& messages) {
+    // 递增序列号使旧请求的回调自动失效
+    int seq = ++m_requestSeq;
+
+    // 清理旧 reply，安全地断开连接以释放底层网络资源
+    for (QNetworkReply* reply : m_activeReplies) {
+        if (reply) {
+            reply->disconnect(this);
+            if (!reply->isFinished()) reply->abort();
+            reply->deleteLater();
+        }
+    }
+    m_activeReplies.clear();
+
     m_cancelled = false;
 
     if (m_apiKey.isEmpty()) {
         emit errorOccurred("API 密钥未设置\n请进入「设置」页面配置有效的 API 密钥后重试");
         return;
     }
-
-    for (QNetworkReply* reply : m_activeReplies) {
-        if (reply && !reply->isFinished()) reply->abort();
-    }
-    m_activeReplies.clear();
 
     QJsonObject requestBody;
     requestBody["model"]       = m_model;
@@ -839,13 +847,15 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
         emit streamStart();
     }
 
-    connect(reply, &QNetworkReply::finished, [this, reply]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, seq]() {
+        if (seq != m_requestSeq) { reply->deleteLater(); return; }
         m_activeReplies.removeAll(reply);
         handleNetworkReply(reply, m_isStreaming);
     });
 
     if (m_isStreaming) {
-        connect(reply, &QNetworkReply::readyRead, [this, reply]() {
+        connect(reply, &QNetworkReply::readyRead, this, [this, reply, seq]() {
+            if (seq != m_requestSeq) return;
             QByteArray data = reply->readAll();
             if (data.isEmpty()) return;
 
@@ -858,6 +868,38 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
 
                 QString jsonData = trimmedLine.mid(6);
                 if (jsonData.trimmed() == "[DONE]") {
+                    // 在 finished 信号之前就把响应写入历史，
+                    // 防止 regenerateMessage 在 streamEnd 后 finished 前被调用时因索引越界空转
+                    if (!m_cancelled) {
+                        if (!m_toolCallsBuffer.isEmpty()) {
+                            json tcArr = json::array();
+                            for (auto it = m_toolCallsBuffer.constBegin(); it != m_toolCallsBuffer.constEnd(); ++it)
+                                tcArr.push_back(it.value());
+                            QString     toolCallsJson = QString::fromStdString(tcArr.dump());
+                            MessageData assistantMsg;
+                            assistantMsg.role          = "assistant";
+                            assistantMsg.content       = m_currentStreamBuffer;
+                            assistantMsg.toolCallsJson = toolCallsJson;
+                            currentMessages().append(assistantMsg);
+                            if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
+                            m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+                            saveSessions();
+                            emit messagesChanged();
+                            dispatchToolCalls(toolCallsJson);
+                        } else if (!m_currentStreamBuffer.isEmpty()) {
+                            MessageData assistantMsg;
+                            assistantMsg.role    = "assistant";
+                            assistantMsg.content = m_currentStreamBuffer;
+                            currentMessages().append(assistantMsg);
+                            if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
+                            m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+                            saveSessions();
+                            emit messagesChanged();
+                        }
+                    }
+                    // 清空 buffer 防止 handleNetworkReply 重复保存
+                    m_currentStreamBuffer.clear();
+                    m_toolCallsBuffer.clear();
                     emit streamEnd();
                     continue;
                 }
@@ -1974,7 +2016,7 @@ void ChatBot::executeTavilySearch(const QString& toolCallId, const QString& quer
     QNetworkReply* reply = m_networkManager->post(request, data);
     m_activeReplies.append(reply);
 
-    connect(reply, &QNetworkReply::finished, [this, reply, toolCallId, query]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, toolCallId, query]() {
         if (!m_activeReplies.contains(reply)) {
             reply->deleteLater();
             return;
@@ -2143,8 +2185,9 @@ void ChatBot::denyShellCommand(const QString& toolCallId) {
     for (int i = 0; i < m_pendingShellExecs.size(); ++i) {
         if (m_pendingShellExecs[i].toolCallId == toolCallId) {
             auto pending = m_pendingShellExecs.takeAt(i);
-            submitToolResultBatched(toolCallId, "shell_exec", "用户拒绝执行该命令。请换一种方式或询问用户。");
+            // 不提交 tool result 给 AI，等待用户输入新消息解释拒绝原因
             emit shellCommandFinished(toolCallId, false, "用户拒绝执行", pending.command);
+            cancelRequest();
             return;
         }
     }

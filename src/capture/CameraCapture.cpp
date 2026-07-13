@@ -10,6 +10,7 @@
 
 #include <QBuffer>
 #include <QImage>
+#include <QPainter>
 #include <QQmlContext>
 #include <QQuickView>
 
@@ -144,6 +145,66 @@ QString CameraCapture::cropImage(const QString& base64Data, int x, int y, int w,
     QBuffer    buffer(&ba);
     buffer.open(QIODevice::WriteOnly);
     cropped.save(&buffer, "JPEG", 90);
+    buffer.close();
+
+    return QString::fromLatin1(ba.toBase64());
+}
+
+QString CameraCapture::stitchImages(const QStringList& imageList, const QString& direction) {
+    if (imageList.size() < 2) {
+        spdlog::warn("[CameraCapture] stitchImages: need at least 2 images, got {}", imageList.size());
+        return {};
+    }
+
+    QVector<QImage> images;
+    for (const auto& b64 : imageList) {
+        if (b64.isEmpty()) continue;
+        QByteArray decoded = QByteArray::fromBase64(b64.toLatin1());
+        QImage img;
+        img.loadFromData(decoded);
+        if (!img.isNull()) images.append(img);
+    }
+
+    if (images.size() < 2) {
+        spdlog::warn("[CameraCapture] stitchImages: need at least 2 images, got {}", images.size());
+        return {};
+    }
+
+    bool horizontal = (direction == "horizontal");
+    int totalW = 0, totalH = 0;
+    int maxW = 0, maxH = 0;
+    for (const auto& img : images) {
+        if (horizontal) {
+            totalW += img.width();
+            maxH = std::max(maxH, img.height());
+        } else {
+            totalH += img.height();
+            maxW = std::max(maxW, img.width());
+        }
+    }
+    if (horizontal) totalH = maxH;
+    else totalW = maxW;
+
+    QImage composite(totalW, totalH, QImage::Format_RGB32);
+    composite.fill(Qt::white);
+    QPainter painter(&composite);
+
+    int offset = 0;
+    for (const auto& img : images) {
+        if (horizontal) {
+            painter.drawImage(offset, 0, img);
+            offset += img.width();
+        } else {
+            painter.drawImage(0, offset, img);
+            offset += img.height();
+        }
+    }
+    painter.end();
+
+    QByteArray ba;
+    QBuffer buffer(&ba);
+    buffer.open(QIODevice::WriteOnly);
+    composite.save(&buffer, "JPEG", 90);
     buffer.close();
 
     return QString::fromLatin1(ba.toBase64());

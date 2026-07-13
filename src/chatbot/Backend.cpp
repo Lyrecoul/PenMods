@@ -557,7 +557,7 @@ void ChatBot::sendMessageWithMedia(const QString& message, const QString& mediaP
 }
 
 // -----------------------------------------------------------------------
-// callVisionProxy: 用视觉代理模型提取图片文字描述（同步）
+// callVisionProxy: 用视觉代理模型提取图片文字描述
 // 自动检测 OpenAI / Anthropic 格式
 // -----------------------------------------------------------------------
 
@@ -588,14 +588,13 @@ QString ChatBot::callVisionProxy(const QVector<MessagePart>& parts) {
     userMsg["role"] = "user";
 
     if (isAnthropic) {
-        // Anthropic 格式
         QJsonArray contentArray;
         for (const auto& p : parts) {
             if (p.type == "image_url") {
                 QString base64Data = p.url;
                 if (base64Data.startsWith("data:image/jpeg;base64,"))
                     base64Data = base64Data.mid(23);
-                else                 if (base64Data.startsWith("data:image/png;base64,"))
+                else if (base64Data.startsWith("data:image/png;base64,"))
                     base64Data = base64Data.mid(22);
 
                 QJsonObject imgObj;
@@ -614,7 +613,6 @@ QString ChatBot::callVisionProxy(const QVector<MessagePart>& parts) {
         contentArray.append(textObj);
         userMsg["content"] = contentArray;
     } else {
-        // OpenAI 格式
         QJsonArray contentArray;
         for (const auto& p : parts) {
             if (p.type == "image_url") {
@@ -649,6 +647,7 @@ QString ChatBot::callVisionProxy(const QVector<MessagePart>& parts) {
     QUrl            proxyUrl(proxyEndpoint);
     QNetworkRequest request(proxyUrl);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    request.setTransferTimeout(30000);
     if (isAnthropic) {
         request.setRawHeader("x-api-key", proxyApiKey.toUtf8());
         request.setRawHeader("anthropic-version", "2023-06-01");
@@ -661,18 +660,34 @@ QString ChatBot::callVisionProxy(const QVector<MessagePart>& parts) {
          m_proxyVisionPrompt.left(30).toStdString());
 
     QNetworkReply* reply = m_networkManager->post(request, data);
-    QObject::connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
+
+    // 超时定时器：30s 无响应则中止
+    QTimer timeoutTimer;
+    timeoutTimer.setSingleShot(true);
+    connect(&timeoutTimer, &QTimer::timeout, reply, &QNetworkReply::abort);
 
     QEventLoop loop;
-    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    timeoutTimer.start(30000);
     loop.exec();
+    timeoutTimer.stop();
+
+    if (m_cancelled) {
+        reply->abort();
+        reply->deleteLater();
+        warn("视觉代理模型调用已取消");
+        return {};
+    }
 
     if (reply->error() != QNetworkReply::NoError) {
         warn("视觉代理模型调用失败: {}", reply->errorString().toStdString());
+        reply->deleteLater();
         return {};
     }
 
     QByteArray  responseData = reply->readAll();
+    reply->deleteLater();
+
     QJsonObject responseJson = QJsonDocument::fromJson(responseData).object();
 
     if (responseJson.contains("error")) {

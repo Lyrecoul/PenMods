@@ -9,6 +9,7 @@
 #include "mod/Config.h"
 
 #include <QString>
+#include <QStringList>
 
 namespace mod::capture {
 
@@ -25,6 +26,8 @@ public:
     void onScanComplete();
 
     Q_INVOKABLE QString cropImage(const QString& base64Data, int x, int y, int w, int h);
+
+    Q_INVOKABLE QString stitchImages(const QStringList& imageList, const QString& direction);
 
 signals:
 

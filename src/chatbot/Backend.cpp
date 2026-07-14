@@ -15,7 +15,6 @@
 
 #include <QDateTime>
 #include <QDir>
-#include <QEventLoop>
 #include <QFile>
 #include <QHttpMultiPart>
 #include <QHttpPart>
@@ -293,6 +292,8 @@ static json messageDataToJson(const MessageData& msg) {
     if (msg.isMultimodal()) {
         json partsArr = json::array();
         for (const auto& part : msg.parts) {
+            if (part.type == "image_url" && part.url.startsWith("data:", Qt::CaseInsensitive)) continue;
+
             json p;
             p["type"]   = part.type.toStdString();
             p["text"]   = part.text.toStdString();
@@ -301,7 +302,8 @@ static json messageDataToJson(const MessageData& msg) {
             p["format"] = part.format.toStdString();
             partsArr.push_back(p);
         }
-        obj["parts"] = partsArr;
+        if (partsArr.empty()) obj["content"] = msg.content.toStdString();
+        else obj["parts"] = partsArr;
     } else {
         obj["content"] = msg.content.toStdString();
     }
@@ -328,6 +330,34 @@ static MessageData messageDataFromJson(const json& obj) {
         msg.content = QString::fromStdString(obj.value("content", ""));
     }
     return msg;
+}
+
+static bool sanitizeMessageHistory(MessageData& msg) {
+    bool removedImage = false;
+    msg.parts.erase(
+        std::remove_if(
+            msg.parts.begin(),
+            msg.parts.end(),
+            [&removedImage](const MessagePart& part) {
+                if (part.type != "image_url" || !part.url.startsWith("data:", Qt::CaseInsensitive)) return false;
+                removedImage = true;
+                return true;
+            }
+        ),
+        msg.parts.end()
+    );
+
+    if (!removedImage) return false;
+    if (!msg.content.isEmpty()) return true;
+
+    for (const auto& part : msg.parts) {
+        if (part.type == "text" && !part.text.isEmpty()) {
+            msg.content = part.text;
+            return true;
+        }
+    }
+    msg.content = "[图片]";
+    return true;
 }
 
 // -----------------------------------------------------------------------
@@ -370,7 +400,8 @@ void ChatBot::saveSessions() {
 // -----------------------------------------------------------------------
 
 void ChatBot::initSessions() {
-    auto  path = sessionsFilePath();
+    bool  historySanitized = false;
+    auto  path             = sessionsFilePath();
     QFile file(path);
     if (file.exists() && file.open(QIODevice::ReadOnly)) {
         try {
@@ -398,7 +429,9 @@ void ChatBot::initSessions() {
                                     msg.toolCallsJson = QString::fromStdString(msgObj["toolCallsJson"]);
                                 session.messages.append(msg);
                             } else {
-                                session.messages.append(messageDataFromJson(msgObj));
+                                MessageData msg = messageDataFromJson(msgObj);
+                                historySanitized |= sanitizeMessageHistory(msg);
+                                session.messages.append(msg);
                             }
                         }
                     }
@@ -422,6 +455,7 @@ void ChatBot::initSessions() {
     if (!m_sessions.contains(m_currentSessionId)) {
         m_currentSessionId = createSession("新对话");
     }
+    if (historySanitized) saveSessions();
 }
 
 bool ChatBot::isAvailable() { return !m_apiKey.isEmpty(); }
@@ -478,6 +512,14 @@ void ChatBot::sendMessage(const QString& message, const QString& fileRefs) {
 // -----------------------------------------------------------------------
 
 void ChatBot::sendMessageWithMedia(const QString& message, const QString& mediaParts) {
+    m_cancelled = false;
+
+    static constexpr int MAX_MEDIA_JSON_SIZE = 12 * 1024 * 1024;
+    if (mediaParts.size() > MAX_MEDIA_JSON_SIZE) {
+        emit errorOccurred("图片数据过大，请裁剪或减少拼接范围后重试");
+        return;
+    }
+
     QVector<MessagePart> parts;
 
     QJsonDocument doc = QJsonDocument::fromJson(mediaParts.toUtf8());
@@ -488,13 +530,18 @@ void ChatBot::sendMessageWithMedia(const QString& message, const QString& mediaP
             part.type = obj["type"].toString();
             if (part.type == "image_url") {
                 part.url = obj["url"].toString();
+                if (part.url.isEmpty()) continue;
             } else if (part.type == "input_audio") {
                 part.data   = obj["data"].toString();
                 part.format = obj["format"].toString("mp3");
+                if (part.data.isEmpty()) continue;
             } else if (part.type == "text") {
                 part.text = obj["text"].toString();
+                if (part.text.isEmpty()) continue;
+            } else {
+                continue;
             }
-            if (!part.type.isEmpty()) parts.append(part);
+            parts.append(part);
         }
     }
 
@@ -506,50 +553,70 @@ void ChatBot::sendMessageWithMedia(const QString& message, const QString& mediaP
         }
     }
 
-    QString effectiveMessage = message;
-
     if (!m_capVision && hasImageParts) {
         if (!m_proxyVisionModelId.isEmpty()) {
+            const int     requestSeq = ++m_requestSeq;
+            const QString sessionId  = m_currentSessionId;
+
+            abortActiveReplies();
+            m_cancelled = false;
             emit proxyVisionStarted();
-            QString desc = callVisionProxy(parts);
-            if (!desc.isEmpty()) {
-                effectiveMessage = "[图片描述]\n" + desc + "\n\n[用户消息]\n" + message;
-                // 保留非 image 的 parts（如 text、audio）
-                parts.erase(std::remove_if(parts.begin(), parts.end(), [](const MessagePart& p) {
-                    return p.type == "image_url";
-                }), parts.end());
-            } else {
-                emit errorOccurred("视觉代理模型调用失败，已移除图片仅发送文字");
-                parts.erase(std::remove_if(parts.begin(), parts.end(), [](const MessagePart& p) {
-                    return p.type == "image_url";
-                }), parts.end());
-                effectiveMessage = "[图片分析失败]\n" + message;
-            }
+            callVisionProxy(message, parts, sessionId, requestSeq);
+            return;
         } else {
-            emit errorOccurred("当前模型不支持视觉，请先在模型设置中配置「视觉代理模型」");
+            showToast("当前模型不支持视觉，已仅发送文字");
             parts.erase(std::remove_if(parts.begin(), parts.end(), [](const MessagePart& p) {
                 return p.type == "image_url";
             }), parts.end());
         }
-        emit proxyVisionCompleted(effectiveMessage);
     }
 
-    QJsonArray apiMessages = buildApiMessages(currentMessages(), effectiveMessage, parts);
+    finishMediaMessage(message, parts, message, m_currentSessionId);
+}
 
-    // 记录用户消息（含多模态）
+void ChatBot::finishMediaMessage(const QString&              message,
+                                 const QVector<MessagePart>& parts,
+                                 const QString&              effectiveMessage,
+                                 const QString&              sessionId) {
+    if (m_cancelled || sessionId != m_currentSessionId || !m_sessions.contains(sessionId)) {
+        warn("多模态消息已失效，会话已切换或请求已取消");
+        return;
+    }
+    if (effectiveMessage.trimmed().isEmpty() && parts.isEmpty()) {
+        emit errorOccurred("没有可发送的文字或媒体内容");
+        return;
+    }
+
+    QJsonArray apiMessages = buildApiMessages(m_sessions[sessionId].messages, effectiveMessage, parts);
+
+    // 内嵌图片只保留在本次请求中，避免 Base64 被写入历史并在后续请求中反复复制。
+    const bool hadImage = std::any_of(parts.cbegin(), parts.cend(), [](const MessagePart& part) {
+        return part.type == "image_url";
+    });
+    QVector<MessagePart> historyParts = parts;
+    historyParts.erase(std::remove_if(historyParts.begin(), historyParts.end(), [](const MessagePart& p) {
+        return p.type == "image_url" && p.url.startsWith("data:", Qt::CaseInsensitive);
+    }), historyParts.end());
+
     MessageData userMsg;
-    userMsg.role  = "user";
-    userMsg.parts = parts;
+    userMsg.role    = "user";
+    userMsg.content = message.isEmpty() && hadImage ? "[图片]" : message;
+    userMsg.parts   = historyParts;
     if (!effectiveMessage.isEmpty()) {
-        MessagePart textPart;
-        textPart.type = "text";
-        textPart.text = effectiveMessage;
-        userMsg.parts.prepend(textPart);
+        if (historyParts.isEmpty()) {
+            userMsg.content = effectiveMessage;
+        } else {
+            MessagePart textPart;
+            textPart.type = "text";
+            textPart.text = effectiveMessage;
+            userMsg.parts.prepend(textPart);
+        }
     }
-    currentMessages().append(userMsg);
-    if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
+    auto& messages = m_sessions[sessionId].messages;
+    messages.append(userMsg);
+    if (messages.size() > MAX_HISTORY_SIZE) messages.removeFirst();
 
-    m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+    m_sessions[sessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
     saveSessions();
     emit messagesChanged();
 
@@ -557,28 +624,42 @@ void ChatBot::sendMessageWithMedia(const QString& message, const QString& mediaP
 }
 
 // -----------------------------------------------------------------------
-// callVisionProxy: 用视觉代理模型提取图片文字描述
+// callVisionProxy: 用视觉代理模型异步提取图片文字描述
 // 自动检测 OpenAI / Anthropic 格式
 // -----------------------------------------------------------------------
 
-QString ChatBot::callVisionProxy(const QVector<MessagePart>& parts) {
+void ChatBot::callVisionProxy(const QString&              message,
+                              const QVector<MessagePart>& parts,
+                              const QString&              sessionId,
+                              int                         requestSeq) {
     std::string proxyId = m_proxyVisionModelId.toStdString();
 
     json proxyModel;
-    for (const auto& model : m_modelsData["models"]) {
-        if (model["id"] == proxyId) {
-            proxyModel = model;
-            break;
+    if (m_modelsData.contains("models") && m_modelsData["models"].is_array()) {
+        for (const auto& model : m_modelsData["models"]) {
+            if (model.is_object() && model.value("id", "") == proxyId) {
+                proxyModel = model;
+                break;
+            }
         }
     }
-    if (proxyModel.empty()) {
+    if (proxyModel.empty() || !proxyModel.contains("endpoint") || !proxyModel["endpoint"].is_string()
+        || !proxyModel.contains("modelId") || !proxyModel["modelId"].is_string()
+        || (proxyModel.contains("apiKey") && !proxyModel["apiKey"].is_string())) {
         warn("代理视觉模型未找到: {}", proxyId);
-        return {};
+        QVector<MessagePart> fallbackParts = parts;
+        fallbackParts.erase(std::remove_if(fallbackParts.begin(), fallbackParts.end(), [](const MessagePart& p) {
+            return p.type == "image_url";
+        }), fallbackParts.end());
+        showToast("视觉代理模型配置无效，已仅发送文字");
+        emit proxyVisionCompleted(QString());
+        finishMediaMessage(message, fallbackParts, "[图片分析失败]\n" + message, sessionId);
+        return;
     }
 
-    QString proxyEndpoint = QString::fromStdString(proxyModel["endpoint"]);
-    QString proxyApiKey   = QString::fromStdString(proxyModel["apiKey"]);
-    QString proxyModelId  = QString::fromStdString(proxyModel["modelId"]);
+    QString proxyEndpoint = QString::fromStdString(proxyModel.value("endpoint", ""));
+    QString proxyApiKey   = QString::fromStdString(proxyModel.value("apiKey", ""));
+    QString proxyModelId  = QString::fromStdString(proxyModel.value("modelId", ""));
 
     bool isAnthropic = proxyEndpoint.contains("/messages");
 
@@ -592,16 +673,22 @@ QString ChatBot::callVisionProxy(const QVector<MessagePart>& parts) {
         for (const auto& p : parts) {
             if (p.type == "image_url") {
                 QString base64Data = p.url;
+                QString mediaType  = "image/jpeg";
                 if (base64Data.startsWith("data:image/jpeg;base64,"))
                     base64Data = base64Data.mid(23);
-                else if (base64Data.startsWith("data:image/png;base64,"))
+                else if (base64Data.startsWith("data:image/png;base64,")) {
                     base64Data = base64Data.mid(22);
+                    mediaType  = "image/png";
+                } else {
+                    warn("Anthropic 视觉代理仅支持 data URL 图片");
+                    continue;
+                }
 
                 QJsonObject imgObj;
                 imgObj["type"] = "image";
                 QJsonObject source;
                 source["type"]       = "base64";
-                source["media_type"] = "image/jpeg";
+                source["media_type"] = mediaType;
                 source["data"]       = base64Data;
                 imgObj["source"]     = source;
                 contentArray.append(imgObj);
@@ -660,65 +747,78 @@ QString ChatBot::callVisionProxy(const QVector<MessagePart>& parts) {
          m_proxyVisionPrompt.left(30).toStdString());
 
     QNetworkReply* reply = m_networkManager->post(request, data);
+    m_activeReplies.append(reply);
 
-    // 超时定时器：30s 无响应则中止
-    QTimer timeoutTimer;
-    timeoutTimer.setSingleShot(true);
-    connect(&timeoutTimer, &QTimer::timeout, reply, &QNetworkReply::abort);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, requestSeq, sessionId, message, parts, isAnthropic]() {
+        m_activeReplies.removeAll(reply);
 
-    QEventLoop loop;
-    connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
-    timeoutTimer.start(30000);
-    loop.exec();
-    timeoutTimer.stop();
-
-    if (m_cancelled) {
-        reply->abort();
-        reply->deleteLater();
-        warn("视觉代理模型调用已取消");
-        return {};
-    }
-
-    if (reply->error() != QNetworkReply::NoError) {
-        warn("视觉代理模型调用失败: {}", reply->errorString().toStdString());
-        reply->deleteLater();
-        return {};
-    }
-
-    QByteArray  responseData = reply->readAll();
-    reply->deleteLater();
-
-    QJsonObject responseJson = QJsonDocument::fromJson(responseData).object();
-
-    if (responseJson.contains("error")) {
-        warn("视觉代理模型返回错误: {}", responseJson["error"].toObject()["message"].toString().toStdString());
-        return {};
-    }
-
-    QString desc;
-    if (isAnthropic) {
-        QJsonArray content = responseJson["content"].toArray();
-        if (content.isEmpty()) {
-            warn("视觉代理模型返回空 content，完整响应: {}", responseData.constData());
-            return {};
+        if (requestSeq != m_requestSeq || m_cancelled) {
+            reply->deleteLater();
+            return;
         }
-        desc = content[0].toObject()["text"].toString();
-    } else {
-        QJsonArray choices = responseJson["choices"].toArray();
-        if (choices.isEmpty()) {
-            warn("视觉代理模型返回空 choices，完整响应: {}", responseData.constData());
-            return {};
+
+        QByteArray responseData = reply->readAll();
+        QString    description;
+        QString    failureReason;
+
+        if (reply->error() != QNetworkReply::NoError) {
+            failureReason = reply->errorString();
+        } else {
+            QJsonParseError parseError;
+            QJsonDocument   responseDoc = QJsonDocument::fromJson(responseData, &parseError);
+            if (parseError.error != QJsonParseError::NoError || !responseDoc.isObject()) {
+                failureReason = "响应不是有效的 JSON";
+            } else {
+                QJsonObject responseJson = responseDoc.object();
+                if (responseJson["error"].isObject()) {
+                    failureReason = responseJson["error"].toObject()["message"].toString("服务返回错误");
+                } else if (isAnthropic) {
+                    QJsonArray content = responseJson["content"].toArray();
+                    for (const auto& item : content) {
+                        QJsonObject block = item.toObject();
+                        if (block["type"].toString() == "text") description += block["text"].toString();
+                    }
+                    if (description.isEmpty()) failureReason = "响应中没有文本内容";
+                } else {
+                    QJsonArray choices = responseJson["choices"].toArray();
+                    if (choices.isEmpty()) {
+                        failureReason = "响应中没有 choices";
+                    } else {
+                        QJsonValue content = choices.first().toObject()["message"].toObject()["content"];
+                        if (content.isString()) description = content.toString();
+                        else if (content.isArray()) {
+                            for (const auto& item : content.toArray()) {
+                                QJsonObject block = item.toObject();
+                                if (block["type"].toString() == "text") description += block["text"].toString();
+                            }
+                        }
+                        if (description.isEmpty()) failureReason = "响应中没有文本内容";
+                    }
+                }
+            }
         }
-        desc = choices[0].toObject()["message"].toObject()["content"].toString();
-    }
 
-    if (desc.isEmpty()) {
-        warn("视觉代理模型返回空文本");
-        return {};
-    }
+        QVector<MessagePart> nextParts = parts;
+        nextParts.erase(std::remove_if(nextParts.begin(), nextParts.end(), [](const MessagePart& p) {
+            return p.type == "image_url";
+        }), nextParts.end());
 
-    info("视觉代理模型返回 {} 个字符", desc.length());
-    return desc.trimmed();
+        QString effectiveMessage;
+        if (failureReason.isEmpty()) {
+            description      = description.trimmed();
+            effectiveMessage = "[图片描述]\n" + description + "\n\n[用户消息]\n" + message;
+            info("视觉代理模型返回 {} 个字符", description.length());
+            emit proxyVisionCompleted(description);
+        } else {
+            warn("视觉代理模型调用失败: {}", failureReason.toStdString());
+            showToast("视觉代理模型调用失败，已仅发送文字");
+            effectiveMessage = "[图片分析失败]\n" + message;
+            emit proxyVisionCompleted(QString());
+        }
+
+        reply->deleteLater();
+        finishMediaMessage(message, nextParts, effectiveMessage, sessionId);
+    });
 }
 
 // -----------------------------------------------------------------------
@@ -800,19 +900,23 @@ void ChatBot::tryFlushToolBatch() {
 // makeApiRequest：构建请求体并发送
 // -----------------------------------------------------------------------
 
+void ChatBot::abortActiveReplies() {
+    const QList<QNetworkReply*> replies = m_activeReplies;
+    m_activeReplies.clear();
+
+    for (QNetworkReply* reply : replies) {
+        if (!reply) continue;
+        reply->disconnect(this);
+        if (!reply->isFinished()) reply->abort();
+        reply->deleteLater();
+    }
+}
+
 void ChatBot::makeApiRequest(const QJsonArray& messages) {
     // 递增序列号使旧请求的回调自动失效
     int seq = ++m_requestSeq;
 
-    // 清理旧 reply，安全地断开连接以释放底层网络资源
-    for (QNetworkReply* reply : m_activeReplies) {
-        if (reply) {
-            reply->disconnect(this);
-            if (!reply->isFinished()) reply->abort();
-            reply->deleteLater();
-        }
-    }
-    m_activeReplies.clear();
+    abortActiveReplies();
 
     m_cancelled = false;
 
@@ -843,7 +947,10 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
 
     QJsonDocument requestDoc(requestBody);
     QByteArray    requestData = requestDoc.toJson(QJsonDocument::Compact);
-    debug("请求数据: {}", QString(requestData).toStdString());
+    debug("发送 API 请求: model={}, messages={}, payload={} bytes",
+          m_model.toStdString(),
+          messages.size(),
+          requestData.size());
 
     QNetworkRequest request;
     request.setUrl(QUrl(m_apiEndpoint));
@@ -1021,17 +1128,26 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
             QByteArray    response = reply->readAll();
             QJsonDocument doc      = QJsonDocument::fromJson(response);
             if (!doc.isObject()) {
+                emit errorOccurred("API 响应格式错误：不是有效的 JSON 对象");
                 reply->deleteLater();
                 return;
             }
 
             QJsonObject obj = doc.object();
             if (!obj.contains("choices") || !obj["choices"].isArray()) {
+                emit errorOccurred("API 响应格式错误：缺少 choices");
                 reply->deleteLater();
                 return;
             }
 
-            QJsonObject choice  = obj["choices"].toArray()[0].toObject();
+            QJsonArray choices = obj["choices"].toArray();
+            if (choices.isEmpty()) {
+                emit errorOccurred("API 响应格式错误：choices 为空");
+                reply->deleteLater();
+                return;
+            }
+
+            QJsonObject choice  = choices.first().toObject();
             QJsonObject message = choice["message"].toObject();
 
             if (message.contains("tool_calls") && message["tool_calls"].isArray()) {
@@ -1191,10 +1307,8 @@ void ChatBot::regenerateMessage(int index) {
 // -----------------------------------------------------------------------
 
 void ChatBot::clearHistory() {
-    for (QNetworkReply* reply : m_activeReplies) {
-        if (reply && !reply->isFinished()) reply->abort();
-    }
-    m_activeReplies.clear();
+    ++m_requestSeq;
+    abortActiveReplies();
 
     currentMessages().clear();
     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
@@ -1204,11 +1318,8 @@ void ChatBot::clearHistory() {
 
 void ChatBot::cancelRequest() {
     m_cancelled = true;
-
-    for (QNetworkReply* reply : m_activeReplies) {
-        if (reply && !reply->isFinished()) reply->abort();
-    }
-    m_activeReplies.clear();
+    ++m_requestSeq;
+    abortActiveReplies();
 
     QStringList shellKeys;
     for (auto it = m_activeShellExecs.constBegin(); it != m_activeShellExecs.constEnd(); ++it)

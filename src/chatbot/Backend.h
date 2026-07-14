@@ -276,6 +276,7 @@ private:
 
     void makeApiRequest(const QJsonArray& messages);
     void handleNetworkReply(QNetworkReply* reply, bool isStream);
+    void abortActiveReplies();
 
     QString m_currentStreamBuffer;
     QString m_responseBuffer;
@@ -353,7 +354,14 @@ private:
     void submitToolResultBatched(const QString& toolCallId, const QString& toolName, const QString& result);
     void tryFlushToolBatch();
 
-    QString callVisionProxy(const QVector<MessagePart>& parts);
+    void callVisionProxy(const QString&              message,
+                         const QVector<MessagePart>& parts,
+                         const QString&              sessionId,
+                         int                         requestSeq);
+    void finishMediaMessage(const QString&              message,
+                            const QVector<MessagePart>& parts,
+                            const QString&              effectiveMessage,
+                            const QString&              sessionId);
 };
 
 } // namespace mod::chatbot

@@ -29,11 +29,19 @@ public:
 
     Q_INVOKABLE QString stitchImages(const QStringList& imageList, const QString& direction);
 
+    Q_INVOKABLE void cropImageAsync(quint64 requestId, const QString& base64Data, int x, int y, int w, int h);
+
+    Q_INVOKABLE void stitchImagesAsync(quint64 requestId, const QStringList& imageList, const QString& direction);
+
 signals:
 
     void captureEnabledChanged();
 
     void imageCaptured(const QString& base64Data);
+
+    void cropImageCompleted(quint64 requestId, const QString& base64Data, const QString& errorMessage);
+
+    void stitchImagesCompleted(quint64 requestId, const QString& base64Data, const QString& errorMessage);
 
 private:
     friend Singleton<CameraCapture>;

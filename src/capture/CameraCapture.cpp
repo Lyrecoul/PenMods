@@ -10,15 +10,168 @@
 
 #include <QBuffer>
 #include <QImage>
+#include <QMetaObject>
 #include <QPainter>
 #include <QQmlContext>
 #include <QQuickView>
+#include <QRunnable>
+#include <QThreadPool>
 
 #include <cstring>
 #include <dlfcn.h>
+#include <limits>
 #include <spdlog/spdlog.h>
+#include <type_traits>
+#include <utility>
 
 namespace mod::capture {
+
+namespace {
+
+constexpr int    MaxBase64Chars          = 16 * 1024 * 1024;
+constexpr int    MaxStitchBase64Chars    = 24 * 1024 * 1024;
+constexpr qint64 MaxImagePixels          = 12 * 1024 * 1024;
+constexpr qint64 MaxCompositeImagePixels = 16 * 1024 * 1024;
+
+struct ImageProcessResult {
+    QString data;
+    QString error;
+};
+
+template <typename Function>
+class ImageTask final : public QRunnable {
+public:
+    explicit ImageTask(Function function) : mFunction(std::move(function)) {}
+
+    void run() override { mFunction(); }
+
+private:
+    Function mFunction;
+};
+
+template <typename Function>
+QRunnable* makeImageTask(Function&& function) {
+    using Task = ImageTask<std::decay_t<Function>>;
+    return new Task(std::forward<Function>(function));
+}
+
+ImageProcessResult decodeImage(const QString& base64Data, QImage& image) {
+    if (base64Data.isEmpty()) {
+        return {{}, "图片数据为空"};
+    }
+    if (base64Data.size() > MaxBase64Chars) {
+        return {{}, "图片数据过大"};
+    }
+
+    QByteArray decoded = QByteArray::fromBase64(base64Data.toLatin1(), QByteArray::AbortOnBase64DecodingErrors);
+    if (decoded.isEmpty() || !image.loadFromData(decoded)) {
+        return {{}, "图片解码失败"};
+    }
+    if (qint64(image.width()) * image.height() > MaxImagePixels) {
+        image = {};
+        return {{}, "图片分辨率过高"};
+    }
+    return {};
+}
+
+ImageProcessResult cropImageImpl(const QString& base64Data, int x, int y, int w, int h) {
+    QImage image;
+    auto   decoded = decodeImage(base64Data, image);
+    if (!decoded.error.isEmpty()) {
+        return decoded;
+    }
+
+    x = std::max(0, std::min(image.width() - 1, x));
+    y = std::max(0, std::min(image.height() - 1, y));
+    w = std::max(1, std::min(image.width() - x, w));
+    h = std::max(1, std::min(image.height() - y, h));
+
+    QImage     cropped = image.copy(x, y, w, h);
+    QByteArray ba;
+    QBuffer    buffer(&ba);
+    buffer.open(QIODevice::WriteOnly);
+    if (!cropped.save(&buffer, "JPEG", 90)) {
+        return {{}, "裁剪图片编码失败"};
+    }
+    return {QString::fromLatin1(ba.toBase64()), {}};
+}
+
+ImageProcessResult stitchImagesImpl(const QStringList& imageList, const QString& direction) {
+    if (imageList.size() < 2) {
+        return {{}, "至少需要两张图片"};
+    }
+    if (direction != "horizontal" && direction != "vertical") {
+        return {{}, "拼接方向无效"};
+    }
+
+    qint64 totalBase64Chars = 0;
+    for (const auto& imageData : imageList) {
+        totalBase64Chars += imageData.size();
+        if (totalBase64Chars > MaxStitchBase64Chars) {
+            return {{}, "待拼接图片总大小过大"};
+        }
+    }
+
+    const bool horizontal  = direction == "horizontal";
+    qint64     totalWidth  = 0;
+    qint64     totalHeight = 0;
+    int        maxWidth    = 0;
+    int        maxHeight   = 0;
+
+    QVector<QImage> images;
+    images.reserve(imageList.size());
+    for (const auto& imageData : imageList) {
+        QImage image;
+        auto   decoded = decodeImage(imageData, image);
+        if (!decoded.error.isEmpty()) {
+            return decoded;
+        }
+
+        if (horizontal) {
+            totalWidth  += image.width();
+            maxHeight    = std::max(maxHeight, image.height());
+            totalHeight  = maxHeight;
+        } else {
+            totalHeight += image.height();
+            maxWidth     = std::max(maxWidth, image.width());
+            totalWidth   = maxWidth;
+        }
+        if (totalWidth <= 0 || totalHeight <= 0 || totalWidth * totalHeight > MaxCompositeImagePixels
+            || totalWidth > std::numeric_limits<int>::max() || totalHeight > std::numeric_limits<int>::max()) {
+            return {{}, "拼接结果尺寸过大"};
+        }
+        images.append(std::move(image));
+    }
+
+    QImage composite(static_cast<int>(totalWidth), static_cast<int>(totalHeight), QImage::Format_RGB32);
+    if (composite.isNull()) {
+        return {{}, "无法分配拼接图片内存"};
+    }
+    composite.fill(Qt::white);
+    QPainter painter(&composite);
+
+    int offset = 0;
+    for (const auto& image : images) {
+        if (horizontal) {
+            painter.drawImage(offset, 0, image);
+            offset += image.width();
+        } else {
+            painter.drawImage(0, offset, image);
+            offset += image.height();
+        }
+    }
+    painter.end();
+
+    QByteArray ba;
+    QBuffer    buffer(&ba);
+    buffer.open(QIODevice::WriteOnly);
+    if (!composite.save(&buffer, "JPEG", 90)) {
+        return {{}, "拼接图片编码失败"};
+    }
+    return {QString::fromLatin1(ba.toBase64()), {}};
+}
+
+} // namespace
 
 // ── call ydstitch_save_img across ABI boundary ─────────────────────
 //
@@ -38,8 +191,8 @@ static_assert(sizeof(StitchString) == 32, "must match libstdc++ std::string size
 static bool parseStitchString(const StitchString& s, std::string& out) {
     const char* data   = nullptr;
     size_t      length = 0;
-    std::memcpy(&data,   s.data,      8);
-    std::memcpy(&length, s.data + 8,   8);
+    std::memcpy(&data, s.data, 8);
+    std::memcpy(&length, s.data + 8, 8);
 
     uint64 dataAddr = reinterpret_cast<uint64>(data);
     uint64 objAddr  = reinterpret_cast<uint64>(&s);
@@ -61,13 +214,16 @@ static bool callYdstitchSaveImg(std::string& outPath) {
         sym = dlsym(RTLD_DEFAULT, "ydstitch_save_img");
         if (!sym) {
             static bool once = false;
-            if (!once) { once = true; spdlog::warn("[CameraCapture] ydstitch_save_img not found."); }
+            if (!once) {
+                once = true;
+                spdlog::warn("[CameraCapture] ydstitch_save_img not found.");
+            }
             return false;
         }
     }
 
     using Fn = StitchString (*)();
-    auto fn = reinterpret_cast<Fn>(sym);
+    auto fn  = reinterpret_cast<Fn>(sym);
 
     StitchString result = fn();
 
@@ -115,99 +271,62 @@ void CameraCapture::onScanComplete() {
         spdlog::warn("[CameraCapture] onScanComplete: failed to load image");
         return;
     }
+    if (qint64(img.width()) * img.height() > MaxImagePixels) {
+        spdlog::warn("[CameraCapture] onScanComplete: image resolution is too high");
+        return;
+    }
 
     QByteArray ba;
     QBuffer    buffer(&ba);
     buffer.open(QIODevice::WriteOnly);
-    img.save(&buffer, "JPEG", 85);
-    buffer.close();
+    if (!img.save(&buffer, "JPEG", 85) || ba.size() > (MaxBase64Chars / 4) * 3) {
+        spdlog::warn("[CameraCapture] onScanComplete: encoded image is too large");
+        return;
+    }
 
     emit imageCaptured(ba.toBase64());
 }
 
 QString CameraCapture::cropImage(const QString& base64Data, int x, int y, int w, int h) {
-    QByteArray decoded = QByteArray::fromBase64(base64Data.toLatin1());
-    QImage     img;
-    img.loadFromData(decoded);
-    if (img.isNull()) {
-        spdlog::warn("[CameraCapture] cropImage: failed to decode base64");
-        return {};
+    auto result = cropImageImpl(base64Data, x, y, w, h);
+    if (!result.error.isEmpty()) {
+        spdlog::warn("[CameraCapture] cropImage: {}", result.error.toStdString());
     }
-
-    x = std::max(0, std::min(img.width() - 1, x));
-    y = std::max(0, std::min(img.height() - 1, y));
-    w = std::max(1, std::min(img.width() - x, w));
-    h = std::max(1, std::min(img.height() - y, h));
-
-    QImage cropped = img.copy(x, y, w, h);
-
-    QByteArray ba;
-    QBuffer    buffer(&ba);
-    buffer.open(QIODevice::WriteOnly);
-    cropped.save(&buffer, "JPEG", 90);
-    buffer.close();
-
-    return QString::fromLatin1(ba.toBase64());
+    return result.data;
 }
 
 QString CameraCapture::stitchImages(const QStringList& imageList, const QString& direction) {
-    if (imageList.size() < 2) {
-        spdlog::warn("[CameraCapture] stitchImages: need at least 2 images, got {}", imageList.size());
-        return {};
+    auto result = stitchImagesImpl(imageList, direction);
+    if (!result.error.isEmpty()) {
+        spdlog::warn("[CameraCapture] stitchImages: {}", result.error.toStdString());
     }
+    return result.data;
+}
 
-    QVector<QImage> images;
-    for (const auto& b64 : imageList) {
-        if (b64.isEmpty()) continue;
-        QByteArray decoded = QByteArray::fromBase64(b64.toLatin1());
-        QImage img;
-        img.loadFromData(decoded);
-        if (!img.isNull()) images.append(img);
-    }
+void CameraCapture::cropImageAsync(quint64 requestId, const QString& base64Data, int x, int y, int w, int h) {
+    QThreadPool::globalInstance()->start(makeImageTask([this, requestId, base64Data, x, y, w, h]() {
+        auto result = cropImageImpl(base64Data, x, y, w, h);
+        QMetaObject::invokeMethod(
+            this,
+            [this, requestId, result = std::move(result)]() {
+                emit cropImageCompleted(requestId, result.data, result.error);
+            },
+            Qt::QueuedConnection
+        );
+    }));
+}
 
-    if (images.size() < 2) {
-        spdlog::warn("[CameraCapture] stitchImages: need at least 2 images, got {}", images.size());
-        return {};
-    }
-
-    bool horizontal = (direction == "horizontal");
-    int totalW = 0, totalH = 0;
-    int maxW = 0, maxH = 0;
-    for (const auto& img : images) {
-        if (horizontal) {
-            totalW += img.width();
-            maxH = std::max(maxH, img.height());
-        } else {
-            totalH += img.height();
-            maxW = std::max(maxW, img.width());
-        }
-    }
-    if (horizontal) totalH = maxH;
-    else totalW = maxW;
-
-    QImage composite(totalW, totalH, QImage::Format_RGB32);
-    composite.fill(Qt::white);
-    QPainter painter(&composite);
-
-    int offset = 0;
-    for (const auto& img : images) {
-        if (horizontal) {
-            painter.drawImage(offset, 0, img);
-            offset += img.width();
-        } else {
-            painter.drawImage(0, offset, img);
-            offset += img.height();
-        }
-    }
-    painter.end();
-
-    QByteArray ba;
-    QBuffer buffer(&ba);
-    buffer.open(QIODevice::WriteOnly);
-    composite.save(&buffer, "JPEG", 90);
-    buffer.close();
-
-    return QString::fromLatin1(ba.toBase64());
+void CameraCapture::stitchImagesAsync(quint64 requestId, const QStringList& imageList, const QString& direction) {
+    QThreadPool::globalInstance()->start(makeImageTask([this, requestId, imageList, direction]() {
+        auto result = stitchImagesImpl(imageList, direction);
+        QMetaObject::invokeMethod(
+            this,
+            [this, requestId, result = std::move(result)]() {
+                emit stitchImagesCompleted(requestId, result.data, result.error);
+            },
+            Qt::QueuedConnection
+        );
+    }));
 }
 
 } // namespace mod::capture

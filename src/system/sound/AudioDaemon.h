@@ -13,6 +13,8 @@
 #include <QSocketNotifier>
 #include <QTimer>
 
+#include <array>
+
 namespace mod {
 
 /// 音频源类型，用于引用计数跟踪
@@ -53,8 +55,11 @@ public:
     /// 释放音频输出引用。返回新的引用计数。
     int release(AudioSource source);
 
-    /// 当前引用计数
+    /// 当前所有音频源的引用总数
     int refCount() const { return mRefCount; }
+
+    /// 指定音频源的引用数
+    int sourceRefCount(AudioSource source) const { return mSourceRefCounts[_sourceIndex(source)]; }
 
     /// 当前守护进程状态
     AudioDaemonState state() const { return mState; }
@@ -79,12 +84,13 @@ private:
     explicit AudioDaemon();
 
     // --- 状态机 ---
+    static constexpr size_t _sourceIndex(AudioSource source) { return static_cast<size_t>(source); }
     void _transitionTo(AudioDaemonState newState);
 
     // --- 唤醒锁文件操作 ---
     QString _lockFilePath(AudioSource source) const;
     int     _countWakeLocks();
-    void    _onWakeLockChange();
+    void    _onWakeLockChange(bool refreshExternalOutput = false);
 
     // --- inotify ---
     void _initInotify();
@@ -98,7 +104,9 @@ private:
     // --- 状态 ---
     AudioDaemonState mState{AudioDaemonState::IDLE};
     int              mRefCount{0};
+    std::array<int, 4> mSourceRefCounts{};
     bool             mEnabled{true};
+    bool             mPendingForceOpen{false};
     bool             mPendingForceClose{false};
 
     // --- 配置 ---

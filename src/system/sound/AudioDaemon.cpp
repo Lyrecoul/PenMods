@@ -57,7 +57,7 @@ AudioDaemon::AudioDaemon() : Logger("AudioDaemon") {
     // inotify 防抖定时器（单次触发，50ms）
     mInotifyDebounceTimer = new QTimer(this);
     mInotifyDebounceTimer->setSingleShot(true);
-    connect(mInotifyDebounceTimer, &QTimer::timeout, this, &AudioDaemon::_onWakeLockChange);
+    connect(mInotifyDebounceTimer, &QTimer::timeout, this, [this]() { _onWakeLockChange(); });
 
     // 读取配置（如果存在）
     json cfg = Config::getInstance().read("AudioDaemon");
@@ -85,27 +85,30 @@ int AudioDaemon::acquire(AudioSource source) {
         return mRefCount;
     }
 
-    bool needsOpen = (mRefCount == 0 && mState == AudioDaemonState::IDLE);
+    bool needsOpen      = (mRefCount == 0 && mState == AudioDaemonState::IDLE);
+    int& sourceRefCount = mSourceRefCounts[_sourceIndex(source)];
 
-    // 创建文件唤醒锁
-    QDir().mkpath(mWakeLockDir);
-    QString lockFile = _lockFilePath(source);
-    {
-        QFile f(lockFile);
-        f.open(QIODevice::WriteOnly | QIODevice::Truncate);
-        f.write(QByteArray::number(static_cast<long long>(getpid())));
-        f.close();
+    // 每个 source 的首个引用持有对应锁文件，避免重复 acquire 被一次 release 提前解锁。
+    if (sourceRefCount == 0) {
+        QDir().mkpath(mWakeLockDir);
+        QString lockFile = _lockFilePath(source);
+        QFile   f(lockFile);
+        if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            warn("acquire({}) 无法创建 lockFile={}", sourceToString(source), lockFile.toStdString());
+        } else {
+            f.write(QByteArray::number(static_cast<long long>(getpid())));
+        }
     }
 
+    sourceRefCount++;
     mRefCount++;
-    info("acquire({}) → refCount={}, lockFile={}", sourceToString(source), mRefCount, lockFile.toStdString());
+    info("acquire({}) → refCount={}, sourceRefCount={}", sourceToString(source), mRefCount, sourceRefCount);
     emit refCountChanged(mRefCount);
 
     // 如果音频输出当前处于关闭状态（IDLE），主动打开
     if (needsOpen) {
         info("acquire: 引用计数从 0 增加，主动打开音频输出");
         auto result = PEN_CALL(uint64, "_ZN12YSoundCenter15openAudioOutputEv", void*)(YPointer<YSoundCenter>::getInstance());
-        notifyOpenDone();
         info("acquire: openAudioOutput 主动打开完成, ret={}", result);
     }
 
@@ -118,17 +121,19 @@ int AudioDaemon::release(AudioSource source) {
         return mRefCount;
     }
 
-    if (mRefCount <= 0) {
-        warn("release({}) 调用时 refCount 已为 0！", sourceToString(source));
-        return 0;
+    int& sourceRefCount = mSourceRefCounts[_sourceIndex(source)];
+    if (sourceRefCount <= 0) {
+        warn("release({}) 调用时该 source 的引用已为 0！", sourceToString(source));
+        return mRefCount;
     }
 
-    // 删除文件唤醒锁
-    QString lockFile = _lockFilePath(source);
-    QFile::remove(lockFile);
-
+    sourceRefCount--;
     mRefCount--;
-    info("release({}) → refCount={}, lockFile removed", sourceToString(source), mRefCount);
+    if (sourceRefCount == 0) {
+        QFile::remove(_lockFilePath(source));
+    }
+
+    info("release({}) → refCount={}, sourceRefCount={}", sourceToString(source), mRefCount, sourceRefCount);
     emit refCountChanged(mRefCount);
     return mRefCount;
 }
@@ -137,6 +142,12 @@ int AudioDaemon::release(AudioSource source) {
 
 bool AudioDaemon::shouldOpenAudioOutput() {
     if (!mEnabled) return true;  // 不启用时，直接放行
+
+    if (mPendingForceOpen) {
+        mPendingForceOpen = false;
+        info("强制执行 openAudioOutput（外部唤醒锁输出刷新）");
+        return true;
+    }
 
     switch (mState) {
     case AudioDaemonState::IDLE:
@@ -366,7 +377,7 @@ void AudioDaemon::_onInotifyReady(int fd) {
     // n == 0 或 EAGAIN：无事可做，忽略
 }
 
-void AudioDaemon::_onWakeLockChange() {
+void AudioDaemon::_onWakeLockChange(bool refreshExternalOutput) {
     int fileLocks = _countWakeLocks();
     info("wake lock 目录变更: fileLocks={}, refCount={}, state={}",
           fileLocks, mRefCount, stateToString(mState));
@@ -376,12 +387,21 @@ void AudioDaemon::_onWakeLockChange() {
         if (mState == AudioDaemonState::IDLE) {
             info("检测到新的唤醒锁，主动打开音频输出");
             auto result = PEN_CALL(uint64, "_ZN12YSoundCenter15openAudioOutputEv", void*)(YPointer<YSoundCenter>::getInstance());
-            notifyOpenDone();
             info("_onWakeLockDirChanged: openAudioOutput 主动打开完成, ret={}", result);
-        } else if (mState == AudioDaemonState::CLOSE_DELAY) {
+            return;
+        }
+
+        if (mState == AudioDaemonState::CLOSE_DELAY) {
             // 取消延迟关闭，回到 PLAYING
             mCloseDelayTimer->stop();
             _transitionTo(AudioDaemonState::PLAYING);
+        }
+
+        // 底层输出可能在静默期间自行休眠；定期扫描到外部锁时强制重新打开。
+        if (refreshExternalOutput && fileLocks > 0 && mRefCount == 0) {
+            mPendingForceOpen = true;
+            auto result = PEN_CALL(uint64, "_ZN12YSoundCenter15openAudioOutputEv", void*)(YPointer<YSoundCenter>::getInstance());
+            info("外部唤醒锁输出刷新完成, ret={}", result);
         }
     } else if (mState == AudioDaemonState::PLAYING && mRefCount == 0) {
         // 所有文件锁已释放且 refCount 也为 0，进入延迟关闭
@@ -397,13 +417,21 @@ void AudioDaemon::_scheduleWakeLockCheck() {
 }
 
 void AudioDaemon::_onCleanupTick() {
-    // 触发状态重评估，期间 _countWakeLocks() 会顺手清理孤儿锁，
-    // _onWakeLockChange() 会根据最新的 fileLocks 和 refCount 做正确的状态转换
-    _onWakeLockChange();
+    // 定期重评估会清理孤儿锁，并为仍有效的外部锁刷新底层音频输出。
+    _onWakeLockChange(true);
 }
 
 void AudioDaemon::_onCloseTimeout() {
-    info("延迟关闭超时已到期（refCount={}），直接调用 closeAudioOutput", mRefCount);
+    int fileLocks = _countWakeLocks();
+    if (mState != AudioDaemonState::CLOSE_DELAY || mRefCount > 0 || fileLocks > 0) {
+        info("延迟关闭超时取消（state={}, refCount={}, fileLocks={}）", stateToString(mState), mRefCount, fileLocks);
+        if (mState == AudioDaemonState::CLOSE_DELAY) {
+            _transitionTo(AudioDaemonState::PLAYING);
+        }
+        return;
+    }
+
+    info("延迟关闭超时已到期，执行 closeAudioOutput");
     // 先设置强制关闭标记，使得 PEN_HOOK detour 放行
     mPendingForceClose = true;
     // 直接通过 PEN_CALL 调用原始 closeAudioOutput（会经过 PEN_HOOK，但 mPendingForceClose 让其放行）

@@ -75,8 +75,8 @@ void MusicPlayer::play(size_t idx) {
 
 void MusicPlayer::_play(const std::shared_ptr<QFileInfo>& file) {
     mIsTakeOver = true;
-    // 播放新曲目前先释放之前的引用，防止 refCount 无限累积
-    if (mod::AudioDaemon::getInstance().refCount() > 0) {
+    // 播放新曲目前先释放之前的 MUSIC 引用，防止该 source 的引用累积。
+    if (mod::AudioDaemon::getInstance().sourceRefCount(AudioSource::MUSIC) > 0) {
         mod::AudioDaemon::getInstance().release(AudioSource::MUSIC);
     }
     // 通知音频守护进程：音乐播放器正在使用音频输出
@@ -241,8 +241,9 @@ AudioSequence MusicPlayer::getCurrentAudioSequence() {
 
 void MusicPlayer::releaseAudio() {
     info("QML 请求释放 MUSIC 引用");
-    while (mod::AudioDaemon::getInstance().refCount() > 0) {
-        mod::AudioDaemon::getInstance().release(AudioSource::MUSIC);
+    auto& audioDaemon = mod::AudioDaemon::getInstance();
+    while (audioDaemon.sourceRefCount(AudioSource::MUSIC) > 0) {
+        audioDaemon.release(AudioSource::MUSIC);
     }
 }
 

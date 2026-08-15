@@ -143,12 +143,6 @@ void PluginManager::scanAndLoadAll() {
 
     m_scanning = false;
 
-    // 清理 QML 引擎缓存以加载更新后的插件
-    if (m_engine) {
-        m_engine->clearComponentCache();
-        m_engine->trimComponentCache();
-    }
-
     emit pluginsChanged();
 }
 

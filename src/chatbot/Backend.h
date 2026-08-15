@@ -61,6 +61,7 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
     Q_PROPERTY(QString apiKey READ getApiKey WRITE setApiKey NOTIFY apiKeyChanged)
     Q_PROPERTY(QString apiEndpoint READ getApiEndpoint WRITE setApiEndpoint NOTIFY apiEndpointChanged)
     Q_PROPERTY(QString model READ getModel WRITE setModel NOTIFY modelChanged)
+    Q_PROPERTY(QString apiProtocol READ getApiProtocol NOTIFY apiProtocolChanged)
     Q_PROPERTY(qreal temperature READ getTemperature WRITE setTemperature NOTIFY temperatureChanged)
     Q_PROPERTY(QString defaultPrompt READ getDefaultPrompt WRITE setDefaultPrompt NOTIFY defaultPromptChanged)
     Q_PROPERTY(bool isStreaming READ getIsStreaming WRITE setIsStreaming NOTIFY isStreamingChanged)
@@ -148,6 +149,7 @@ public:
     QString      getApiKey() const;
     QString      getApiEndpoint() const;
     QString      getModel() const;
+    QString      getApiProtocol() const;
     qreal        getTemperature() const;
     QString      getDefaultPrompt() const;
     bool         getIsStreaming() const;
@@ -195,6 +197,7 @@ signals:
     void apiKeyChanged();
     void apiEndpointChanged();
     void modelChanged();
+    void apiProtocolChanged();
     void temperatureChanged();
     void defaultPromptChanged();
     void isStreamingChanged();
@@ -235,6 +238,7 @@ private:
     QString m_apiKey;
     QString m_apiEndpoint;
     QString m_model;
+    QString m_apiProtocol = "chat_completions";
     qreal   m_temperature;
     QString m_defaultPrompt;
     bool    m_isStreaming;
@@ -276,6 +280,8 @@ private:
 
     void makeApiRequest(const QJsonArray& messages);
     void handleNetworkReply(QNetworkReply* reply, bool isStream);
+    bool       usesResponsesApi() const;
+    QJsonArray messagesToResponsesInput(const QJsonArray& messages) const;
     void abortActiveReplies();
 
     QString m_currentStreamBuffer;

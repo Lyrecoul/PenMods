@@ -145,6 +145,7 @@ Config::Config() : Logger("Config") {
                     {"provider",    "DeepSeek"},
                     {"endpoint",    "https://api.deepseek.com/v1/chat/completions"},
                     {"modelId",     "deepseek-v4-flash"},
+                    {"apiProtocol", "chat_completions"},
                     {"apiKey",      ""},
                     {"temperature", 0.7},
                     {"maxContextSize", 0},
@@ -276,14 +277,17 @@ bool Config::_update(json& data) {
                 if (!data["ai"].contains("models") || !data["ai"]["models"].is_array()) {
                     auto& cb                    = data["ai"]["chatbot"];
                     data["ai"]["models"]        = json::array({
-                        json{{"id", cb.value("model", "deepseek-chat")},
+                        json{
+                             {"id", cb.value("model", "deepseek-chat")},
                              {"name", "DeepSeek Chat"},
                              {"provider", "DeepSeek"},
                              {"endpoint", cb.value("api_endpoint", "https://api.deepseek.com/v1/chat/completions")},
                              {"modelId", cb.value("model", "deepseek-chat")},
+                             {"apiProtocol", "chat_completions"},
                              {"apiKey", cb.value("api_key", "")},
                              {"temperature", cb.value("temperature", 0.7)},
-                             {"extraParams", ""}}
+                             {"extraParams", ""}
+                        }
                     });
                     data["ai"]["activeModelId"] = cb.value("model", "deepseek-chat");
                 }

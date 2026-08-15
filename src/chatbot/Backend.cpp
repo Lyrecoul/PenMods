@@ -897,6 +897,102 @@ void ChatBot::tryFlushToolBatch() {
 }
 
 // -----------------------------------------------------------------------
+// Responses API conversion
+// -----------------------------------------------------------------------
+
+bool ChatBot::usesResponsesApi() const { return m_apiProtocol == "responses"; }
+
+QJsonArray ChatBot::messagesToResponsesInput(const QJsonArray& messages) const {
+    QJsonArray input;
+    for (const QJsonValue& value : messages) {
+        const QJsonObject message = value.toObject();
+        const QString     role    = message["role"].toString();
+
+        if (role == "tool") {
+            input.append(
+                QJsonObject{
+                    {"type",    "function_call_output"            },
+                    {"call_id", message["tool_call_id"].toString()},
+                    {"output",  message["content"].toString()     }
+            }
+            );
+            continue;
+        }
+
+        QString          content;
+        const QJsonValue contentValue = message["content"];
+        if (contentValue.isString()) {
+            content = contentValue.toString();
+        } else if (contentValue.isArray()) {
+            for (const QJsonValue& partValue : contentValue.toArray()) {
+                const QJsonObject part = partValue.toObject();
+                if (part["type"].toString() == "text") content += part["text"].toString();
+            }
+            if (content.isEmpty()) content = "[不支持的媒体输入]";
+        }
+
+        if (!content.isEmpty())
+            input.append(
+                QJsonObject{
+                    {"type",    "message"},
+                    {"role",    role     },
+                    {"content", content  }
+            }
+            );
+
+        if (message["tool_calls"].isArray()) {
+            for (const QJsonValue& toolValue : message["tool_calls"].toArray()) {
+                const QJsonObject tool     = toolValue.toObject();
+                const QJsonObject function = tool["function"].toObject();
+                input.append(
+                    QJsonObject{
+                        {"type",      "function_call"                 },
+                        {"call_id",   tool["id"].toString()           },
+                        {"name",      function["name"].toString()     },
+                        {"arguments", function["arguments"].toString()}
+                }
+                );
+            }
+        }
+    }
+    return input;
+}
+
+namespace {
+
+QString responseOutputText(const QJsonArray& output) {
+    QString text;
+    for (const QJsonValue& itemValue : output) {
+        const QJsonObject item = itemValue.toObject();
+        if (item["type"].toString() != "message") continue;
+        for (const QJsonValue& contentValue : item["content"].toArray()) {
+            const QJsonObject content = contentValue.toObject();
+            if (content["type"].toString() == "output_text") text += content["text"].toString();
+        }
+    }
+    return text;
+}
+
+QString responseOutputToolCalls(const QJsonArray& output) {
+    QJsonArray toolCalls;
+    for (const QJsonValue& itemValue : output) {
+        const QJsonObject item = itemValue.toObject();
+        if (item["type"].toString() != "function_call") continue;
+        toolCalls.append(
+            QJsonObject{
+                {"id",       item["call_id"].toString()                                                     },
+                {"type",     "function"                                                                     },
+                {"function",
+                 QJsonObject{{"name", item["name"].toString()}, {"arguments", item["arguments"].toString()}}}
+        }
+        );
+    }
+    return QString::fromUtf8(QJsonDocument(toolCalls).toJson(QJsonDocument::Compact));
+}
+
+} // namespace
+
+// -----------------------------------------------------------------------
 // makeApiRequest：构建请求体并发送
 // -----------------------------------------------------------------------
 
@@ -926,8 +1022,9 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
     }
 
     QJsonObject requestBody;
-    requestBody["model"]       = m_model;
-    requestBody["messages"]    = messages;
+    requestBody["model"] = m_model;
+    requestBody[usesResponsesApi() ? "input" : "messages"] =
+        usesResponsesApi() ? messagesToResponsesInput(messages) : messages;
     requestBody["temperature"] = m_temperature;
     requestBody["stream"]      = m_isStreaming;
 
@@ -1030,6 +1127,56 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                 if (!doc.isObject()) continue;
 
                 QJsonObject obj = doc.object();
+                if (usesResponsesApi()) {
+                    const QString eventType = obj["type"].toString();
+                    if (eventType == "response.output_text.delta") {
+                        const QString content = obj["delta"].toString();
+                        if (!content.isEmpty()) {
+                            emit streamChunk(content);
+                            m_currentStreamBuffer += content;
+                        }
+                    } else if (eventType == "response.completed") {
+                        const QJsonObject response = obj["response"].toObject();
+                        if (response["status"].toString() != "completed") {
+                            const QString detail = response["error"].toObject()["message"].toString(
+                                response["incomplete_details"].toObject()["reason"].toString("响应未完成")
+                            );
+                            emit errorOccurred("API 请求失败\n" + detail);
+                            m_currentStreamBuffer.clear();
+                            m_toolCallsBuffer.clear();
+                            emit streamEnd();
+                            continue;
+                        }
+                        const QString toolCallsJson = responseOutputToolCalls(response["output"].toArray());
+                        if (!m_cancelled && !toolCallsJson.isEmpty() && toolCallsJson != "[]") {
+                            MessageData assistantMsg;
+                            assistantMsg.role          = "assistant";
+                            assistantMsg.content       = m_currentStreamBuffer;
+                            assistantMsg.toolCallsJson = toolCallsJson;
+                            currentMessages().append(assistantMsg);
+                            if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
+                            m_sessions[m_currentSessionId].updatedAt =
+                                QDateTime::currentDateTime().toString(Qt::ISODate);
+                            saveSessions();
+                            emit messagesChanged();
+                            dispatchToolCalls(toolCallsJson);
+                        } else if (!m_cancelled && !m_currentStreamBuffer.isEmpty()) {
+                            MessageData assistantMsg;
+                            assistantMsg.role    = "assistant";
+                            assistantMsg.content = m_currentStreamBuffer;
+                            currentMessages().append(assistantMsg);
+                            if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
+                            m_sessions[m_currentSessionId].updatedAt =
+                                QDateTime::currentDateTime().toString(Qt::ISODate);
+                            saveSessions();
+                            emit messagesChanged();
+                        }
+                        m_currentStreamBuffer.clear();
+                        m_toolCallsBuffer.clear();
+                        emit streamEnd();
+                    }
+                    continue;
+                }
                 if (!obj.contains("choices") || !obj["choices"].isArray()) continue;
 
                 QJsonArray choices = obj["choices"].toArray();
@@ -1134,6 +1281,46 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
             }
 
             QJsonObject obj = doc.object();
+            if (usesResponsesApi()) {
+                if (obj["status"].toString() != "completed") {
+                    const QString detail = obj["error"].toObject()["message"].toString(
+                        obj["incomplete_details"].toObject()["reason"].toString("响应未完成")
+                    );
+                    emit errorOccurred("API 请求失败\n" + detail);
+                    m_activeReplies.removeAll(reply);
+                    reply->deleteLater();
+                    return;
+                }
+                const QString toolCallsJson = responseOutputToolCalls(obj["output"].toArray());
+                const QString content       = responseOutputText(obj["output"].toArray());
+                if (!m_cancelled && !toolCallsJson.isEmpty() && toolCallsJson != "[]") {
+                    MessageData assistantMsg;
+                    assistantMsg.role          = "assistant";
+                    assistantMsg.content       = content;
+                    assistantMsg.toolCallsJson = toolCallsJson;
+                    currentMessages().append(assistantMsg);
+                    if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
+                    m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+                    saveSessions();
+                    emit messagesChanged();
+                    dispatchToolCalls(toolCallsJson);
+                } else if (!m_cancelled && !content.isEmpty()) {
+                    MessageData assistantMsg;
+                    assistantMsg.role    = "assistant";
+                    assistantMsg.content = content;
+                    currentMessages().append(assistantMsg);
+                    if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
+                    m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+                    saveSessions();
+                    emit messageReceived(content, true);
+                    emit messagesChanged();
+                } else if (!m_cancelled) {
+                    emit errorOccurred("API 响应格式错误：Responses API 未返回文本或工具调用");
+                }
+                m_activeReplies.removeAll(reply);
+                reply->deleteLater();
+                return;
+            }
             if (!obj.contains("choices") || !obj["choices"].isArray()) {
                 emit errorOccurred("API 响应格式错误：缺少 choices");
                 reply->deleteLater();
@@ -1423,6 +1610,8 @@ void ChatBot::setApiEndpoint(const QString& endpoint) {
 
 QString ChatBot::getModel() const { return m_model; }
 
+QString ChatBot::getApiProtocol() const { return m_apiProtocol; }
+
 void ChatBot::setModel(const QString& model) {
     if (m_model == model) return;
     m_model = model;
@@ -1489,9 +1678,10 @@ void ChatBot::initModels() {
         defaultModel["provider"]      = "DeepSeek";
         defaultModel["endpoint"]      = m_apiEndpoint.toStdString();
         defaultModel["apiKey"]        = m_apiKey.toStdString();
-        defaultModel["modelId"]       = m_model.toStdString();
-        defaultModel["temperature"]   = m_temperature;
-        defaultModel["extraParams"]   = json::object();
+        defaultModel["modelId"]            = m_model.toStdString();
+        defaultModel["apiProtocol"]        = "chat_completions";
+        defaultModel["temperature"]        = m_temperature;
+        defaultModel["extraParams"]        = json::object();
         defaultModel["proxyVisionModelId"] = "";
         defaultModel["proxyVisionPrompt"]  = "请详细描述这张图片的内容。如果图片中有文字，请完整转录。";
         m_modelsData["models"]        = json::array({defaultModel});
@@ -1522,6 +1712,8 @@ void ChatBot::applyModelConfig(const json& modelObj) {
     if (modelObj.contains("endpoint")) m_apiEndpoint = QString::fromStdString(modelObj["endpoint"]);
     if (modelObj.contains("apiKey")) m_apiKey = QString::fromStdString(modelObj["apiKey"]);
     if (modelObj.contains("modelId")) m_model = QString::fromStdString(modelObj["modelId"]);
+    m_apiProtocol = QString::fromStdString(modelObj.value("apiProtocol", "chat_completions"));
+    if (m_apiProtocol != "responses") m_apiProtocol = "chat_completions";
     if (modelObj.contains("temperature") && modelObj["temperature"].is_number())
         m_temperature = modelObj["temperature"];
     if (modelObj.contains("extraParams") && modelObj["extraParams"].is_object())
@@ -1574,6 +1766,8 @@ bool ChatBot::addModel(const QString& modelJson) {
     newModel["endpoint"]       = endpoint;
     newModel["apiKey"]         = input["apiKey"].toString().toStdString();
     newModel["modelId"]        = modelId;
+    QString apiProtocol        = input["apiProtocol"].toString();
+    newModel["apiProtocol"]    = apiProtocol == "responses" ? "responses" : "chat_completions";
     newModel["temperature"]    = input.contains("temperature") ? input["temperature"].toDouble() : 0.7;
     newModel["maxContextSize"] = input.contains("maxContextSize") ? input["maxContextSize"].toInt() : 0;
 
@@ -1629,6 +1823,7 @@ bool ChatBot::addModel(const QString& modelJson) {
         emit apiEndpointChanged();
         emit apiKeyChanged();
         emit modelChanged();
+        emit apiProtocolChanged();
         emit temperatureChanged();
     }
 
@@ -1650,6 +1845,7 @@ bool ChatBot::removeModel(const QString& modelId) {
                 emit apiEndpointChanged();
                 emit apiKeyChanged();
                 emit modelChanged();
+                emit apiProtocolChanged();
                 emit temperatureChanged();
             }
             // 清理其他模型对被删除模型的视觉代理引用
@@ -1683,6 +1879,7 @@ bool ChatBot::setActiveModel(const QString& modelId) {
             emit apiEndpointChanged();
             emit apiKeyChanged();
             emit modelChanged();
+            emit apiProtocolChanged();
             emit temperatureChanged();
             info("活动模型已切换为: {}", id);
             return true;
@@ -2027,10 +2224,15 @@ void ChatBot::injectToolDefinitions(QJsonObject& requestBody) {
                               "recent facts, or anything outside your training data.";
         func["parameters"]  = funcParam;
 
-        QJsonObject tool;
-        tool["type"]     = "function";
-        tool["function"] = func;
-        tools.append(tool);
+        if (usesResponsesApi()) {
+            func["type"] = "function";
+            tools.append(func);
+        } else {
+            QJsonObject tool;
+            tool["type"]     = "function";
+            tool["function"] = func;
+            tools.append(tool);
+        }
     }
 
     if (m_shellToolEnabled) {
@@ -2053,10 +2255,15 @@ void ChatBot::injectToolDefinitions(QJsonObject& requestBody) {
                               "Use for file operations, system queries, diagnostics, package management, etc.";
         func["parameters"]  = funcParam;
 
-        QJsonObject tool;
-        tool["type"]     = "function";
-        tool["function"] = func;
-        tools.append(tool);
+        if (usesResponsesApi()) {
+            func["type"] = "function";
+            tools.append(func);
+        } else {
+            QJsonObject tool;
+            tool["type"]     = "function";
+            tool["function"] = func;
+            tools.append(tool);
+        }
     }
 
     if (!tools.isEmpty()) {

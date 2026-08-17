@@ -10,12 +10,15 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMap>
+#include <QMutex>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QObject>
 #include <QProcess>
 #include <QQueue>
+#include <QThreadPool>
+#include <QSet>
 #include <QTimer>
 #include <QVector>
 
@@ -39,6 +42,7 @@ struct MessagePart {
 struct MessageData {
     QString              role;          // "user" | "assistant" | "system" | "tool"
     QString              content;       // 纯文本（无多模态时使用）
+    QString              reasoning;     // 模型推理摘要（不发送回 API）
     QVector<MessagePart> parts;         // 多模态内容（非空时优先于 content）
     QString              toolCallId;    // role=tool 时
     QString              toolCallsJson; // role=assistant 且有 tool_calls 时，原始 JSON 字符串
@@ -98,6 +102,8 @@ public:
     Q_INVOKABLE void    clearHistory();
     Q_INVOKABLE void    saveMessages();
     Q_INVOKABLE QString markdownToHtml(const QString& markdown);
+    Q_INVOKABLE void    parseMarkdownAsync(const QString& markdown, const QString& requestId);
+    Q_INVOKABLE void    cancelMarkdownParse(const QString& requestId);
     Q_INVOKABLE void    truncateHistory(int index);
     Q_INVOKABLE void    editMessage(int index, const QString& newContent);
     Q_INVOKABLE void    deleteMessage(int index);
@@ -189,11 +195,14 @@ signals:
     void messageReceived(const QString& content, bool isComplete = true);
     void streamStart();
     void streamChunk(const QString& content);
+    void reasoningChunk(const QString& content);
+    void markdownParsed(const QString& requestId, const QString& blocksJson);
     void streamEnd();
     void errorOccurred(const QString& error);
     void requestCancelled();
     // Tool Call 信号：toolCallsJson 为完整 tool_calls 数组的 JSON 字符串
     void toolCallReceived(const QString& toolCallsJson);
+    void toolCallProgress(const QString& text, bool isComplete);
     void apiKeyChanged();
     void apiEndpointChanged();
     void modelChanged();
@@ -231,6 +240,9 @@ public:
 
 private:
     QNetworkAccessManager* m_networkManager;
+    QThreadPool            m_markdownPool;
+    QMutex                 m_markdownRequestsMutex;
+    QSet<QString>          m_markdownRequests;
     QList<QNetworkReply*>  m_activeReplies;
     bool                   m_cancelled = false;
     int                    m_requestSeq = 0;
@@ -251,8 +263,9 @@ private:
     bool m_capVision      = false;
     bool m_capAudio       = false;
     bool m_capToolCall    = false;
-    bool m_capReasoning   = false;
-    int  m_maxContextSize = 0;
+    bool    m_capReasoning   = false;
+    QString m_reasoningEffort;
+    int     m_maxContextSize = 0;
 
     QString m_proxyVisionModelId;
     QString m_proxyVisionPrompt = "请详细描述这张图片的内容。如果图片中有文字，请完整转录。";
@@ -285,9 +298,13 @@ private:
     void abortActiveReplies();
 
     QString m_currentStreamBuffer;
+    QString m_currentReasoningBuffer;
     QString m_responseBuffer;
     // 流式 tool_calls 累积缓冲（按 index 存储各工具调用的片段）
-    QMap<int, json> m_toolCallsBuffer;
+    QMap<int, json>    m_toolCallsBuffer;
+    QMap<QString, int> m_responseToolItemIndexes;
+    bool               m_serverToolCallActive = false;
+    QString            m_serverToolCallName;
 
     // 多模型管理
     json m_modelsData;

@@ -149,6 +149,7 @@ Config::Config() : Logger("Config") {
                     {"apiKey",      ""},
                     {"temperature", 0.7},
                     {"maxContextSize", 0},
+                    {"reasoningEffort", ""},
                     {"capabilities", json{
                         {"text",      true},
                         {"vision",    false},
@@ -286,6 +287,7 @@ bool Config::_update(json& data) {
                              {"apiProtocol", "chat_completions"},
                              {"apiKey", cb.value("api_key", "")},
                              {"temperature", cb.value("temperature", 0.7)},
+                             {"reasoningEffort", ""},
                              {"extraParams", ""}
                         }
                     });

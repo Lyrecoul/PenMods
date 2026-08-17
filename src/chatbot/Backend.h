@@ -72,6 +72,7 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
     Q_PROPERTY(bool isAvailable READ isAvailable CONSTANT)
     Q_PROPERTY(QVariantList messages READ getMessages NOTIFY messagesChanged)
     Q_PROPERTY(QString currentSessionId READ getCurrentSessionId NOTIFY sessionSwitched)
+    Q_PROPERTY(QVariantMap apiCacheStats READ getApiCacheStats NOTIFY apiCacheStatsChanged)
 
     // 当前活动模型的能力标志（只读，随模型切换更新）
     Q_PROPERTY(bool capText READ getCapText NOTIFY activeModelCapabilitiesChanged)
@@ -109,6 +110,7 @@ public:
     Q_INVOKABLE void    deleteMessage(int index);
     Q_INVOKABLE void    regenerateMessage(int index);
     Q_INVOKABLE void    cancelRequest();
+    Q_INVOKABLE void    resetApiCacheStats();
 
     // Tool Call 接口
     Q_INVOKABLE void submitToolResult(const QString& toolCallId, const QString& toolName, const QString& result);
@@ -160,6 +162,7 @@ public:
     QString      getDefaultPrompt() const;
     bool         getIsStreaming() const;
     QVariantList getMessages() const;
+    QVariantMap  getApiCacheStats() const;
 
     bool getCapText() const { return m_capText; }
     bool getCapVision() const { return m_capVision; }
@@ -211,6 +214,7 @@ signals:
     void defaultPromptChanged();
     void isStreamingChanged();
     void messagesChanged();
+    void apiCacheStatsChanged();
     void modelsChanged();
     void promptsChanged();
     void sessionsChanged();
@@ -293,6 +297,7 @@ private:
 
     void makeApiRequest(const QJsonArray& messages);
     void handleNetworkReply(QNetworkReply* reply, bool isStream);
+    void recordApiUsage(const QJsonObject& usage);
     bool       usesResponsesApi() const;
     QJsonArray messagesToResponsesInput(const QJsonArray& messages) const;
     void abortActiveReplies();
@@ -305,6 +310,11 @@ private:
     QMap<QString, int> m_responseToolItemIndexes;
     bool               m_serverToolCallActive = false;
     QString            m_serverToolCallName;
+    quint64            m_cacheSampleCount = 0;
+    quint64            m_totalInputTokens = 0;
+    quint64            m_totalCachedTokens = 0;
+    quint64            m_lastInputTokens = 0;
+    quint64            m_lastCachedTokens = 0;
 
     // 多模型管理
     json m_modelsData;

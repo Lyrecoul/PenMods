@@ -75,6 +75,81 @@ QString ChatBot::markdownToHtml(const QString& markdown) {
     return doc.toHtml();
 }
 
+QVariantMap ChatBot::getApiCacheStats() const {
+    const double totalRate = m_totalInputTokens > 0
+        ? 100.0 * static_cast<double>(m_totalCachedTokens) / static_cast<double>(m_totalInputTokens)
+        : 0.0;
+    const double lastRate = m_lastInputTokens > 0
+        ? 100.0 * static_cast<double>(m_lastCachedTokens) / static_cast<double>(m_lastInputTokens)
+        : 0.0;
+    return {{"sampleCount", QVariant::fromValue<qulonglong>(m_cacheSampleCount)},
+            {"totalInputTokens", QVariant::fromValue<qulonglong>(m_totalInputTokens)},
+            {"totalCachedTokens", QVariant::fromValue<qulonglong>(m_totalCachedTokens)},
+            {"totalRate", totalRate},
+            {"lastInputTokens", QVariant::fromValue<qulonglong>(m_lastInputTokens)},
+            {"lastCachedTokens", QVariant::fromValue<qulonglong>(m_lastCachedTokens)},
+            {"lastRate", lastRate}};
+}
+
+void ChatBot::resetApiCacheStats() {
+    m_cacheSampleCount = 0;
+    m_totalInputTokens = 0;
+    m_totalCachedTokens = 0;
+    m_lastInputTokens = 0;
+    m_lastCachedTokens = 0;
+    emit apiCacheStatsChanged();
+}
+
+void ChatBot::recordApiUsage(const QJsonObject& usage) {
+    quint64 input = static_cast<quint64>(usage["prompt_tokens"].toVariant().toULongLong());
+    if (input == 0) input = static_cast<quint64>(usage["input_tokens"].toVariant().toULongLong());
+
+    quint64 cached = 0;
+    const QJsonObject promptDetails = usage["prompt_tokens_details"].toObject();
+    const QJsonObject inputDetails  = usage["input_tokens_details"].toObject();
+    cached = static_cast<quint64>(promptDetails["cached_tokens"].toVariant().toULongLong());
+    if (cached == 0)
+        cached = static_cast<quint64>(inputDetails["cached_tokens"].toVariant().toULongLong());
+
+    const quint64 cacheHit = static_cast<quint64>(usage["prompt_cache_hit_tokens"].toVariant().toULongLong());
+    const quint64 cacheMiss = static_cast<quint64>(usage["prompt_cache_miss_tokens"].toVariant().toULongLong());
+    if (cacheHit > 0 || cacheMiss > 0) {
+        cached = cacheHit;
+        input  = cacheHit + cacheMiss;
+    }
+
+    const quint64 cacheRead = static_cast<quint64>(usage["cache_read_input_tokens"].toVariant().toULongLong());
+    const quint64 cacheCreation =
+        static_cast<quint64>(usage["cache_creation_input_tokens"].toVariant().toULongLong());
+    if (cacheRead > 0 || cacheCreation > 0) {
+        cached = cacheRead;
+        input += cacheRead + cacheCreation;
+    }
+
+    if (input == 0 && cached == 0) return;
+    if (input < cached) input = cached;
+
+    m_lastInputTokens  = input;
+    m_lastCachedTokens = cached;
+    m_totalInputTokens += input;
+    m_totalCachedTokens += cached;
+    ++m_cacheSampleCount;
+
+    const double lastRate = input > 0 ? 100.0 * static_cast<double>(cached) / static_cast<double>(input) : 0.0;
+    const double totalRate = m_totalInputTokens > 0
+        ? 100.0 * static_cast<double>(m_totalCachedTokens) / static_cast<double>(m_totalInputTokens)
+        : 0.0;
+    info("API 缓存: 本次 {}/{} tokens ({:.1f}%), 累计 {}/{} ({:.1f}%), 样本 {}",
+         cached,
+         input,
+         lastRate,
+         m_totalCachedTokens,
+         m_totalInputTokens,
+         totalRate,
+         m_cacheSampleCount);
+    emit apiCacheStatsChanged();
+}
+
 void ChatBot::parseMarkdownAsync(const QString& markdown, const QString& requestId) {
     if (requestId.isEmpty()) return;
     {
@@ -1114,6 +1189,8 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
         usesResponsesApi() ? messagesToResponsesInput(messages) : messages;
     requestBody["temperature"] = m_temperature;
     requestBody["stream"]      = m_isStreaming;
+    if (m_isStreaming && !usesResponsesApi())
+        requestBody["stream_options"] = QJsonObject{{"include_usage", true}};
 
     if (m_capReasoning) {
         if (usesResponsesApi()) {
@@ -1241,6 +1318,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                 if (!doc.isObject()) continue;
 
                 QJsonObject obj = doc.object();
+                if (obj["usage"].isObject()) recordApiUsage(obj["usage"].toObject());
                 if (usesResponsesApi()) {
                     const QString eventType = obj["type"].toString();
                     if (eventType == "response.output_text.delta") {
@@ -1306,6 +1384,8 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                         }
                     } else if (eventType == "response.completed") {
                         const QJsonObject response = obj["response"].toObject();
+                        if (!obj["usage"].isObject() && response["usage"].isObject())
+                            recordApiUsage(response["usage"].toObject());
                         if (response["status"].toString() != "completed") {
                             if (m_serverToolCallActive) {
                                 emit toolCallProgress("服务器工具执行未完成", true);
@@ -1500,6 +1580,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
             }
 
             QJsonObject obj = doc.object();
+            if (obj["usage"].isObject()) recordApiUsage(obj["usage"].toObject());
             if (usesResponsesApi()) {
                 if (obj["status"].toString() != "completed") {
                     const QString detail = obj["error"].toObject()["message"].toString(

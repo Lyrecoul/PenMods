@@ -25,6 +25,11 @@ public:
     bool autoSendScanConfig() const { return m_autoSendScanConfig; }
     void setAutoSendScanConfig(bool value);
 
+    Q_INVOKABLE bool startVoiceInput(QObject* speechManager);
+    Q_INVOKABLE bool stopVoiceInput(QObject* speechManager);
+
+    bool isStartingVoiceInput() const { return m_startingVoiceInput; }
+
 signals:
     void scanFinished(QString result);
     void inputPageShowingChanged();
@@ -37,6 +42,7 @@ private:
     bool m_inputPageShowing = false;
     bool m_autoSendScan = false;
     bool m_autoSendScanConfig = true;
+    bool m_startingVoiceInput = false;
 };
 
 } // namespace mod

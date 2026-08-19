@@ -53,7 +53,34 @@ void KeyBoard::setAutoSendScanConfig(bool value) {
     }
 }
 
+bool KeyBoard::startVoiceInput(QObject* speechManager) {
+    auto* startAsrRecord = PEN_SYM("_ZN14YSpeechManager14startAsrRecordEv");
+    auto* setAsrResult   = PEN_SYM("_ZN14YSpeechManager12setAsrResultERK7QString");
+    if (speechManager == nullptr || startAsrRecord == nullptr || setAsrResult == nullptr) return false;
+
+    const QString emptyResult;
+    reinterpret_cast<void (*)(void*, const QString&)>(setAsrResult)(speechManager, emptyResult);
+
+    m_startingVoiceInput = true;
+    reinterpret_cast<void (*)(void*)>(startAsrRecord)(speechManager);
+    m_startingVoiceInput = false;
+    return true;
+}
+
+bool KeyBoard::stopVoiceInput(QObject* speechManager) {
+    auto* stopAsrRecord = PEN_SYM("_ZN14YSpeechManager13stopAsrRecordEv");
+    if (speechManager == nullptr || stopAsrRecord == nullptr) return false;
+
+    reinterpret_cast<void (*)(void*)>(stopAsrRecord)(speechManager);
+    return true;
+}
+
 } // namespace mod
+
+PEN_HOOK(uint64, _ZN7YGlobal14showSpeechPageEv, uint64 self) {
+    if (mod::KeyBoard::getInstance().isStartingVoiceInput()) return 0;
+    return origin(self);
+}
 
 static bool shouldBlockScan() {
     bool inputPageShowing = PEN_CALL(bool, "_ZNK7YGlobal16inputPageShowingEv", void*)(mod::YPointer<YGlobal>::getInstance());

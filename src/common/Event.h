@@ -25,6 +25,8 @@ signals:
 
     void homeButtonPressed();
 
+    void ocrStarted();
+
     void currentPageIndexChanged(int pageIndex);
 
 

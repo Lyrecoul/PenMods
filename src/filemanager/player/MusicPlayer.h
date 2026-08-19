@@ -21,6 +21,8 @@ using PlayList = std::vector<PlayFile>;
 class MusicPlayer : public QObject, public Singleton<MusicPlayer>, private Logger {
     Q_OBJECT
 
+    Q_PROPERTY(bool pauseOnScan READ getPauseOnScan WRITE setPauseOnScan NOTIFY pauseOnScanChanged);
+
 public:
     void play(size_t idx);
 
@@ -38,11 +40,17 @@ public:
 
     static bool mIsTakeOver;
 
+    [[nodiscard]] bool getPauseOnScan() const;
+    void setPauseOnScan(bool enabled);
+
     /// 供 QML 调⽤：释放当前 MUSIC 引⽤（播放停⽌/关闭播放器时）
     Q_INVOKABLE void releaseAudio();
 
     /// 清理当前临时软链接
     void cleanupTempSymlinks();
+
+signals:
+    void pauseOnScanChanged();
 
 private:
     friend Singleton<MusicPlayer>;
@@ -70,5 +78,8 @@ private:
 
     // 临时软链接路径，用于清理
     QString mTempAudioLink;
+    bool    mPauseOnScan{false};
+
+    void onOcrStarted();
 };
 } // namespace mod::filemanager

@@ -11,6 +11,8 @@
 #include "common/Event.h"
 #include "common/Utils.h"
 
+#include "mod/Config.h"
+
 #include "system/sound/AudioDaemon.h"
 
 #include <QFile>
@@ -24,6 +26,10 @@ namespace mod::filemanager {
 bool MusicPlayer::mIsTakeOver{false};
 
 MusicPlayer::MusicPlayer() : Logger("MusicPlayer") {
+    const auto cfg = Config::getInstance().read("fm");
+    mPauseOnScan   = cfg.value("pause_on_scan", false);
+
+    connect(&Event::getInstance(), &Event::ocrStarted, this, &MusicPlayer::onOcrStarted);
     connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView& view, QQmlContext* context) {
         context->setContextProperty("musicPlayer", this);
     });
@@ -237,6 +243,30 @@ void MusicPlayer::onSoundEnd() {
 AudioSequence MusicPlayer::getCurrentAudioSequence() {
     return PEN_CALL(AudioSequence, "_ZNK15YSettingManager13audioSequenceEv", void*)(
         YPointer<YSettingManager>::getInstance());
+}
+
+bool MusicPlayer::getPauseOnScan() const { return mPauseOnScan; }
+
+void MusicPlayer::setPauseOnScan(bool enabled) {
+    if (mPauseOnScan == enabled) {
+        return;
+    }
+    mPauseOnScan         = enabled;
+    auto cfg             = Config::getInstance().read("fm");
+    cfg["pause_on_scan"] = enabled;
+    Config::getInstance().write("fm", std::move(cfg));
+    emit pauseOnScanChanged();
+}
+
+void MusicPlayer::onOcrStarted() {
+    if (!mPauseOnScan) {
+        return;
+    }
+    auto*      manager = YPointer<YMediaPlayerManager>::getInstance();
+    const auto state   = PEN_CALL(PlayState, "_ZNK19YMediaPlayerManager9playStateEv", void*)(manager);
+    if (state == PlayState::PLAYING) {
+        PEN_CALL(void, "_ZN19YMediaPlayerManager14onClickedPauseEv", void*)(manager);
+    }
 }
 
 void MusicPlayer::releaseAudio() {

@@ -123,7 +123,8 @@ Config::Config() : Logger("Config") {
                 {"reversed", false}
             }},
             {"hide_paired_lyrics", false},
-            {"show_hidden_files", false}
+            {"show_hidden_files", false},
+            {"pause_on_scan", false}
         }},
         {"wallpaper", {
             {"mode", 0},

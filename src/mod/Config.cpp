@@ -101,7 +101,8 @@ Config::Config() : Logger("Config") {
                 {"restart", true},
                 {"reset_page", true},
                 {"dev_setting", false},
-                {"filemanager",false}
+                {"filemanager",false},
+                {"antiembs_deactivate", false}
             }}
         }},
         {"antiembs", {

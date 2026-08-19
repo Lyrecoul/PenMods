@@ -14,6 +14,7 @@
 #include "mod/Mod.h"
 
 #include "filemanager/FileManager.h"
+#include "locker/Locker.h"
 
 #include "system/sound/ASound.h"
 
@@ -79,9 +80,27 @@ void AntiEmbs::onHomeButtonPress() {
         }
     }
     mHomePressTimes.clear();
+    if (isActive() && Locker::getInstance().getScene("antiembs_deactivate")) {
+        emit deactivationUnlockRequested();
+        return;
+    }
     showToast("操作执行完毕");
     filemanager::FileManager::getInstance().negateHiddenAll();
     emit activeChanged();
+}
+
+bool AntiEmbs::deactivate(const QString& password) {
+    if (!isActive()) {
+        return true;
+    }
+    auto& locker = Locker::getInstance();
+    if (locker.getScene("antiembs_deactivate") && password != locker.getPassword()) {
+        return false;
+    }
+    showToast("操作执行完毕");
+    filemanager::FileManager::getInstance().negateHiddenAll();
+    emit activeChanged();
+    return true;
 }
 
 bool AntiEmbs::getAutoMute() const { return mAutoMute; }

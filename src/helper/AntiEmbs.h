@@ -27,6 +27,8 @@ public:
 
     void onHomeButtonPress();
 
+    Q_INVOKABLE bool deactivate(const QString& password);
+
     // =================================
 
     [[nodiscard]] bool getAutoMute() const;
@@ -62,6 +64,8 @@ signals:
     void fastHideChanged();
 
     void activeChanged();
+
+    void deactivationUnlockRequested();
 
     void lowVoiceModeChanged();
 

@@ -17,8 +17,8 @@
 #include <QObject>
 #include <QProcess>
 #include <QQueue>
-#include <QThreadPool>
 #include <QSet>
+#include <QThreadPool>
 #include <QTimer>
 #include <QVector>
 
@@ -81,8 +81,13 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
     Q_PROPERTY(bool capToolCall READ getCapToolCall NOTIFY activeModelCapabilitiesChanged)
     Q_PROPERTY(bool capReasoning READ getCapReasoning NOTIFY activeModelCapabilitiesChanged)
 
-    Q_PROPERTY(QString proxyVisionModelId READ getProxyVisionModelId WRITE setProxyVisionModelId NOTIFY proxyVisionSettingsChanged)
-    Q_PROPERTY(QString proxyVisionPrompt READ getProxyVisionPrompt WRITE setProxyVisionPrompt NOTIFY proxyVisionSettingsChanged)
+    Q_PROPERTY(
+        QString proxyVisionModelId READ getProxyVisionModelId WRITE setProxyVisionModelId NOTIFY
+            proxyVisionSettingsChanged
+    )
+    Q_PROPERTY(
+        QString proxyVisionPrompt READ getProxyVisionPrompt WRITE setProxyVisionPrompt NOTIFY proxyVisionSettingsChanged
+    )
 
     Q_PROPERTY(bool tavilyEnabled READ getTavilyEnabled WRITE setTavilyEnabled NOTIFY tavilyConfigChanged)
     Q_PROPERTY(bool tavilyConfigured READ getTavilyConfigured NOTIFY tavilyConfigChanged)
@@ -90,8 +95,12 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
     Q_PROPERTY(bool shellToolEnabled READ getShellToolEnabled WRITE setShellToolEnabled NOTIFY shellToolConfigChanged)
 
     Q_PROPERTY(
-        bool mathRenderEnabled READ getMathRenderEnabled WRITE setMathRenderEnabled NOTIFY mathRenderConfigChanged)
+        bool mathRenderEnabled READ getMathRenderEnabled WRITE setMathRenderEnabled NOTIFY mathRenderConfigChanged
+    )
     Q_PROPERTY(QString mathServerPath READ getMathServerPath WRITE setMathServerPath NOTIFY mathRenderConfigChanged)
+    Q_PROPERTY(
+        QString bubbleRenderMode READ getBubbleRenderMode WRITE setBubbleRenderMode NOTIFY bubbleRenderModeChanged
+    )
 
 public:
     // 基础接口
@@ -184,8 +193,10 @@ public:
 
     bool    getMathRenderEnabled() const { return m_mathRenderEnabled; }
     QString getMathServerPath() const { return m_mathServerPath; }
+    QString getBubbleRenderMode() const { return m_bubbleRenderMode; }
     void    setMathRenderEnabled(bool v);
     void    setMathServerPath(const QString& path);
+    void    setBubbleRenderMode(const QString& mode);
 
     void setApiKey(const QString& key);
     void setApiEndpoint(const QString& endpoint);
@@ -234,6 +245,7 @@ signals:
     shellCommandFinished(const QString& toolCallId, bool success, const QString& summary, const QString& resultText);
     void toolBatchFlushed();
     void mathRenderConfigChanged();
+    void bubbleRenderModeChanged();
 
 private:
     friend Singleton<ChatBot>;
@@ -248,7 +260,7 @@ private:
     QMutex                 m_markdownRequestsMutex;
     QSet<QString>          m_markdownRequests;
     QList<QNetworkReply*>  m_activeReplies;
-    bool                   m_cancelled = false;
+    bool                   m_cancelled  = false;
     int                    m_requestSeq = 0;
 
     QString m_apiKey;
@@ -263,11 +275,11 @@ private:
     json m_extraParams;
 
     // 当前活动模型的能力标志
-    bool m_capText        = true;
-    bool m_capVision      = false;
-    bool m_capAudio       = false;
-    bool m_capToolCall    = false;
-    bool    m_capReasoning   = false;
+    bool    m_capText      = true;
+    bool    m_capVision    = false;
+    bool    m_capAudio     = false;
+    bool    m_capToolCall  = false;
+    bool    m_capReasoning = false;
     QString m_reasoningEffort;
     int     m_maxContextSize = 0;
 
@@ -291,16 +303,18 @@ private:
     // 将 MessageData 序列化为 OpenAI API 格式的 QJsonObject
     QJsonObject messageToJson(const MessageData& msg) const;
     // 将当前历史（加 system prompt）组装为 API messages 数组
-    QJsonArray buildApiMessages(const QVector<MessageData>& history,
-                                const QString&              userText,
-                                const QVector<MessagePart>& userParts = {});
+    QJsonArray buildApiMessages(
+        const QVector<MessageData>& history,
+        const QString&              userText,
+        const QVector<MessagePart>& userParts = {}
+    );
 
-    void makeApiRequest(const QJsonArray& messages);
-    void handleNetworkReply(QNetworkReply* reply, bool isStream);
-    void recordApiUsage(const QJsonObject& usage);
+    void       makeApiRequest(const QJsonArray& messages);
+    void       handleNetworkReply(QNetworkReply* reply, bool isStream);
+    void       recordApiUsage(const QJsonObject& usage);
     bool       usesResponsesApi() const;
     QJsonArray messagesToResponsesInput(const QJsonArray& messages) const;
-    void abortActiveReplies();
+    void       abortActiveReplies();
 
     QString m_currentStreamBuffer;
     QString m_currentReasoningBuffer;
@@ -310,11 +324,11 @@ private:
     QMap<QString, int> m_responseToolItemIndexes;
     bool               m_serverToolCallActive = false;
     QString            m_serverToolCallName;
-    quint64            m_cacheSampleCount = 0;
-    quint64            m_totalInputTokens = 0;
+    quint64            m_cacheSampleCount  = 0;
+    quint64            m_totalInputTokens  = 0;
     quint64            m_totalCachedTokens = 0;
-    quint64            m_lastInputTokens = 0;
-    quint64            m_lastCachedTokens = 0;
+    quint64            m_lastInputTokens   = 0;
+    quint64            m_lastCachedTokens  = 0;
 
     // 多模型管理
     json m_modelsData;
@@ -356,8 +370,8 @@ private:
     struct ActiveShellExec {
         QString   toolCallId;
         QString   command;
-        QProcess* process    = nullptr;
-        QTimer*   timer      = nullptr;
+        QProcess* process = nullptr;
+        QTimer*   timer   = nullptr;
         QString   stdoutBuf;
         QString   stderrBuf;
     };
@@ -372,6 +386,7 @@ private:
     // 数学公式渲染
     bool    m_mathRenderEnabled = false;
     QString m_mathServerPath;
+    QString m_bubbleRenderMode = "full";
 
     void initMathRender();
 
@@ -387,14 +402,18 @@ private:
     void submitToolResultBatched(const QString& toolCallId, const QString& toolName, const QString& result);
     void tryFlushToolBatch();
 
-    void callVisionProxy(const QString&              message,
-                         const QVector<MessagePart>& parts,
-                         const QString&              sessionId,
-                         int                         requestSeq);
-    void finishMediaMessage(const QString&              message,
-                            const QVector<MessagePart>& parts,
-                            const QString&              effectiveMessage,
-                            const QString&              sessionId);
+    void callVisionProxy(
+        const QString&              message,
+        const QVector<MessagePart>& parts,
+        const QString&              sessionId,
+        int                         requestSeq
+    );
+    void finishMediaMessage(
+        const QString&              message,
+        const QVector<MessagePart>& parts,
+        const QString&              effectiveMessage,
+        const QString&              sessionId
+    );
 };
 
 } // namespace mod::chatbot

@@ -138,6 +138,7 @@ Config::Config() : Logger("Config") {
             {"auto_send_scan", true},
             {"speech_assistant", false},
             {"streaming", true},
+            {"bubble_render_mode", "full"},
             {"models", json::array({
                 json{
                     {"id",          "deepseek-v4-flash"},

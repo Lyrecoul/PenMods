@@ -22,13 +22,13 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QNetworkReply>
 #include <QMutexLocker>
+#include <QNetworkReply>
 #include <QPointer>
 #include <QProcess>
 #include <QQmlContext>
-#include <QRunnable>
 #include <QRegularExpression>
+#include <QRunnable>
 #include <QTextDocument>
 #include <QTextStream>
 #include <QTimer>
@@ -76,27 +76,29 @@ QString ChatBot::markdownToHtml(const QString& markdown) {
 }
 
 QVariantMap ChatBot::getApiCacheStats() const {
-    const double totalRate = m_totalInputTokens > 0
-        ? 100.0 * static_cast<double>(m_totalCachedTokens) / static_cast<double>(m_totalInputTokens)
-        : 0.0;
+    const double totalRate = m_totalInputTokens > 0 ? 100.0 * static_cast<double>(m_totalCachedTokens)
+                                                          / static_cast<double>(m_totalInputTokens)
+                                                    : 0.0;
     const double lastRate = m_lastInputTokens > 0
-        ? 100.0 * static_cast<double>(m_lastCachedTokens) / static_cast<double>(m_lastInputTokens)
-        : 0.0;
-    return {{"sampleCount", QVariant::fromValue<qulonglong>(m_cacheSampleCount)},
-            {"totalInputTokens", QVariant::fromValue<qulonglong>(m_totalInputTokens)},
-            {"totalCachedTokens", QVariant::fromValue<qulonglong>(m_totalCachedTokens)},
-            {"totalRate", totalRate},
-            {"lastInputTokens", QVariant::fromValue<qulonglong>(m_lastInputTokens)},
-            {"lastCachedTokens", QVariant::fromValue<qulonglong>(m_lastCachedTokens)},
-            {"lastRate", lastRate}};
+                              ? 100.0 * static_cast<double>(m_lastCachedTokens) / static_cast<double>(m_lastInputTokens)
+                              : 0.0;
+    return {
+        {"sampleCount",       QVariant::fromValue<qulonglong>(m_cacheSampleCount) },
+        {"totalInputTokens",  QVariant::fromValue<qulonglong>(m_totalInputTokens) },
+        {"totalCachedTokens", QVariant::fromValue<qulonglong>(m_totalCachedTokens)},
+        {"totalRate",         totalRate                                           },
+        {"lastInputTokens",   QVariant::fromValue<qulonglong>(m_lastInputTokens)  },
+        {"lastCachedTokens",  QVariant::fromValue<qulonglong>(m_lastCachedTokens) },
+        {"lastRate",          lastRate                                            }
+    };
 }
 
 void ChatBot::resetApiCacheStats() {
-    m_cacheSampleCount = 0;
-    m_totalInputTokens = 0;
+    m_cacheSampleCount  = 0;
+    m_totalInputTokens  = 0;
     m_totalCachedTokens = 0;
-    m_lastInputTokens = 0;
-    m_lastCachedTokens = 0;
+    m_lastInputTokens   = 0;
+    m_lastCachedTokens  = 0;
     emit apiCacheStatsChanged();
 }
 
@@ -104,49 +106,49 @@ void ChatBot::recordApiUsage(const QJsonObject& usage) {
     quint64 input = static_cast<quint64>(usage["prompt_tokens"].toVariant().toULongLong());
     if (input == 0) input = static_cast<quint64>(usage["input_tokens"].toVariant().toULongLong());
 
-    quint64 cached = 0;
+    quint64           cached        = 0;
     const QJsonObject promptDetails = usage["prompt_tokens_details"].toObject();
     const QJsonObject inputDetails  = usage["input_tokens_details"].toObject();
-    cached = static_cast<quint64>(promptDetails["cached_tokens"].toVariant().toULongLong());
-    if (cached == 0)
-        cached = static_cast<quint64>(inputDetails["cached_tokens"].toVariant().toULongLong());
+    cached                          = static_cast<quint64>(promptDetails["cached_tokens"].toVariant().toULongLong());
+    if (cached == 0) cached = static_cast<quint64>(inputDetails["cached_tokens"].toVariant().toULongLong());
 
-    const quint64 cacheHit = static_cast<quint64>(usage["prompt_cache_hit_tokens"].toVariant().toULongLong());
+    const quint64 cacheHit  = static_cast<quint64>(usage["prompt_cache_hit_tokens"].toVariant().toULongLong());
     const quint64 cacheMiss = static_cast<quint64>(usage["prompt_cache_miss_tokens"].toVariant().toULongLong());
     if (cacheHit > 0 || cacheMiss > 0) {
         cached = cacheHit;
         input  = cacheHit + cacheMiss;
     }
 
-    const quint64 cacheRead = static_cast<quint64>(usage["cache_read_input_tokens"].toVariant().toULongLong());
-    const quint64 cacheCreation =
-        static_cast<quint64>(usage["cache_creation_input_tokens"].toVariant().toULongLong());
+    const quint64 cacheRead     = static_cast<quint64>(usage["cache_read_input_tokens"].toVariant().toULongLong());
+    const quint64 cacheCreation = static_cast<quint64>(usage["cache_creation_input_tokens"].toVariant().toULongLong());
     if (cacheRead > 0 || cacheCreation > 0) {
-        cached = cacheRead;
-        input += cacheRead + cacheCreation;
+        cached  = cacheRead;
+        input  += cacheRead + cacheCreation;
     }
 
     if (input == 0 && cached == 0) return;
     if (input < cached) input = cached;
 
-    m_lastInputTokens  = input;
-    m_lastCachedTokens = cached;
-    m_totalInputTokens += input;
+    m_lastInputTokens    = input;
+    m_lastCachedTokens   = cached;
+    m_totalInputTokens  += input;
     m_totalCachedTokens += cached;
     ++m_cacheSampleCount;
 
-    const double lastRate = input > 0 ? 100.0 * static_cast<double>(cached) / static_cast<double>(input) : 0.0;
-    const double totalRate = m_totalInputTokens > 0
-        ? 100.0 * static_cast<double>(m_totalCachedTokens) / static_cast<double>(m_totalInputTokens)
-        : 0.0;
-    info("API 缓存: 本次 {}/{} tokens ({:.1f}%), 累计 {}/{} ({:.1f}%), 样本 {}",
-         cached,
-         input,
-         lastRate,
-         m_totalCachedTokens,
-         m_totalInputTokens,
-         totalRate,
-         m_cacheSampleCount);
+    const double lastRate  = input > 0 ? 100.0 * static_cast<double>(cached) / static_cast<double>(input) : 0.0;
+    const double totalRate = m_totalInputTokens > 0 ? 100.0 * static_cast<double>(m_totalCachedTokens)
+                                                          / static_cast<double>(m_totalInputTokens)
+                                                    : 0.0;
+    info(
+        "API 缓存: 本次 {}/{} tokens ({:.1f}%), 累计 {}/{} ({:.1f}%), 样本 {}",
+        cached,
+        input,
+        lastRate,
+        m_totalCachedTokens,
+        m_totalInputTokens,
+        totalRate,
+        m_cacheSampleCount
+    );
     emit apiCacheStatsChanged();
 }
 
@@ -213,7 +215,11 @@ ChatBot::ChatBot()
 
     auto& config = mod::Config::getInstance();
     json  aiCfg  = config.read("ai");
-    if (!aiCfg.is_null()) m_isStreaming = aiCfg.value("streaming", true);
+    if (!aiCfg.is_null()) {
+        m_isStreaming            = aiCfg.value("streaming", true);
+        const QString renderMode = QString::fromStdString(aiCfg.value("bubble_render_mode", std::string("full")));
+        if (renderMode == "full" || renderMode == "basic" || renderMode == "plain") m_bubbleRenderMode = renderMode;
+    }
 
     connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView& view, QQmlContext* context) {
         context->setContextProperty("chatbot", this);
@@ -261,6 +267,14 @@ void ChatBot::reloadConfig() {
         bool old      = m_isStreaming;
         m_isStreaming = aiCfg.value("streaming", true);
         if (old != m_isStreaming) emit isStreamingChanged();
+
+        const QString renderMode = QString::fromStdString(aiCfg.value("bubble_render_mode", std::string("full")));
+        const QString normalizedMode =
+            (renderMode == "full" || renderMode == "basic" || renderMode == "plain") ? renderMode : "full";
+        if (m_bubbleRenderMode != normalizedMode) {
+            m_bubbleRenderMode = normalizedMode;
+            emit bubbleRenderModeChanged();
+        }
     }
 
     initModels();
@@ -359,9 +373,11 @@ QJsonObject ChatBot::messageToJson(const MessageData& msg) const {
 // 构建 API messages 数组
 // -----------------------------------------------------------------------
 
-QJsonArray ChatBot::buildApiMessages(const QVector<MessageData>& history,
-                                     const QString&              userText,
-                                     const QVector<MessagePart>& userParts) {
+QJsonArray ChatBot::buildApiMessages(
+    const QVector<MessageData>& history,
+    const QString&              userText,
+    const QVector<MessagePart>& userParts
+) {
     QJsonArray messages;
 
     // system prompt
@@ -578,7 +594,7 @@ void ChatBot::initSessions() {
                                     msg.reasoning = QString::fromStdString(msgObj["reasoning"]);
                                 session.messages.append(msg);
                             } else {
-                                MessageData msg = messageDataFromJson(msgObj);
+                                MessageData msg   = messageDataFromJson(msgObj);
                                 historySanitized |= sanitizeMessageHistory(msg);
                                 session.messages.append(msg);
                             }
@@ -714,19 +730,22 @@ void ChatBot::sendMessageWithMedia(const QString& message, const QString& mediaP
             return;
         } else {
             showToast("当前模型不支持视觉，已仅发送文字");
-            parts.erase(std::remove_if(parts.begin(), parts.end(), [](const MessagePart& p) {
-                return p.type == "image_url";
-            }), parts.end());
+            parts.erase(
+                std::remove_if(parts.begin(), parts.end(), [](const MessagePart& p) { return p.type == "image_url"; }),
+                parts.end()
+            );
         }
     }
 
     finishMediaMessage(message, parts, message, m_currentSessionId);
 }
 
-void ChatBot::finishMediaMessage(const QString&              message,
-                                 const QVector<MessagePart>& parts,
-                                 const QString&              effectiveMessage,
-                                 const QString&              sessionId) {
+void ChatBot::finishMediaMessage(
+    const QString&              message,
+    const QVector<MessagePart>& parts,
+    const QString&              effectiveMessage,
+    const QString&              sessionId
+) {
     if (m_cancelled || sessionId != m_currentSessionId || !m_sessions.contains(sessionId)) {
         warn("多模态消息已失效，会话已切换或请求已取消");
         return;
@@ -739,13 +758,17 @@ void ChatBot::finishMediaMessage(const QString&              message,
     QJsonArray apiMessages = buildApiMessages(m_sessions[sessionId].messages, effectiveMessage, parts);
 
     // 内嵌图片只保留在本次请求中，避免 Base64 被写入历史并在后续请求中反复复制。
-    const bool hadImage = std::any_of(parts.cbegin(), parts.cend(), [](const MessagePart& part) {
-        return part.type == "image_url";
-    });
+    const bool hadImage =
+        std::any_of(parts.cbegin(), parts.cend(), [](const MessagePart& part) { return part.type == "image_url"; });
     QVector<MessagePart> historyParts = parts;
-    historyParts.erase(std::remove_if(historyParts.begin(), historyParts.end(), [](const MessagePart& p) {
-        return p.type == "image_url" && p.url.startsWith("data:", Qt::CaseInsensitive);
-    }), historyParts.end());
+    historyParts.erase(
+        std::remove_if(
+            historyParts.begin(),
+            historyParts.end(),
+            [](const MessagePart& p) { return p.type == "image_url" && p.url.startsWith("data:", Qt::CaseInsensitive); }
+        ),
+        historyParts.end()
+    );
 
     MessageData userMsg;
     userMsg.role    = "user";
@@ -777,10 +800,12 @@ void ChatBot::finishMediaMessage(const QString&              message,
 // 自动检测 OpenAI / Anthropic 格式
 // -----------------------------------------------------------------------
 
-void ChatBot::callVisionProxy(const QString&              message,
-                              const QVector<MessagePart>& parts,
-                              const QString&              sessionId,
-                              int                         requestSeq) {
+void ChatBot::callVisionProxy(
+    const QString&              message,
+    const QVector<MessagePart>& parts,
+    const QString&              sessionId,
+    int                         requestSeq
+) {
     std::string proxyId = m_proxyVisionModelId.toStdString();
 
     json proxyModel;
@@ -797,9 +822,14 @@ void ChatBot::callVisionProxy(const QString&              message,
         || (proxyModel.contains("apiKey") && !proxyModel["apiKey"].is_string())) {
         warn("代理视觉模型未找到: {}", proxyId);
         QVector<MessagePart> fallbackParts = parts;
-        fallbackParts.erase(std::remove_if(fallbackParts.begin(), fallbackParts.end(), [](const MessagePart& p) {
-            return p.type == "image_url";
-        }), fallbackParts.end());
+        fallbackParts.erase(
+            std::remove_if(
+                fallbackParts.begin(),
+                fallbackParts.end(),
+                [](const MessagePart& p) { return p.type == "image_url"; }
+            ),
+            fallbackParts.end()
+        );
         showToast("视觉代理模型配置无效，已仅发送文字");
         emit proxyVisionCompleted(QString());
         finishMediaMessage(message, fallbackParts, "[图片分析失败]\n" + message, sessionId);
@@ -813,7 +843,7 @@ void ChatBot::callVisionProxy(const QString&              message,
     bool isAnthropic = proxyEndpoint.contains("/messages");
 
     // 构造请求体
-    QJsonArray messages;
+    QJsonArray  messages;
     QJsonObject userMsg;
     userMsg["role"] = "user";
 
@@ -823,8 +853,7 @@ void ChatBot::callVisionProxy(const QString&              message,
             if (p.type == "image_url") {
                 QString base64Data = p.url;
                 QString mediaType  = "image/jpeg";
-                if (base64Data.startsWith("data:image/jpeg;base64,"))
-                    base64Data = base64Data.mid(23);
+                if (base64Data.startsWith("data:image/jpeg;base64,")) base64Data = base64Data.mid(23);
                 else if (base64Data.startsWith("data:image/png;base64,")) {
                     base64Data = base64Data.mid(22);
                     mediaType  = "image/png";
@@ -855,7 +884,7 @@ void ChatBot::callVisionProxy(const QString&              message,
                 QJsonObject imgObj;
                 imgObj["type"] = "image_url";
                 QJsonObject imgUrl;
-                imgUrl["url"] = p.url;
+                imgUrl["url"]       = p.url;
                 imgObj["image_url"] = imgUrl;
                 contentArray.append(imgObj);
             }
@@ -872,8 +901,7 @@ void ChatBot::callVisionProxy(const QString&              message,
     requestBody["model"]    = proxyModelId;
     requestBody["messages"] = messages;
     requestBody["stream"]   = false;
-    if (isAnthropic)
-        requestBody["max_tokens"] = 4096;
+    if (isAnthropic) requestBody["max_tokens"] = 4096;
     if (proxyModel.contains("temperature") && proxyModel["temperature"].is_number())
         requestBody["temperature"] = proxyModel["temperature"].get<double>();
 
@@ -891,9 +919,13 @@ void ChatBot::callVisionProxy(const QString&              message,
         request.setRawHeader("Authorization", ("Bearer " + proxyApiKey).toUtf8());
     }
 
-    info("调用视觉代理模型 {} ({} {}): {}",
-         proxyId, isAnthropic ? "Anthropic" : "OpenAI", proxyEndpoint.toStdString(),
-         m_proxyVisionPrompt.left(30).toStdString());
+    info(
+        "调用视觉代理模型 {} ({} {}): {}",
+        proxyId,
+        isAnthropic ? "Anthropic" : "OpenAI",
+        proxyEndpoint.toStdString(),
+        m_proxyVisionPrompt.left(30).toStdString()
+    );
 
     QNetworkReply* reply = m_networkManager->post(request, data);
     m_activeReplies.append(reply);
@@ -948,9 +980,14 @@ void ChatBot::callVisionProxy(const QString&              message,
         }
 
         QVector<MessagePart> nextParts = parts;
-        nextParts.erase(std::remove_if(nextParts.begin(), nextParts.end(), [](const MessagePart& p) {
-            return p.type == "image_url";
-        }), nextParts.end());
+        nextParts.erase(
+            std::remove_if(
+                nextParts.begin(),
+                nextParts.end(),
+                [](const MessagePart& p) { return p.type == "image_url"; }
+            ),
+            nextParts.end()
+        );
 
         QString effectiveMessage;
         if (failureReason.isEmpty()) {
@@ -1190,11 +1227,15 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
     requestBody["temperature"] = m_temperature;
     requestBody["stream"]      = m_isStreaming;
     if (m_isStreaming && !usesResponsesApi())
-        requestBody["stream_options"] = QJsonObject{{"include_usage", true}};
+        requestBody["stream_options"] = QJsonObject{
+            {"include_usage", true}
+        };
 
     if (m_capReasoning) {
         if (usesResponsesApi()) {
-            QJsonObject reasoning{{"summary", "auto"}};
+            QJsonObject reasoning{
+                {"summary", "auto"}
+            };
             if (!m_reasoningEffort.isEmpty()) reasoning["effort"] = m_reasoningEffort;
             requestBody["reasoning"] = reasoning;
         } else if (!m_reasoningEffort.isEmpty()) {
@@ -1218,10 +1259,12 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
 
     QJsonDocument requestDoc(requestBody);
     QByteArray    requestData = requestDoc.toJson(QJsonDocument::Compact);
-    debug("发送 API 请求: model={}, messages={}, payload={} bytes",
-          m_model.toStdString(),
-          messages.size(),
-          requestData.size());
+    debug(
+        "发送 API 请求: model={}, messages={}, payload={} bytes",
+        m_model.toStdString(),
+        messages.size(),
+        requestData.size()
+    );
 
     QNetworkRequest request;
     request.setUrl(QUrl(m_apiEndpoint));
@@ -1245,7 +1288,10 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
     }
 
     connect(reply, &QNetworkReply::finished, this, [this, reply, seq]() {
-        if (seq != m_requestSeq) { reply->deleteLater(); return; }
+        if (seq != m_requestSeq) {
+            reply->deleteLater();
+            return;
+        }
         m_activeReplies.removeAll(reply);
         handleNetworkReply(reply, m_isStreaming);
     });
@@ -1267,9 +1313,8 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                 if (jsonData.trimmed() == "[DONE]") {
                     if (m_serverToolCallActive) {
                         emit toolCallProgress(
-                            QString("已完成：%1").arg(
-                                m_serverToolCallName.isEmpty() ? "服务器工具" : m_serverToolCallName
-                            ),
+                            QString("已完成：%1")
+                                .arg(m_serverToolCallName.isEmpty() ? "服务器工具" : m_serverToolCallName),
                             true
                         );
                         m_serverToolCallActive = false;
@@ -1286,11 +1331,12 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             MessageData assistantMsg;
                             assistantMsg.role          = "assistant";
                             assistantMsg.content       = m_currentStreamBuffer;
-                            assistantMsg.reasoning      = m_currentReasoningBuffer;
+                            assistantMsg.reasoning     = m_currentReasoningBuffer;
                             assistantMsg.toolCallsJson = toolCallsJson;
                             currentMessages().append(assistantMsg);
                             if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
-                            m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+                            m_sessions[m_currentSessionId].updatedAt =
+                                QDateTime::currentDateTime().toString(Qt::ISODate);
                             saveSessions();
                             emit messagesChanged();
                             dispatchToolCalls(toolCallsJson);
@@ -1301,7 +1347,8 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             assistantMsg.reasoning = m_currentReasoningBuffer;
                             currentMessages().append(assistantMsg);
                             if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
-                            m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+                            m_sessions[m_currentSessionId].updatedAt =
+                                QDateTime::currentDateTime().toString(Qt::ISODate);
                             saveSessions();
                             emit messagesChanged();
                         }
@@ -1327,38 +1374,47 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             emit streamChunk(content);
                             m_currentStreamBuffer += content;
                         }
-                    } else if (eventType == "response.reasoning_summary_text.delta"
-                               || eventType == "response.reasoning_text.delta") {
+                    } else if (
+                        eventType == "response.reasoning_summary_text.delta"
+                        || eventType == "response.reasoning_text.delta"
+                    ) {
                         const QString content = obj["delta"].toString();
                         if (!content.isEmpty()) {
                             emit reasoningChunk(content);
                             m_currentReasoningBuffer += content;
                         }
                     } else if (eventType == "response.function_call_arguments.delta") {
-                        const QString callId = obj["item_id"].toString(obj["call_id"].toString());
+                        const QString callId  = obj["item_id"].toString(obj["call_id"].toString());
                         const QString content = obj["delta"].toString();
                         if (!callId.isEmpty()) {
                             int index = m_responseToolItemIndexes.value(callId, m_toolCallsBuffer.size());
                             for (auto it = m_toolCallsBuffer.constBegin(); it != m_toolCallsBuffer.constEnd(); ++it)
                                 if (it.value().value("id", "") == callId.toStdString()) index = it.key();
                             if (!m_toolCallsBuffer.contains(index)) {
-                                m_toolCallsBuffer[index] = json{{"id", callId.toStdString()}, {"type", "function"},
-                                    {"function", {{"name", ""}, {"arguments", ""}}}};
+                                m_toolCallsBuffer[index] = json{
+                                    {"id",       callId.toStdString()             },
+                                    {"type",     "function"                       },
+                                    {"function", {{"name", ""}, {"arguments", ""}}}
+                                };
                             }
                             m_toolCallsBuffer[index]["function"]["arguments"] =
                                 m_toolCallsBuffer[index]["function"]["arguments"].get<std::string>()
                                 + content.toStdString();
                         }
                     } else if (eventType == "response.output_item.added") {
-                        const QJsonObject item = obj["item"].toObject();
-                        const QString itemType = item["type"].toString();
+                        const QJsonObject item     = obj["item"].toObject();
+                        const QString     itemType = item["type"].toString();
                         if (itemType == "function_call") {
                             emit toolCallProgress(QString("正在调用：%1").arg(item["name"].toString("工具")), false);
-                            const int index = m_toolCallsBuffer.size();
+                            const int index                                  = m_toolCallsBuffer.size();
                             m_responseToolItemIndexes[item["id"].toString()] = index;
-                            m_toolCallsBuffer[index] = json{{"id", item["call_id"].toString().toStdString()},
-                                {"type", "function"}, {"function", {{"name", item["name"].toString().toStdString()},
-                                {"arguments", item["arguments"].toString().toStdString()}}}};
+                            m_toolCallsBuffer[index]                         = json{
+                                {"id",       item["call_id"].toString().toStdString()       },
+                                {"type",     "function"                                     },
+                                {"function",
+                                 {{"name", item["name"].toString().toStdString()},
+                                  {"arguments", item["arguments"].toString().toStdString()}}}
+                            };
                         } else if (itemType.endsWith("_call")) {
                             m_serverToolCallActive = true;
                             m_serverToolCallName   = itemType;
@@ -1403,7 +1459,8 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                         }
                         if (m_serverToolCallActive) {
                             emit toolCallProgress(
-                                QString("已完成：%1").arg(m_serverToolCallName.isEmpty() ? "服务器工具" : m_serverToolCallName),
+                                QString("已完成：%1")
+                                    .arg(m_serverToolCallName.isEmpty() ? "服务器工具" : m_serverToolCallName),
                                 true
                             );
                             m_serverToolCallActive = false;
@@ -1436,7 +1493,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             MessageData assistantMsg;
                             assistantMsg.role          = "assistant";
                             assistantMsg.content       = m_currentStreamBuffer;
-                            assistantMsg.reasoning      = m_currentReasoningBuffer;
+                            assistantMsg.reasoning     = m_currentReasoningBuffer;
                             assistantMsg.toolCallsJson = toolCallsJson;
                             currentMessages().append(assistantMsg);
                             if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
@@ -1445,8 +1502,9 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             saveSessions();
                             emit messagesChanged();
                             dispatchToolCalls(toolCallsJson);
-                        } else if (!m_cancelled
-                                   && (!m_currentStreamBuffer.isEmpty() || !m_currentReasoningBuffer.isEmpty())) {
+                        } else if (
+                            !m_cancelled && (!m_currentStreamBuffer.isEmpty() || !m_currentReasoningBuffer.isEmpty())
+                        ) {
                             MessageData assistantMsg;
                             assistantMsg.role      = "assistant";
                             assistantMsg.content   = m_currentStreamBuffer;
@@ -1543,7 +1601,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                     tcArr.push_back(it.value());
                 QString     toolCallsJson = QString::fromStdString(tcArr.dump());
                 MessageData assistantMsg;
-                assistantMsg.role          = "assistant";
+                assistantMsg.role = "assistant";
                 if (!m_cancelled) {
                     assistantMsg.content   = m_currentStreamBuffer;
                     assistantMsg.reasoning = m_currentReasoningBuffer;
@@ -1599,7 +1657,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                     MessageData assistantMsg;
                     assistantMsg.role          = "assistant";
                     assistantMsg.content       = content;
-                    assistantMsg.reasoning      = reasoning;
+                    assistantMsg.reasoning     = reasoning;
                     assistantMsg.toolCallsJson = toolCallsJson;
                     currentMessages().append(assistantMsg);
                     if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
@@ -1638,8 +1696,8 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                 return;
             }
 
-            QJsonObject choice  = choices.first().toObject();
-            QJsonObject message = choice["message"].toObject();
+            QJsonObject   choice    = choices.first().toObject();
+            QJsonObject   message   = choice["message"].toObject();
             const QString reasoning = message["reasoning_content"].toString(message["reasoning"].toString());
             if (!m_cancelled && !reasoning.isEmpty()) emit reasoningChunk(reasoning);
 
@@ -1647,7 +1705,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                 QJsonDocument tcDoc(message["tool_calls"].toArray());
                 QString       toolCallsJson = QString(tcDoc.toJson(QJsonDocument::Compact));
                 MessageData   assistantMsg;
-                assistantMsg.role          = "assistant";
+                assistantMsg.role = "assistant";
                 if (!m_cancelled) {
                     assistantMsg.content   = message["content"].toString();
                     assistantMsg.reasoning = reasoning;
@@ -1703,8 +1761,10 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
         if (httpStatus == 401 || httpStatus == 403) suggestion = "API 密钥无效或已过期";
         else if (httpStatus == 429) suggestion = "请求频率过高，请稍后再试";
         else if (httpStatus >= 500) suggestion = "AI 服务端异常，请稍后重试";
-        else if (reply->error() == QNetworkReply::ConnectionRefusedError
-                 || reply->error() == QNetworkReply::HostNotFoundError || reply->error() == QNetworkReply::TimeoutError)
+        else if (
+            reply->error() == QNetworkReply::ConnectionRefusedError
+            || reply->error() == QNetworkReply::HostNotFoundError || reply->error() == QNetworkReply::TimeoutError
+        )
             suggestion = "无法连接到 AI 服务，请检查网络连接";
         else suggestion = reply->errorString();
 
@@ -1821,8 +1881,7 @@ void ChatBot::cancelRequest() {
     QStringList shellKeys;
     for (auto it = m_activeShellExecs.constBegin(); it != m_activeShellExecs.constEnd(); ++it)
         shellKeys.append(it.key());
-    for (const auto& key : shellKeys)
-        cleanupShellExec(key);
+    for (const auto& key : shellKeys) cleanupShellExec(key);
 
     while (!m_pendingShellExecs.isEmpty()) {
         auto pending = m_pendingShellExecs.takeFirst();
@@ -1988,11 +2047,11 @@ void ChatBot::initModels() {
     } else {
         info("创建默认模型配置");
         json defaultModel;
-        defaultModel["id"]            = m_model.toStdString();
-        defaultModel["name"]          = "DeepSeek Chat";
-        defaultModel["provider"]      = "DeepSeek";
-        defaultModel["endpoint"]      = m_apiEndpoint.toStdString();
-        defaultModel["apiKey"]        = m_apiKey.toStdString();
+        defaultModel["id"]                 = m_model.toStdString();
+        defaultModel["name"]               = "DeepSeek Chat";
+        defaultModel["provider"]           = "DeepSeek";
+        defaultModel["endpoint"]           = m_apiEndpoint.toStdString();
+        defaultModel["apiKey"]             = m_apiKey.toStdString();
         defaultModel["modelId"]            = m_model.toStdString();
         defaultModel["apiProtocol"]        = "chat_completions";
         defaultModel["temperature"]        = m_temperature;
@@ -2000,8 +2059,8 @@ void ChatBot::initModels() {
         defaultModel["extraParams"]        = json::object();
         defaultModel["proxyVisionModelId"] = "";
         defaultModel["proxyVisionPrompt"]  = "请详细描述这张图片的内容。如果图片中有文字，请完整转录。";
-        m_modelsData["models"]        = json::array({defaultModel});
-        m_modelsData["activeModelId"] = m_model.toStdString();
+        m_modelsData["models"]             = json::array({defaultModel});
+        m_modelsData["activeModelId"]      = m_model.toStdString();
         saveModels();
     }
 
@@ -2036,8 +2095,8 @@ void ChatBot::applyModelConfig(const json& modelObj) {
         m_extraParams = modelObj["extraParams"];
     else m_extraParams = json::object();
 
-    m_maxContextSize = modelObj.value("maxContextSize", 0);
-    m_reasoningEffort = QString::fromStdString(modelObj.value("reasoningEffort", ""));
+    m_maxContextSize                          = modelObj.value("maxContextSize", 0);
+    m_reasoningEffort                         = QString::fromStdString(modelObj.value("reasoningEffort", ""));
     static const QStringList reasoningEfforts = {"none", "minimal", "low", "medium", "high", "xhigh"};
     if (!reasoningEfforts.contains(m_reasoningEffort)) m_reasoningEffort.clear();
 
@@ -2079,17 +2138,17 @@ bool ChatBot::addModel(const QString& modelJson) {
     }
 
     json newModel;
-    newModel["id"]             = id;
-    newModel["name"]           = input["name"].toString().toStdString();
-    newModel["provider"]       = input["provider"].toString().toStdString();
-    newModel["endpoint"]       = endpoint;
-    newModel["apiKey"]         = input["apiKey"].toString().toStdString();
-    newModel["modelId"]        = modelId;
-    QString apiProtocol        = input["apiProtocol"].toString();
-    newModel["apiProtocol"]    = apiProtocol == "responses" ? "responses" : "chat_completions";
-    newModel["temperature"]    = input.contains("temperature") ? input["temperature"].toDouble() : 0.7;
-    newModel["maxContextSize"] = input.contains("maxContextSize") ? input["maxContextSize"].toInt() : 0;
-    QString reasoningEffort    = input["reasoningEffort"].toString();
+    newModel["id"]                            = id;
+    newModel["name"]                          = input["name"].toString().toStdString();
+    newModel["provider"]                      = input["provider"].toString().toStdString();
+    newModel["endpoint"]                      = endpoint;
+    newModel["apiKey"]                        = input["apiKey"].toString().toStdString();
+    newModel["modelId"]                       = modelId;
+    QString apiProtocol                       = input["apiProtocol"].toString();
+    newModel["apiProtocol"]                   = apiProtocol == "responses" ? "responses" : "chat_completions";
+    newModel["temperature"]                   = input.contains("temperature") ? input["temperature"].toDouble() : 0.7;
+    newModel["maxContextSize"]                = input.contains("maxContextSize") ? input["maxContextSize"].toInt() : 0;
+    QString                  reasoningEffort  = input["reasoningEffort"].toString();
     static const QStringList reasoningEfforts = {"none", "minimal", "low", "medium", "high", "xhigh"};
     newModel["reasoningEffort"] =
         reasoningEfforts.contains(reasoningEffort) ? reasoningEffort.toStdString() : std::string();
@@ -2126,9 +2185,7 @@ bool ChatBot::addModel(const QString& modelJson) {
 
     // proxyVision
     newModel["proxyVisionModelId"] = input["proxyVisionModelId"].toString().toStdString();
-    newModel["proxyVisionPrompt"]  = input["proxyVisionPrompt"]
-                                         .toString()
-                                         .toStdString();
+    newModel["proxyVisionPrompt"]  = input["proxyVisionPrompt"].toString().toStdString();
 
     bool updated = false;
     for (auto& model : m_modelsData["models"]) {
@@ -2173,8 +2230,7 @@ bool ChatBot::removeModel(const QString& modelId) {
             }
             // 清理其他模型对被删除模型的视觉代理引用
             for (auto& model : models) {
-                if (model.value("proxyVisionModelId", "") == id)
-                    model["proxyVisionModelId"] = "";
+                if (model.value("proxyVisionModelId", "") == id) model["proxyVisionModelId"] = "";
             }
             // 若当前活动模型的代理引用恰好是被删除的模型，通知 QML
             if (m_proxyVisionModelId == modelId) {
@@ -2741,20 +2797,22 @@ void ChatBot::initShellTool() {
             if (item.is_string()) m_shellToolBlocklist.append(QString::fromStdString(item.get<std::string>()));
         }
     } else {
-        m_shellToolBlocklist = QStringList{"rm -rf /",
-                                           "rm -rf /*",
-                                           "mkfs",
-                                           "dd if=",
-                                           ":(){ :|:&",
-                                           "> /dev/sd",
-                                           "chmod -R 777 /",
-                                           "shutdown",
-                                           "reboot",
-                                           "init 0",
-                                           "init 6",
-                                           "halt",
-                                           "fdisk",
-                                           "mount -o remount"};
+        m_shellToolBlocklist = QStringList{
+            "rm -rf /",
+            "rm -rf /*",
+            "mkfs",
+            "dd if=",
+            ":(){ :|:&",
+            "> /dev/sd",
+            "chmod -R 777 /",
+            "shutdown",
+            "reboot",
+            "init 0",
+            "init 6",
+            "halt",
+            "fdisk",
+            "mount -o remount"
+        };
     }
     emit shellToolConfigChanged();
     info("Shell tool 配置已加载, enabled={}", m_shellToolEnabled);
@@ -2881,10 +2939,10 @@ void ChatBot::executeShellCommand(const QString& toolCallId, const QString& comm
     info("启动异步 shell 命令: {}", command.toStdString());
     emit shellCommandStarted(toolCallId, command);
 
-    auto* exec         = new ActiveShellExec;
-    exec->toolCallId   = toolCallId;
-    exec->command      = command;
-    exec->process      = new QProcess(this);
+    auto* exec       = new ActiveShellExec;
+    exec->toolCallId = toolCallId;
+    exec->command    = command;
+    exec->process    = new QProcess(this);
     exec->process->setProgram("/bin/sh");
     exec->process->setArguments({"-c", command});
     exec->process->setProcessChannelMode(QProcess::SeparateChannels);
@@ -2904,38 +2962,42 @@ void ChatBot::executeShellCommand(const QString& toolCallId, const QString& comm
     });
 
     // 进程正常结束
-    connect(exec->process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this, toolCallId](int exitCode, QProcess::ExitStatus status) {
-        auto* e = m_activeShellExecs.value(toolCallId);
-        if (!e) return;
+    connect(
+        exec->process,
+        QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+        this,
+        [this, toolCallId](int exitCode, QProcess::ExitStatus status) {
+            auto* e = m_activeShellExecs.value(toolCallId);
+            if (!e) return;
 
-        // 停掉超时定时器
-        if (e->timer) {
-            e->timer->stop();
-            e->timer->deleteLater();
-            e->timer = nullptr;
+            // 停掉超时定时器
+            if (e->timer) {
+                e->timer->stop();
+                e->timer->deleteLater();
+                e->timer = nullptr;
+            }
+
+            QString stdoutStr = truncateOutput(e->stdoutBuf, m_shellToolMaxOutput);
+            QString stderrStr = truncateOutput(e->stderrBuf, m_shellToolMaxOutput / 2);
+
+            bool    crashed = (status != QProcess::NormalExit);
+            QString resultText;
+            resultText += QString("Exit code: %1\n").arg(exitCode);
+            if (crashed) resultText += "（进程崩溃）\n";
+            if (!stdoutStr.isEmpty()) resultText += "stdout:\n" + stdoutStr + "\n";
+            if (!stderrStr.isEmpty()) resultText += "stderr:\n" + stderrStr + "\n";
+
+            bool    success = (exitCode == 0 && !crashed);
+            QString summary = success ? "执行成功" : crashed ? "进程崩溃" : QString("退出码: %1").arg(exitCode);
+
+            QString cmd = e->command;
+            cleanupShellExec(toolCallId);
+
+            submitToolResultBatched(toolCallId, "shell_exec", resultText);
+            emit shellCommandFinished(toolCallId, success, summary, resultText);
+            info("Shell 命令完成 [{}], exitCode={}, crashed={}", cmd.toStdString(), exitCode, crashed);
         }
-
-        QString stdoutStr = truncateOutput(e->stdoutBuf, m_shellToolMaxOutput);
-        QString stderrStr = truncateOutput(e->stderrBuf, m_shellToolMaxOutput / 2);
-
-        bool    crashed = (status != QProcess::NormalExit);
-        QString resultText;
-        resultText += QString("Exit code: %1\n").arg(exitCode);
-        if (crashed) resultText += "（进程崩溃）\n";
-        if (!stdoutStr.isEmpty()) resultText += "stdout:\n" + stdoutStr + "\n";
-        if (!stderrStr.isEmpty()) resultText += "stderr:\n" + stderrStr + "\n";
-
-        bool    success = (exitCode == 0 && !crashed);
-        QString summary = success ? "执行成功" : crashed ? "进程崩溃" : QString("退出码: %1").arg(exitCode);
-
-        QString cmd = e->command;
-        cleanupShellExec(toolCallId);
-
-        submitToolResultBatched(toolCallId, "shell_exec", resultText);
-        emit shellCommandFinished(toolCallId, success, summary, resultText);
-        info("Shell 命令完成 [{}], exitCode={}, crashed={}", cmd.toStdString(), exitCode, crashed);
-    });
+    );
 
     // 进程启动失败
     connect(exec->process, &QProcess::errorOccurred, this, [this, toolCallId](QProcess::ProcessError err) {
@@ -2978,9 +3040,9 @@ void ChatBot::executeShellCommand(const QString& toolCallId, const QString& comm
             if (!e) return;
 
             // finished 信号未处理（进程已自行结束但信号未传递），直接处理
-            QString resultText = QString("命令超时（%1ms）。\n").arg(m_shellToolTimeoutMs);
-            resultText += "stdout:\n" + e->stdoutBuf + "\n";
-            resultText += "stderr:\n" + e->stderrBuf + "\n";
+            QString resultText  = QString("命令超时（%1ms）。\n").arg(m_shellToolTimeoutMs);
+            resultText         += "stdout:\n" + e->stdoutBuf + "\n";
+            resultText         += "stderr:\n" + e->stderrBuf + "\n";
 
             QString cmd = e->command;
             cleanupShellExec(toolCallId);
@@ -3056,6 +3118,18 @@ void ChatBot::setMathServerPath(const QString& path) {
     aiCfg["math_render"]["server_path"] = path.toStdString();
     mod::Config::getInstance().write("ai", aiCfg, true);
     emit mathRenderConfigChanged();
+}
+
+void ChatBot::setBubbleRenderMode(const QString& mode) {
+    if (mode != "full" && mode != "basic" && mode != "plain") return;
+    if (m_bubbleRenderMode == mode) return;
+
+    m_bubbleRenderMode = mode;
+    json aiCfg         = mod::Config::getInstance().read("ai");
+    if (aiCfg.is_null()) aiCfg = json::object();
+    aiCfg["bubble_render_mode"] = mode.toStdString();
+    mod::Config::getInstance().write("ai", aiCfg, true);
+    emit bubbleRenderModeChanged();
 }
 
 QString ChatBot::getMathRenderConfig() {

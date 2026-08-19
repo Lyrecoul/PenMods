@@ -6,9 +6,10 @@
 
 #include "wallpaper/WallpaperManager.h"
 
-#include "mod/Config.h"
 #include "common/Utils.h"
 #include "common/service/Logger.h"
+#include "helper/AntiEmbs.h"
+#include "mod/Config.h"
 
 #include <QDir>
 #include <QDirIterator>
@@ -23,16 +24,22 @@ WallpaperManager::WallpaperManager(QObject* parent) : QObject(parent) {
 
     loadConfig();
 
+    connect(&AntiEmbs::getInstance(), &AntiEmbs::activeChanged, this, &WallpaperManager::updateAvailability);
+    updateAvailability();
+
     // 如果循环模式已启用，启动定时器
-    if (mWallpaperMode == 2 && !mWallpaperFolder.isEmpty()) {
+    if (mWallpaperMode == 2 && !mWallpaperFolder.isEmpty() && !AntiEmbs::getInstance().isActive()) {
         scanWallpaperFolder();
         startCycleTimer();
     }
 }
 
-int WallpaperManager::getWallpaperMode() const { return mWallpaperMode; }
+int WallpaperManager::getWallpaperMode() const { return AntiEmbs::getInstance().isActive() ? 0 : mWallpaperMode; }
 
 void WallpaperManager::setWallpaperMode(int mode) {
+    if (AntiEmbs::getInstance().isActive()) {
+        return;
+    }
     if (mWallpaperMode != mode) {
         mWallpaperMode = mode;
         saveConfig();
@@ -62,6 +69,9 @@ void WallpaperManager::setWallpaperMode(int mode) {
 QString WallpaperManager::getCustomImagePath() const { return mCustomImagePath; }
 
 void WallpaperManager::setCustomImagePath(const QString& path) {
+    if (AntiEmbs::getInstance().isActive()) {
+        return;
+    }
     if (mCustomImagePath != path) {
         mCustomImagePath = path;
         saveConfig();
@@ -76,6 +86,9 @@ void WallpaperManager::setCustomImagePath(const QString& path) {
 QString WallpaperManager::getWallpaperFolder() const { return mWallpaperFolder; }
 
 void WallpaperManager::setWallpaperFolder(const QString& path) {
+    if (AntiEmbs::getInstance().isActive()) {
+        return;
+    }
     if (mWallpaperFolder != path) {
         mWallpaperFolder = path;
         saveConfig();
@@ -92,6 +105,9 @@ void WallpaperManager::setWallpaperFolder(const QString& path) {
 int WallpaperManager::getCycleInterval() const { return mCycleInterval; }
 
 void WallpaperManager::setCycleInterval(int seconds) {
+    if (AntiEmbs::getInstance().isActive()) {
+        return;
+    }
     if (mCycleInterval != seconds && seconds > 0) {
         mCycleInterval = seconds;
         saveConfig();
@@ -137,7 +153,7 @@ QStringList WallpaperManager::scanWallpaperFolder() {
 }
 
 void WallpaperManager::setWallpaper(const QString& path) {
-    if (path.isEmpty()) return;
+    if (path.isEmpty() || AntiEmbs::getInstance().isActive()) return;
 
     applyWallpaper(path);
 
@@ -150,7 +166,7 @@ void WallpaperManager::setWallpaper(const QString& path) {
 }
 
 void WallpaperManager::nextWallpaper() {
-    if (mCachedImages.isEmpty()) {
+    if (AntiEmbs::getInstance().isActive() || mCachedImages.isEmpty()) {
         return;
     }
 
@@ -219,6 +235,27 @@ void WallpaperManager::applyWallpaper(const QString& path) {
     if (mCurrentWallpaper != path) {
         mCurrentWallpaper = path;
         emit currentWallpaperChanged();
+    }
+}
+
+void WallpaperManager::updateAvailability() {
+    if (AntiEmbs::getInstance().isActive()) {
+        stopCycleTimer();
+        if (!mCurrentWallpaper.isEmpty()) {
+            mCurrentWallpaper.clear();
+            emit currentWallpaperChanged();
+        }
+        emit wallpaperModeChanged();
+        return;
+    }
+
+    emit wallpaperModeChanged();
+    if (mWallpaperMode == 1 && !mCustomImagePath.isEmpty()) {
+        applyWallpaper(mCustomImagePath);
+    } else if (mWallpaperMode == 2 && !mWallpaperFolder.isEmpty()) {
+        scanWallpaperFolder();
+        startCycleTimer();
+        nextWallpaper();
     }
 }
 

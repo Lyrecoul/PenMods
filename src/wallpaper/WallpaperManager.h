@@ -80,6 +80,7 @@ private:
     void startCycleTimer();
     void stopCycleTimer();
     void applyWallpaper(const QString& path);
+    void updateAvailability();
 
     int     mWallpaperMode = 0;       // 默认无壁纸
     QString mCustomImagePath;          // 单张模式路径

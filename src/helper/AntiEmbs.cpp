@@ -81,6 +81,7 @@ void AntiEmbs::onHomeButtonPress() {
     mHomePressTimes.clear();
     showToast("操作执行完毕");
     filemanager::FileManager::getInstance().negateHiddenAll();
+    emit activeChanged();
 }
 
 bool AntiEmbs::getAutoMute() const { return mAutoMute; }
@@ -90,6 +91,10 @@ bool AntiEmbs::getLowVoiceMode() const { return mLowVoiceMode; }
 bool AntiEmbs::getAutoPronLocked() const { return mAutoPronLocked; }
 
 bool AntiEmbs::getFastHide() const { return mFastHide && Mod::getInstance().isTrustedDevice(); }
+
+bool AntiEmbs::isActive() const {
+    return Mod::getInstance().isTrustedDevice() && filemanager::FileManager::getInstance().shouldHiddenAll();
+}
 
 bool AntiEmbs::getFastMute() const { return mFastMute; }
 

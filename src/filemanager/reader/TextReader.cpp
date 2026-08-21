@@ -20,12 +20,25 @@ TextReader::TextReader() {
     });
 } // namespace mod::filemanager
 
-void TextReader::open(QString dir) { mOpeningFileName = std::move(dir); }
+void TextReader::open(QString dir) {
+    mAbsolutePath.clear();
+    mOpeningFileName = std::move(dir);
+}
+
+bool TextReader::openAbsolute(const QString& path) {
+    const QFileInfo file(path);
+    if (!file.isAbsolute() || !file.isFile() || !file.isReadable()) return false;
+    mAbsolutePath    = file.canonicalFilePath();
+    mOpeningFileName = file.fileName();
+    return true;
+}
 
 bool TextReader::getIsMarkdown() { return mOpeningFileName.endsWith(".md", Qt::CaseInsensitive); }
 
 QString TextReader::getContent() {
-    QFile file(FileManager::getInstance().getCurrentPath().filePath(mOpeningFileName));
+    QFile file(
+        mAbsolutePath.isEmpty() ? FileManager::getInstance().getCurrentPath().filePath(mOpeningFileName) : mAbsolutePath
+    );
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
         return "打开文件失败...";
     }

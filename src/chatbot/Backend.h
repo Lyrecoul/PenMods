@@ -31,11 +31,16 @@ namespace mod::chatbot {
 
 // 消息内容部分（多模态）
 struct MessagePart {
-    QString type;   // "text" | "image_url" | "input_audio"
-    QString text;   // type=text
-    QString url;    // type=image_url：HTTP URL 或 data:image/...;base64,...
-    QString data;   // type=input_audio：base64 音频数据
-    QString format; // type=input_audio：格式 (mp3/wav/ogg 等)
+    QString type;      // "text" | "image_url" | "input_audio"
+    QString text;      // type=text
+    QString url;       // type=image_url：HTTP URL 或 data:image/...;base64,...
+    QString data;      // type=input_audio：base64 音频数据
+    QString format;    // type=input_audio：格式 (mp3/wav/ogg 等)
+    QString localPath; // 持久化附件的绝对路径
+    QString name;      // 附件显示名称
+    QString mimeType;  // 附件 MIME 类型
+    QString language;  // 文本附件的语法语言
+    qint64  size = 0;  // 附件字节数
 };
 
 // 单条消息（纯文本或多模态）
@@ -80,6 +85,7 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
     Q_PROPERTY(bool capAudio READ getCapAudio NOTIFY activeModelCapabilitiesChanged)
     Q_PROPERTY(bool capToolCall READ getCapToolCall NOTIFY activeModelCapabilitiesChanged)
     Q_PROPERTY(bool capReasoning READ getCapReasoning NOTIFY activeModelCapabilitiesChanged)
+    Q_PROPERTY(bool capImageGeneration READ getCapImageGeneration NOTIFY activeModelCapabilitiesChanged)
 
     Q_PROPERTY(
         QString proxyVisionModelId READ getProxyVisionModelId WRITE setProxyVisionModelId NOTIFY
@@ -178,6 +184,7 @@ public:
     bool getCapAudio() const { return m_capAudio; }
     bool getCapToolCall() const { return m_capToolCall; }
     bool getCapReasoning() const { return m_capReasoning; }
+    bool getCapImageGeneration() const { return m_capImageGeneration; }
 
     QString getProxyVisionModelId() const { return m_proxyVisionModelId; }
     void    setProxyVisionModelId(const QString& v);
@@ -216,6 +223,7 @@ signals:
     void requestCancelled();
     // Tool Call 信号：toolCallsJson 为完整 tool_calls 数组的 JSON 字符串
     void toolCallReceived(const QString& toolCallsJson);
+    void imageAttachmentsReceived(const QVariantList& attachments);
     void toolCallProgress(const QString& text, bool isComplete);
     void apiKeyChanged();
     void apiEndpointChanged();
@@ -275,11 +283,14 @@ private:
     json m_extraParams;
 
     // 当前活动模型的能力标志
-    bool    m_capText      = true;
-    bool    m_capVision    = false;
-    bool    m_capAudio     = false;
-    bool    m_capToolCall  = false;
-    bool    m_capReasoning = false;
+    bool    m_capText                 = true;
+    bool    m_capVision               = false;
+    bool    m_capAudio                = false;
+    bool    m_capToolCall             = false;
+    bool    m_capReasoning            = false;
+    bool    m_capImageGeneration      = false;
+    bool    m_nativeWebSearchEnabled  = false;
+    QString m_nativeWebSearchProvider = "auto";
     QString m_reasoningEffort;
     int     m_maxContextSize = 0;
 
@@ -349,10 +360,12 @@ private:
     int     m_tavilyMaxResults = 5;
     bool    m_tavilyEnabled    = false;
 
-    void initTavily();
-    void injectToolDefinitions(QJsonObject& requestBody);
-    void dispatchToolCalls(const QString& toolCallsJson);
-    void executeTavilySearch(const QString& toolCallId, const QString& query);
+    void                 initTavily();
+    void                 injectToolDefinitions(QJsonObject& requestBody);
+    QVector<MessagePart> persistGeneratedImages(const QJsonArray& output);
+    QVariantList         attachmentVariants(const QVector<MessagePart>& parts) const;
+    void                 dispatchToolCalls(const QString& toolCallsJson);
+    void                 executeTavilySearch(const QString& toolCallId, const QString& query);
 
     // Shell tool
     bool        m_shellToolEnabled   = false;

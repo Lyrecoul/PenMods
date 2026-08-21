@@ -30,7 +30,9 @@ QImage WebPImageProvider::requestImage(const QString &id, QSize *size, const QSi
         return QImage();
     }
     
-    QString fullPath = FileManager::getInstance().getCurrentPath().filePath(m_currentWebPPath);
+    const QString fullPath = QFileInfo(m_currentWebPPath).isAbsolute()
+                                 ? m_currentWebPPath
+                                 : FileManager::getInstance().getCurrentPath().filePath(m_currentWebPPath);
     
     QFile webpFile(fullPath);
     if (!webpFile.open(QIODevice::ReadOnly)) {
@@ -289,7 +291,7 @@ QString ImageViewer::source() const {
     
     // WebP 图片返回 provider 路径供静态预览
     if (isWebP()) {
-        const_cast<WebPImageProvider*>(m_webpProvider)->setCurrentWebPPath(m_openingFileName);
+        const_cast<WebPImageProvider*>(m_webpProvider)->setCurrentWebPPath(fullPath());
         return "image://webp/current";
     }
     
@@ -297,6 +299,7 @@ QString ImageViewer::source() const {
 }
 
 QString ImageViewer::fullPath() const {
+    if (!m_absolutePath.isEmpty()) return m_absolutePath;
     if (m_openingFileName.isEmpty()) return "";
     return FileManager::getInstance().getCurrentPath().filePath(m_openingFileName);
 }
@@ -308,7 +311,7 @@ bool ImageViewer::isWebP() const {
 bool ImageViewer::isAnimatedWebP() const {
     if (!isWebP()) return false;
 
-    QString fullPath = FileManager::getInstance().getCurrentPath().filePath(m_openingFileName);
+    QString fullPath = this->fullPath();
     QFile webpFile(fullPath);
     if (!webpFile.open(QIODevice::ReadOnly)) {
         const_cast<ImageViewer*>(this)->error("Could not open WebP file for animation check: {}", fullPath.toStdString());
@@ -336,8 +339,22 @@ bool ImageViewer::isAnimatedWebP() const {
 }
 
 void ImageViewer::open(const QString &path) {
+    m_absolutePath.clear();
     m_openingFileName = path;
     emit sourceChanged();
+}
+
+bool ImageViewer::openAbsolute(const QString &path) {
+    const QFileInfo file(path);
+    if (!file.isAbsolute() || !file.isFile() || !file.isReadable()) {
+        warn("拒绝打开无效的绝对图片路径: {}", path.toStdString());
+        return false;
+    }
+
+    m_absolutePath = file.canonicalFilePath();
+    m_openingFileName = file.fileName();
+    emit sourceChanged();
+    return true;
 }
 
 } // namespace mod::filemanager

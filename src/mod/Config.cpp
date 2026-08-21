@@ -153,12 +153,15 @@ Config::Config() : Logger("Config") {
                     {"temperature", 0.7},
                     {"maxContextSize", 0},
                     {"reasoningEffort", ""},
+                    {"nativeWebSearchEnabled", false},
+                    {"nativeWebSearchProvider", "auto"},
                     {"capabilities", json{
                         {"text",      true},
                         {"vision",    false},
                         {"audio",     false},
                         {"toolCall",  false},
-                        {"reasoning", false}
+                        {"reasoning",       false},
+                        {"imageGeneration", false}
                     }},
                     {"extraParams", ""},
                     {"proxyVisionModelId", ""},

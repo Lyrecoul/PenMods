@@ -79,6 +79,7 @@ public:
     bool isAnimatedWebP() const;
 
     Q_INVOKABLE void open(const QString &path);
+    Q_INVOKABLE bool openAbsolute(const QString &path);
 
 signals:
     void sourceChanged();
@@ -88,6 +89,7 @@ private:
     explicit ImageViewer(QObject *parent = nullptr);
 
     QString m_openingFileName;
+    QString m_absolutePath;
     WebPImageProvider* m_webpProvider;
 };
 

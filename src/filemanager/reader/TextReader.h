@@ -17,6 +17,7 @@ class TextReader : public QObject, public Singleton<TextReader> {
 
 public:
     Q_INVOKABLE void open(QString dir);
+    Q_INVOKABLE bool openAbsolute(const QString& path);
 
     bool getIsMarkdown();
 
@@ -29,6 +30,7 @@ private:
     explicit TextReader();
 
     QString mOpeningFileName;
+    QString mAbsolutePath;
     QString mContent;
 }; // namespace mod::filemanager
 } // namespace mod::filemanager

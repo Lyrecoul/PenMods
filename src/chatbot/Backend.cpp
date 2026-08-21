@@ -6,6 +6,8 @@
 
 #include "chatbot/Backend.h"
 
+#include "chatbot/AttachmentManager.h"
+
 #include "chatbot/MarkdownParser.h"
 #include "common/Event.h"
 #include "common/Utils.h"
@@ -342,16 +344,17 @@ QJsonObject ChatBot::messageToJson(const MessageData& msg) const {
         if (tcDoc.isArray()) obj["tool_calls"] = tcDoc.array();
     }
 
-    if (msg.isMultimodal()) {
+    if (msg.isMultimodal() && msg.role == "user") {
         QJsonArray contentArr;
         for (const auto& part : msg.parts) {
+            if (part.type == "file") continue;
             QJsonObject p;
             p["type"] = part.type;
             if (part.type == "text") {
                 p["text"] = part.text;
             } else if (part.type == "image_url") {
                 QJsonObject imgUrl;
-                imgUrl["url"]  = part.url;
+                imgUrl["url"]  = AttachmentManager::requestUrl(part);
                 p["image_url"] = imgUrl;
             } else if (part.type == "input_audio") {
                 QJsonObject audio;
@@ -361,7 +364,7 @@ QJsonObject ChatBot::messageToJson(const MessageData& msg) const {
             }
             contentArr.append(p);
         }
-        obj["content"] = contentArr;
+        obj["content"] = contentArr.isEmpty() ? QJsonValue(msg.content) : QJsonValue(contentArr);
     } else {
         obj["content"] = msg.content;
     }
@@ -446,7 +449,8 @@ QString ChatBot::sessionsFilePath() {
 
 static json messageDataToJson(const MessageData& msg) {
     json obj;
-    obj["role"] = msg.role.toStdString();
+    obj["role"]    = msg.role.toStdString();
+    obj["content"] = msg.content.toStdString();
     if (!msg.toolCallId.isEmpty()) obj["toolCallId"] = msg.toolCallId.toStdString();
     if (!msg.toolCallsJson.isEmpty()) obj["toolCallsJson"] = msg.toolCallsJson.toStdString();
     if (!msg.reasoning.isEmpty()) obj["reasoning"] = msg.reasoning.toStdString();
@@ -457,24 +461,27 @@ static json messageDataToJson(const MessageData& msg) {
             if (part.type == "image_url" && part.url.startsWith("data:", Qt::CaseInsensitive)) continue;
 
             json p;
-            p["type"]   = part.type.toStdString();
-            p["text"]   = part.text.toStdString();
-            p["url"]    = part.url.toStdString();
-            p["data"]   = part.data.toStdString();
-            p["format"] = part.format.toStdString();
+            p["type"]      = part.type.toStdString();
+            p["text"]      = part.text.toStdString();
+            p["url"]       = part.url.toStdString();
+            p["data"]      = part.data.toStdString();
+            p["format"]    = part.format.toStdString();
+            p["localPath"] = part.localPath.toStdString();
+            p["name"]      = part.name.toStdString();
+            p["mimeType"]  = part.mimeType.toStdString();
+            p["language"]  = part.language.toStdString();
+            p["size"]      = part.size;
             partsArr.push_back(p);
         }
-        if (partsArr.empty()) obj["content"] = msg.content.toStdString();
-        else obj["parts"] = partsArr;
-    } else {
-        obj["content"] = msg.content.toStdString();
+        if (!partsArr.empty()) obj["parts"] = partsArr;
     }
     return obj;
 }
 
 static MessageData messageDataFromJson(const json& obj) {
     MessageData msg;
-    msg.role = QString::fromStdString(obj.value("role", ""));
+    msg.role    = QString::fromStdString(obj.value("role", ""));
+    msg.content = QString::fromStdString(obj.value("content", ""));
     if (obj.contains("toolCallId")) msg.toolCallId = QString::fromStdString(obj["toolCallId"]);
     if (obj.contains("toolCallsJson")) msg.toolCallsJson = QString::fromStdString(obj["toolCallsJson"]);
     if (obj.contains("reasoning")) msg.reasoning = QString::fromStdString(obj["reasoning"]);
@@ -482,15 +489,26 @@ static MessageData messageDataFromJson(const json& obj) {
     if (obj.contains("parts") && obj["parts"].is_array()) {
         for (const auto& p : obj["parts"]) {
             MessagePart part;
-            part.type   = QString::fromStdString(p.value("type", "text"));
-            part.text   = QString::fromStdString(p.value("text", ""));
-            part.url    = QString::fromStdString(p.value("url", ""));
-            part.data   = QString::fromStdString(p.value("data", ""));
-            part.format = QString::fromStdString(p.value("format", ""));
+            part.type      = QString::fromStdString(p.value("type", "text"));
+            part.text      = QString::fromStdString(p.value("text", ""));
+            part.url       = QString::fromStdString(p.value("url", ""));
+            part.data      = QString::fromStdString(p.value("data", ""));
+            part.format    = QString::fromStdString(p.value("format", ""));
+            part.localPath = QString::fromStdString(p.value("localPath", ""));
+            part.name      = QString::fromStdString(p.value("name", ""));
+            part.mimeType  = QString::fromStdString(p.value("mimeType", ""));
+            part.language  = QString::fromStdString(p.value("language", ""));
+            part.size      = p.value("size", 0LL);
             msg.parts.append(part);
         }
-    } else {
-        msg.content = QString::fromStdString(obj.value("content", ""));
+        if (msg.content.isEmpty()) {
+            for (const auto& part : msg.parts) {
+                if (part.type == "text" && !part.text.isEmpty()) {
+                    msg.content = part.text;
+                    break;
+                }
+            }
+        }
     }
     return msg;
 }
@@ -601,6 +619,20 @@ void ChatBot::initSessions() {
                         }
                     }
 
+                    const auto oldSize = session.messages.size();
+                    session.messages.erase(
+                        std::remove_if(
+                            session.messages.begin(),
+                            session.messages.end(),
+                            [](const MessageData& message) {
+                                return message.role == "system"
+                                    && (message.content.startsWith("用户引用了以下文件作为上下文：")
+                                        || message.content.startsWith("用户引用了以下文件作为代码审查/分析的上下文："));
+                            }
+                        ),
+                        session.messages.end()
+                    );
+                    historySanitized |= session.messages.size() != oldSize;
                     if (!session.id.isEmpty()) m_sessions.insert(session.id, session);
                 }
             }
@@ -625,40 +657,98 @@ void ChatBot::initSessions() {
 
 bool ChatBot::isAvailable() { return !m_apiKey.isEmpty(); }
 
+namespace {
+
+constexpr qint64 MAX_FILE_CONTEXT_BYTES = 1024 * 1024;
+
+QString buildFileContext(const QVector<MessagePart>& parts, QStringList* failedFiles = nullptr) {
+    QString context;
+    qint64  totalBytes = 0;
+    for (const auto& part : parts) {
+        if (part.type != "file") continue;
+
+        const QFileInfo info(part.localPath);
+        if (!info.isAbsolute() || !info.isFile() || !info.isReadable() || info.size() > MAX_FILE_CONTEXT_BYTES
+            || totalBytes + info.size() > MAX_FILE_CONTEXT_BYTES) {
+            if (failedFiles) failedFiles->append(part.name.isEmpty() ? info.fileName() : part.name);
+            continue;
+        }
+
+        QFile file(info.absoluteFilePath());
+        if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            if (failedFiles) failedFiles->append(part.name.isEmpty() ? info.fileName() : part.name);
+            continue;
+        }
+        const QByteArray data = file.read(MAX_FILE_CONTEXT_BYTES + 1);
+        if (data.size() > MAX_FILE_CONTEXT_BYTES || totalBytes + data.size() > MAX_FILE_CONTEXT_BYTES) {
+            if (failedFiles) failedFiles->append(part.name.isEmpty() ? info.fileName() : part.name);
+            continue;
+        }
+        totalBytes += data.size();
+        context    += QString("---\n## 文件: %1\n```%2\n%3\n```\n\n")
+                          .arg(info.absoluteFilePath(), part.language, QString::fromUtf8(data));
+    }
+    return context.isEmpty() ? QString() : "用户引用了以下文件作为上下文：\n\n" + context;
+}
+
+} // namespace
+
 // -----------------------------------------------------------------------
 // sendMessage（纯文本，兼容旧接口）
 // -----------------------------------------------------------------------
 
 void ChatBot::sendMessage(const QString& message, const QString& fileRefs) {
     QVector<MessagePart> extraParts;
+    QString              requestFileContext;
 
     // 文件引用转文本 part（保持原有行为）
     if (!fileRefs.isEmpty()) {
         QJsonDocument doc = QJsonDocument::fromJson(fileRefs.toUtf8());
         if (doc.isArray() && !doc.array().isEmpty()) {
-            QString contextText = "用户引用了以下文件作为代码审查/分析的上下文：\n\n";
             for (const auto& fileVal : doc.array()) {
-                QJsonObject file     = fileVal.toObject();
-                QString     path     = file["path"].toString();
-                QString     content  = file["content"].toString();
-                QString     lang     = file["language"].toString();
-                contextText         += QString("---\n## 文件: %1\n```%2\n%3\n```\n\n").arg(path, lang, content);
+                QJsonObject file = fileVal.toObject();
+                QString     path = file["path"].toString();
+                QString     lang = file["language"].toString();
+
+                MessagePart part;
+                part.type      = "file";
+                part.localPath = path;
+                part.name      = file["name"].toString(QFileInfo(path).fileName());
+                part.mimeType  = "text/plain";
+                part.language  = lang;
+                part.size      = QFileInfo(path).size();
+                extraParts.append(part);
             }
-            // 在 system 消息之后插入文件上下文（通过在历史前追加一条 system 消息实现）
-            MessageData ctxMsg;
-            ctxMsg.role    = "system";
-            ctxMsg.content = contextText;
-            currentMessages().append(ctxMsg);
-            debug("已附加 {} 个文件作为上下文", doc.array().size());
+            QStringList failedFiles;
+            requestFileContext = buildFileContext(extraParts, &failedFiles);
+            if (!failedFiles.isEmpty()) {
+                warn("附件未发送给模型: {}", failedFiles.join("、").toStdString());
+                showToast(QString("%1 个附件未发送，请检查权限或大小").arg(failedFiles.size()).toStdString());
+            }
+            debug("已附加 {} 个文件，{} 个读取失败", doc.array().size(), failedFiles.size());
         }
     }
 
-    QJsonArray apiMessages = buildApiMessages(currentMessages(), message);
+    QVector<MessageData> requestHistory = currentMessages();
+    if (!requestFileContext.isEmpty()) {
+        MessageData contextMessage;
+        contextMessage.role    = "system";
+        contextMessage.content = requestFileContext;
+        requestHistory.append(contextMessage);
+    }
+    QJsonArray apiMessages = buildApiMessages(requestHistory, message);
 
     // 记录用户消息
     MessageData userMsg;
     userMsg.role    = "user";
     userMsg.content = message;
+    userMsg.parts   = extraParts;
+    if (!message.isEmpty() && !extraParts.isEmpty()) {
+        MessagePart textPart;
+        textPart.type = "text";
+        textPart.text = message;
+        userMsg.parts.prepend(textPart);
+    }
     currentMessages().append(userMsg);
     if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
 
@@ -703,11 +793,31 @@ void ChatBot::sendMessageWithMedia(const QString& message, const QString& mediaP
             } else if (part.type == "text") {
                 part.text = obj["text"].toString();
                 if (part.text.isEmpty()) continue;
+            } else if (part.type == "file") {
+                part.localPath = obj["localPath"].toString();
+                part.name      = obj["name"].toString(QFileInfo(part.localPath).fileName());
+                part.mimeType  = obj["mimeType"].toString("text/plain");
+                part.language  = obj["language"].toString();
+                part.size      = static_cast<qint64>(obj["size"].toDouble(QFileInfo(part.localPath).size()));
+                if (part.localPath.isEmpty()) continue;
             } else {
                 continue;
             }
             parts.append(part);
         }
+    }
+
+    QStringList   failedFiles;
+    const QString fileContext = buildFileContext(parts, &failedFiles);
+    if (!fileContext.isEmpty()) {
+        MessagePart contextPart;
+        contextPart.type = "text";
+        contextPart.text = fileContext;
+        parts.prepend(contextPart);
+    }
+    if (!failedFiles.isEmpty()) {
+        warn("附件未发送给模型: {}", failedFiles.join("、").toStdString());
+        showToast(QString("%1 个附件未发送，请检查权限或大小").arg(failedFiles.size()).toStdString());
     }
 
     bool hasImageParts = false;
@@ -760,12 +870,24 @@ void ChatBot::finishMediaMessage(
     // 内嵌图片只保留在本次请求中，避免 Base64 被写入历史并在后续请求中反复复制。
     const bool hadImage =
         std::any_of(parts.cbegin(), parts.cend(), [](const MessagePart& part) { return part.type == "image_url"; });
-    QVector<MessagePart> historyParts = parts;
+    QVector<MessagePart> historyParts   = parts;
+    const QString        attachmentRoot = QFileInfo(sessionsFilePath()).absolutePath();
+    for (auto& part : historyParts) {
+        if (part.type != "image_url" || !part.url.startsWith("data:", Qt::CaseInsensitive)) continue;
+        QString attachmentError;
+        if (!AttachmentManager::persistImage(attachmentRoot, sessionId, part, &attachmentError)) {
+            warn("保存图片附件失败: {}", attachmentError.toStdString());
+            part.localPath.clear();
+        }
+        part.url.clear();
+    }
     historyParts.erase(
         std::remove_if(
             historyParts.begin(),
             historyParts.end(),
-            [](const MessagePart& p) { return p.type == "image_url" && p.url.startsWith("data:", Qt::CaseInsensitive); }
+            [](const MessagePart& part) {
+                return part.type == "image_url" && part.url.isEmpty() && part.localPath.isEmpty();
+            }
         ),
         historyParts.end()
     );
@@ -1105,19 +1227,50 @@ QJsonArray ChatBot::messagesToResponsesInput(const QJsonArray& messages) const {
             continue;
         }
 
-        QString          content;
+        QJsonValue       content;
         const QJsonValue contentValue = message["content"];
         if (contentValue.isString()) {
-            content = contentValue.toString();
+            content = contentValue;
         } else if (contentValue.isArray()) {
+            QJsonArray responsesContent;
+            bool       hasUnsupportedMedia = false;
             for (const QJsonValue& partValue : contentValue.toArray()) {
-                const QJsonObject part = partValue.toObject();
-                if (part["type"].toString() == "text") content += part["text"].toString();
+                const QJsonObject part     = partValue.toObject();
+                const QString     partType = part["type"].toString();
+                if (partType == "text") {
+                    const QString text = part["text"].toString();
+                    if (!text.isEmpty())
+                        responsesContent.append(
+                            QJsonObject{
+                                {"type", "input_text"},
+                                {"text", text        }
+                        }
+                        );
+                } else if (partType == "image_url") {
+                    const QString imageUrl = part["image_url"].toObject()["url"].toString();
+                    if (!imageUrl.isEmpty())
+                        responsesContent.append(
+                            QJsonObject{
+                                {"type",      "input_image"},
+                                {"image_url", imageUrl     }
+                        }
+                        );
+                } else {
+                    hasUnsupportedMedia = true;
+                }
             }
-            if (content.isEmpty()) content = "[不支持的媒体输入]";
+            if (responsesContent.isEmpty() && hasUnsupportedMedia)
+                responsesContent.append(
+                    QJsonObject{
+                        {"type", "input_text"        },
+                        {"text", "[不支持的媒体输入]"}
+                }
+                );
+            content = responsesContent;
         }
 
-        if (!content.isEmpty())
+        if ((content.isString() && !content.toString().isEmpty())
+            || (content.isArray() && !content.toArray().isEmpty()))
             input.append(
                 QJsonObject{
                     {"type",    "message"},
@@ -1191,6 +1344,46 @@ QString responseOutputToolCalls(const QJsonArray& output) {
 
 } // namespace
 
+QVector<MessagePart> ChatBot::persistGeneratedImages(const QJsonArray& output) {
+    QVector<MessagePart> parts;
+    const QString        rootPath = QFileInfo(sessionsFilePath()).absolutePath();
+    for (const QJsonValue& itemValue : output) {
+        const QJsonObject item = itemValue.toObject();
+        if (item["type"].toString() != "image_generation_call") continue;
+
+        const QString result = item["result"].toString();
+        if (result.isEmpty()) continue;
+
+        MessagePart part;
+        part.type = "image_url";
+        part.url  = "data:image/png;base64," + result;
+        part.name = "生成图片.png";
+        QString attachmentError;
+        if (!AttachmentManager::persistImage(rootPath, m_currentSessionId, part, &attachmentError)) {
+            warn("保存生成图片失败: {}", attachmentError.toStdString());
+            continue;
+        }
+        part.url.clear();
+        parts.append(part);
+    }
+    return parts;
+}
+
+QVariantList ChatBot::attachmentVariants(const QVector<MessagePart>& parts) const {
+    QVariantList variants;
+    for (const auto& part : parts) {
+        QVariantMap attachment;
+        attachment["type"]      = part.type;
+        attachment["localPath"] = part.localPath;
+        attachment["source"]    = QUrl::fromLocalFile(part.localPath).toString();
+        attachment["name"]      = part.name;
+        attachment["mimeType"]  = part.mimeType;
+        attachment["size"]      = part.size;
+        variants.append(attachment);
+    }
+    return variants;
+}
+
 // -----------------------------------------------------------------------
 // makeApiRequest：构建请求体并发送
 // -----------------------------------------------------------------------
@@ -1252,8 +1445,9 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
         }
     }
 
-    // 注入工具定义
-    if (m_capToolCall && ((m_tavilyEnabled && !m_tavilyApiKey.isEmpty()) || m_shellToolEnabled)) {
+    // 注入本地函数工具和 Responses API 图片生成工具。
+    if ((m_capToolCall && ((m_tavilyEnabled && !m_tavilyApiKey.isEmpty()) || m_shellToolEnabled))
+        || (usesResponsesApi() && (m_capImageGeneration || m_nativeWebSearchEnabled))) {
         injectToolDefinitions(requestBody);
     }
 
@@ -1466,7 +1660,8 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             m_serverToolCallActive = false;
                             m_serverToolCallName.clear();
                         }
-                        const QJsonArray output = response["output"].toArray();
+                        const QJsonArray           output          = response["output"].toArray();
+                        const QVector<MessagePart> generatedImages = persistGeneratedImages(output);
                         if (m_currentReasoningBuffer.isEmpty()) {
                             const QString reasoning = responseOutputReasoning(output);
                             if (!reasoning.isEmpty()) {
@@ -1482,6 +1677,11 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             }
                         }
 
+                        if (m_currentStreamBuffer.isEmpty() && !generatedImages.isEmpty()) {
+                            m_currentStreamBuffer = "已生成图片";
+                            emit streamChunk(m_currentStreamBuffer);
+                        }
+
                         QString toolCallsJson = responseOutputToolCalls(output);
                         if ((toolCallsJson.isEmpty() || toolCallsJson == "[]") && !m_toolCallsBuffer.isEmpty()) {
                             json calls = json::array();
@@ -1495,6 +1695,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             assistantMsg.content       = m_currentStreamBuffer;
                             assistantMsg.reasoning     = m_currentReasoningBuffer;
                             assistantMsg.toolCallsJson = toolCallsJson;
+                            assistantMsg.parts         = generatedImages;
                             currentMessages().append(assistantMsg);
                             if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
                             m_sessions[m_currentSessionId].updatedAt =
@@ -1509,6 +1710,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             assistantMsg.role      = "assistant";
                             assistantMsg.content   = m_currentStreamBuffer;
                             assistantMsg.reasoning = m_currentReasoningBuffer;
+                            assistantMsg.parts     = generatedImages;
                             currentMessages().append(assistantMsg);
                             if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
                             m_sessions[m_currentSessionId].updatedAt =
@@ -1516,6 +1718,8 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             saveSessions();
                             emit messagesChanged();
                         }
+                        if (!generatedImages.isEmpty())
+                            emit imageAttachmentsReceived(attachmentVariants(generatedImages));
                         m_currentStreamBuffer.clear();
                         m_currentReasoningBuffer.clear();
                         m_toolCallsBuffer.clear();
@@ -1649,9 +1853,12 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                     reply->deleteLater();
                     return;
                 }
-                const QString toolCallsJson = responseOutputToolCalls(obj["output"].toArray());
-                const QString content       = responseOutputText(obj["output"].toArray());
-                const QString reasoning     = responseOutputReasoning(obj["output"].toArray());
+                const QJsonArray           output          = obj["output"].toArray();
+                const QVector<MessagePart> generatedImages = persistGeneratedImages(output);
+                const QString              toolCallsJson   = responseOutputToolCalls(output);
+                QString                    content         = responseOutputText(output);
+                const QString              reasoning       = responseOutputReasoning(output);
+                if (content.isEmpty() && !generatedImages.isEmpty()) content = "已生成图片";
                 if (!m_cancelled && !reasoning.isEmpty()) emit reasoningChunk(reasoning);
                 if (!m_cancelled && !toolCallsJson.isEmpty() && toolCallsJson != "[]") {
                     MessageData assistantMsg;
@@ -1659,6 +1866,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                     assistantMsg.content       = content;
                     assistantMsg.reasoning     = reasoning;
                     assistantMsg.toolCallsJson = toolCallsJson;
+                    assistantMsg.parts         = generatedImages;
                     currentMessages().append(assistantMsg);
                     if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
                     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
@@ -1670,14 +1878,16 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                     assistantMsg.role      = "assistant";
                     assistantMsg.content   = content;
                     assistantMsg.reasoning = reasoning;
+                    assistantMsg.parts     = generatedImages;
                     currentMessages().append(assistantMsg);
                     if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
                     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
                     saveSessions();
                     emit messageReceived(content, true);
+                    if (!generatedImages.isEmpty()) emit imageAttachmentsReceived(attachmentVariants(generatedImages));
                     emit messagesChanged();
                 } else if (!m_cancelled) {
-                    emit errorOccurred("API 响应格式错误：Responses API 未返回文本或工具调用");
+                    emit errorOccurred("API 响应格式错误：Responses API 未返回文本、图片或工具调用");
                 }
                 m_activeReplies.removeAll(reply);
                 reply->deleteLater();
@@ -1949,10 +2159,16 @@ QVariantList ChatBot::getMessages() const {
             QVariantList partsList;
             for (const auto& part : msg.parts) {
                 QVariantMap pm;
-                pm["type"]   = part.type;
-                pm["text"]   = part.text;
-                pm["url"]    = part.url;
-                pm["format"] = part.format;
+                pm["type"]      = part.type;
+                pm["text"]      = part.text;
+                pm["url"]       = part.url;
+                pm["format"]    = part.format;
+                pm["localPath"] = part.localPath;
+                pm["source"]    = part.localPath.isEmpty() ? part.url : QUrl::fromLocalFile(part.localPath).toString();
+                pm["name"]      = part.name;
+                pm["mimeType"]  = part.mimeType;
+                pm["language"]  = part.language;
+                pm["size"]      = part.size;
                 partsList.append(pm);
             }
             m["parts"] = partsList;
@@ -2100,23 +2316,30 @@ void ChatBot::applyModelConfig(const json& modelObj) {
     static const QStringList reasoningEfforts = {"none", "minimal", "low", "medium", "high", "xhigh"};
     if (!reasoningEfforts.contains(m_reasoningEffort)) m_reasoningEffort.clear();
 
+    m_nativeWebSearchEnabled  = modelObj.value("nativeWebSearchEnabled", false);
+    m_nativeWebSearchProvider = QString::fromStdString(modelObj.value("nativeWebSearchProvider", "auto"));
+    static const QStringList nativeWebSearchProviders = {"auto", "openai", "xai", "compatible"};
+    if (!nativeWebSearchProviders.contains(m_nativeWebSearchProvider)) m_nativeWebSearchProvider = "auto";
+
     m_proxyVisionModelId = QString::fromStdString(modelObj.value("proxyVisionModelId", ""));
     m_proxyVisionPrompt  = QString::fromStdString(
         modelObj.value("proxyVisionPrompt", "请详细描述这张图片的内容。如果图片中有文字，请完整转录。")
     );
 
-    m_capText      = true;
-    m_capVision    = false;
-    m_capAudio     = false;
-    m_capToolCall  = false;
-    m_capReasoning = false;
+    m_capText            = true;
+    m_capVision          = false;
+    m_capAudio           = false;
+    m_capToolCall        = false;
+    m_capReasoning       = false;
+    m_capImageGeneration = false;
     if (modelObj.contains("capabilities") && modelObj["capabilities"].is_object()) {
-        const auto& cap = modelObj["capabilities"];
-        m_capText       = cap.value("text", true);
-        m_capVision     = cap.value("vision", false);
-        m_capAudio      = cap.value("audio", false);
-        m_capToolCall   = cap.value("toolCall", false);
-        m_capReasoning  = cap.value("reasoning", false);
+        const auto& cap      = modelObj["capabilities"];
+        m_capText            = cap.value("text", true);
+        m_capVision          = cap.value("vision", false);
+        m_capAudio           = cap.value("audio", false);
+        m_capToolCall        = cap.value("toolCall", false);
+        m_capReasoning       = cap.value("reasoning", false);
+        m_capImageGeneration = cap.value("imageGeneration", false);
     }
     emit activeModelCapabilitiesChanged();
 }
@@ -2152,15 +2375,21 @@ bool ChatBot::addModel(const QString& modelJson) {
     static const QStringList reasoningEfforts = {"none", "minimal", "low", "medium", "high", "xhigh"};
     newModel["reasoningEffort"] =
         reasoningEfforts.contains(reasoningEffort) ? reasoningEffort.toStdString() : std::string();
+    newModel["nativeWebSearchEnabled"]                = input["nativeWebSearchEnabled"].toBool(false);
+    QString                  nativeWebSearchProvider  = input["nativeWebSearchProvider"].toString("auto");
+    static const QStringList nativeWebSearchProviders = {"auto", "openai", "xai", "compatible"};
+    newModel["nativeWebSearchProvider"] =
+        nativeWebSearchProviders.contains(nativeWebSearchProvider) ? nativeWebSearchProvider.toStdString() : "auto";
 
     // capabilities
     {
         json cap;
-        cap["text"]      = true;
-        cap["vision"]    = false;
-        cap["audio"]     = false;
-        cap["toolCall"]  = false;
-        cap["reasoning"] = false;
+        cap["text"]            = true;
+        cap["vision"]          = false;
+        cap["audio"]           = false;
+        cap["toolCall"]        = false;
+        cap["reasoning"]       = false;
+        cap["imageGeneration"] = false;
         if (input.contains("capabilities") && input["capabilities"].isObject()) {
             const auto qcap = input["capabilities"].toObject();
             if (qcap.contains("text")) cap["text"] = qcap["text"].toBool(true);
@@ -2168,6 +2397,7 @@ bool ChatBot::addModel(const QString& modelJson) {
             if (qcap.contains("audio")) cap["audio"] = qcap["audio"].toBool(false);
             if (qcap.contains("toolCall")) cap["toolCall"] = qcap["toolCall"].toBool(false);
             if (qcap.contains("reasoning")) cap["reasoning"] = qcap["reasoning"].toBool(false);
+            if (qcap.contains("imageGeneration")) cap["imageGeneration"] = qcap["imageGeneration"].toBool(false);
         }
         newModel["capabilities"] = cap;
     }
@@ -2484,6 +2714,7 @@ bool ChatBot::deleteSession(const QString& sessionId) {
     }
 
     m_sessions.remove(sessionId);
+    AttachmentManager::removeSession(QFileInfo(sessionsFilePath()).absolutePath(), sessionId);
     if (m_currentSessionId == sessionId) {
         m_currentSessionId = m_sessions.firstKey();
         emit messagesChanged();
@@ -2583,7 +2814,21 @@ void ChatBot::setTavilyConfig(const QString& configJson) {
 void ChatBot::injectToolDefinitions(QJsonObject& requestBody) {
     QJsonArray tools;
 
-    if (m_tavilyEnabled && !m_tavilyApiKey.isEmpty()) {
+    if (usesResponsesApi() && m_capImageGeneration)
+        tools.append(
+            QJsonObject{
+                {"type", "image_generation"}
+        }
+        );
+
+    if (usesResponsesApi() && m_nativeWebSearchEnabled)
+        tools.append(
+            QJsonObject{
+                {"type", "web_search"}
+        }
+        );
+
+    if (m_capToolCall && m_tavilyEnabled && !m_tavilyApiKey.isEmpty()) {
         QJsonObject funcParam;
         funcParam["type"] = "object";
 
@@ -2614,7 +2859,7 @@ void ChatBot::injectToolDefinitions(QJsonObject& requestBody) {
         }
     }
 
-    if (m_shellToolEnabled) {
+    if (m_capToolCall && m_shellToolEnabled) {
         QJsonObject funcParam;
         funcParam["type"] = "object";
 

@@ -40,11 +40,21 @@ public:
 
     static bool mIsTakeOver;
 
+    [[nodiscard]] bool isPausedByScan() const { return mPausedByScan; }
+    int64_t            normalizePositionDuringScan(int64_t requestedPosition);
+    void                  onPlaybackResumedAfterScan();
+    Q_INVOKABLE bool      isScanPauseActive() const { return mPausedByScan; }
+    Q_INVOKABLE bool      shouldPreserveMusicOnScanResultClose();
+    Q_INVOKABLE void      finishScanPause();
+
     [[nodiscard]] bool getPauseOnScan() const;
     void setPauseOnScan(bool enabled);
 
     /// 供 QML 调⽤：释放当前 MUSIC 引⽤（播放停⽌/关闭播放器时）
     Q_INVOKABLE void releaseAudio();
+
+    /// 页面导航隐藏播放器时，保留由扫描暂停的播放会话
+    Q_INVOKABLE void releaseAudioAfterHide();
 
     /// 清理当前临时软链接
     void cleanupTempSymlinks();
@@ -79,7 +89,12 @@ private:
     // 临时软链接路径，用于清理
     QString mTempAudioLink;
     bool    mPauseOnScan{false};
+    bool    mPausedByScan{false};
+    bool    mPlaybackResumedDuringScan{false};
+    bool    mScanResultClosed{false};
+    int64_t mScanPausePosition{0};
 
     void onOcrStarted();
+    void restoreScanPausePosition();
 };
 } // namespace mod::filemanager

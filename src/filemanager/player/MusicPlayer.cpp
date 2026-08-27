@@ -80,7 +80,10 @@ void MusicPlayer::play(size_t idx) {
 }
 
 void MusicPlayer::_play(const std::shared_ptr<QFileInfo>& file) {
-    mIsTakeOver = true;
+    mIsTakeOver                = true;
+    mPausedByScan              = false;
+    mPlaybackResumedDuringScan = false;
+    mScanResultClosed          = false;
     // 播放新曲目前先释放之前的 MUSIC 引用，防止该 source 的引用累积。
     if (mod::AudioDaemon::getInstance().sourceRefCount(AudioSource::MUSIC) > 0) {
         mod::AudioDaemon::getInstance().release(AudioSource::MUSIC);
@@ -259,22 +262,101 @@ void MusicPlayer::setPauseOnScan(bool enabled) {
 }
 
 void MusicPlayer::onOcrStarted() {
-    if (!mPauseOnScan) {
+    if (!mPauseOnScan || !mIsTakeOver) {
         return;
     }
     auto*      manager = YPointer<YMediaPlayerManager>::getInstance();
     const auto state   = PEN_CALL(PlayState, "_ZNK19YMediaPlayerManager9playStateEv", void*)(manager);
-    if (state == PlayState::PLAYING) {
-        PEN_CALL(void, "_ZN19YMediaPlayerManager14onClickedPauseEv", void*)(manager);
+    if (state != PlayState::PLAYING) {
+        return;
     }
+
+    mScanPausePosition         = PEN_CALL(int64_t, "_ZNK19YMediaPlayerManager10currentPosEv", void*)(manager);
+    mPausedByScan              = true;
+    mPlaybackResumedDuringScan = false;
+    mScanResultClosed          = false;
+    PEN_CALL(void, "_ZN19YMediaPlayerManager14onClickedPauseEv", void*)(manager);
+
+    // ocrStart 的同步 QML 处理会切换页面并停止提示音，待这些处理结束后恢复被覆盖的播放位置。
+    QTimer::singleShot(0, this, &MusicPlayer::restoreScanPausePosition);
+}
+
+void MusicPlayer::restoreScanPausePosition() {
+    if (!mPausedByScan) {
+        return;
+    }
+    auto* manager = YPointer<YMediaPlayerManager>::getInstance();
+    PEN_CALL(void, "_ZN19YMediaPlayerManager13setCurrentPosERKx", void*, int64_t const&)(manager,
+                                                                                         mScanPausePosition);
+}
+
+int64_t MusicPlayer::normalizePositionDuringScan(int64_t requestedPosition) {
+    if (requestedPosition != 0) {
+        return requestedPosition;
+    }
+    if (mPlaybackResumedDuringScan) {
+        return PEN_CALL(int64_t, "_ZNK19YMediaPlayerManager10currentPosEv", void*)(
+            YPointer<YMediaPlayerManager>::getInstance());
+    }
+    return mScanPausePosition > 0 ? mScanPausePosition : requestedPosition;
+}
+
+void MusicPlayer::onPlaybackResumedAfterScan() {
+    if (!mPausedByScan) {
+        return;
+    }
+    mPlaybackResumedDuringScan = true;
+    QTimer::singleShot(0, this, [this]() {
+        if (!mPausedByScan) {
+            return;
+        }
+        restoreScanPausePosition();
+        if (mScanResultClosed) {
+            mPausedByScan              = false;
+            mPlaybackResumedDuringScan = false;
+            mScanResultClosed          = false;
+        }
+    });
+}
+
+bool MusicPlayer::shouldPreserveMusicOnScanResultClose() {
+    return mPausedByScan && mPlaybackResumedDuringScan;
+}
+
+void MusicPlayer::finishScanPause() {
+    if (!mPausedByScan) {
+        return;
+    }
+    mScanResultClosed = true;
+    if (mPlaybackResumedDuringScan) {
+        // 已恢复的音乐无需再被结果页关闭流程干预，保留它的自然播放进度。
+        mPausedByScan              = false;
+        mPlaybackResumedDuringScan = false;
+        mScanResultClosed          = false;
+        return;
+    }
+
+    // 仍暂停时允许结果页关闭音效流程完成，但继续保护位置直到用户恢复播放。
+    QTimer::singleShot(0, this, &MusicPlayer::restoreScanPausePosition);
 }
 
 void MusicPlayer::releaseAudio() {
+    mPausedByScan              = false;
+    mPlaybackResumedDuringScan = false;
+    mScanResultClosed          = false;
     info("QML 请求释放 MUSIC 引用");
     auto& audioDaemon = mod::AudioDaemon::getInstance();
     while (audioDaemon.sourceRefCount(AudioSource::MUSIC) > 0) {
         audioDaemon.release(AudioSource::MUSIC);
     }
+}
+
+void MusicPlayer::releaseAudioAfterHide() {
+    if (mPausedByScan) {
+        info("扫描暂停期间隐藏播放器，保留 MUSIC 引用");
+        return;
+    }
+    releaseAudio();
 }
 
 } // namespace mod::filemanager
@@ -286,6 +368,22 @@ using MusicPlayer = mod::filemanager::MusicPlayer;
 PEN_HOOK(void*, _ZN13YMediaManager10clickMediaEi, void* a1, void* a2) {
     MusicPlayer::mIsTakeOver = false;
     return origin(a1, a2);
+}
+
+PEN_HOOK(void, _ZN19YMediaPlayerManager13setCurrentPosERKx, void* self, int64_t const& position) {
+    auto& player = MusicPlayer::getInstance();
+    if (MusicPlayer::mIsTakeOver && player.isPausedByScan()) {
+        const auto normalized = player.normalizePositionDuringScan(position);
+        return origin(self, normalized);
+    }
+    return origin(self, position);
+}
+
+PEN_HOOK(void, _ZN19YMediaPlayerManager13onClickedPlayEv, void* self) {
+    origin(self);
+    if (MusicPlayer::mIsTakeOver) {
+        MusicPlayer::getInstance().onPlaybackResumedAfterScan();
+    }
 }
 
 PEN_HOOK(uint64, _ZN19YMediaPlayerManager13onClickedPrevEb, void* self, bool a2) {

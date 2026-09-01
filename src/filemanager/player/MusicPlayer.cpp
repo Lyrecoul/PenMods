@@ -26,8 +26,9 @@ namespace mod::filemanager {
 bool MusicPlayer::mIsTakeOver{false};
 
 MusicPlayer::MusicPlayer() : Logger("MusicPlayer") {
-    const auto cfg = Config::getInstance().read("fm");
-    mPauseOnScan   = cfg.value("pause_on_scan", false);
+    const auto cfg      = Config::getInstance().read("fm");
+    mPauseOnScan        = cfg.value("pause_on_scan", false);
+    mHideFloatingWindow = cfg.value("hide_floating_window", false);
 
     connect(&Event::getInstance(), &Event::ocrStarted, this, &MusicPlayer::onOcrStarted);
     connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView& view, QQmlContext* context) {
@@ -261,6 +262,19 @@ void MusicPlayer::setPauseOnScan(bool enabled) {
     emit pauseOnScanChanged();
 }
 
+bool MusicPlayer::getHideFloatingWindow() const { return mHideFloatingWindow; }
+
+void MusicPlayer::setHideFloatingWindow(bool hidden) {
+    if (mHideFloatingWindow == hidden) {
+        return;
+    }
+    mHideFloatingWindow         = hidden;
+    auto cfg                    = Config::getInstance().read("fm");
+    cfg["hide_floating_window"] = hidden;
+    Config::getInstance().write("fm", std::move(cfg));
+    emit hideFloatingWindowChanged();
+}
+
 void MusicPlayer::onOcrStarted() {
     if (!mPauseOnScan || !mIsTakeOver) {
         return;
@@ -355,6 +369,25 @@ void MusicPlayer::seekToPosition(qint64 position) {
         const auto delta = currentPosition - targetPosition;
         PEN_CALL(int64_t, "_ZN19YMediaPlayerManager14onFastBackwardEx", void*, int64_t)(manager, delta);
     }
+}
+
+void MusicPlayer::stop() {
+    emit stopRequested();
+
+    auto* manager = YPointer<YMediaPlayerManager>::getInstance();
+    if (!manager) {
+        releaseAudio();
+        return;
+    }
+
+    mCurrentPlaying.mIsEnd = true;
+    auto state = PlayState::STOPPED;
+    *(uint32*)(*((uint64*)manager + 4) + 100) = 0;
+    PEN_CALL(void*, "_ZN19YMediaPlayerManager12setPlayStateERKN12YEnumWrapper10Play_StateE", void*, void*)
+    (manager, &state);
+    PEN_CALL(void*, "_ZN19YMediaPlayerManager8wipeDataEv", void*)(manager);
+    mIsTakeOver = false;
+    releaseAudio();
 }
 
 void MusicPlayer::releaseAudio() {

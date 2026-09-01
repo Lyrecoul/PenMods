@@ -124,7 +124,8 @@ Config::Config() : Logger("Config") {
             }},
             {"hide_paired_lyrics", false},
             {"show_hidden_files", false},
-            {"pause_on_scan", false}
+            {"pause_on_scan", false},
+            {"hide_floating_window", false}
         }},
         {"wallpaper", {
             {"mode", 0},

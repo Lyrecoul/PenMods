@@ -268,8 +268,9 @@ private:
     QMutex                 m_markdownRequestsMutex;
     QSet<QString>          m_markdownRequests;
     QList<QNetworkReply*>  m_activeReplies;
-    bool                   m_cancelled  = false;
-    int                    m_requestSeq = 0;
+    bool                   m_cancelled        = false;
+    bool                   m_streamEndEmitted = false;
+    int                    m_requestSeq       = 0;
 
     QString m_apiKey;
     QString m_apiEndpoint;
@@ -322,6 +323,7 @@ private:
 
     void       makeApiRequest(const QJsonArray& messages);
     void       handleNetworkReply(QNetworkReply* reply, bool isStream);
+    void       finishStream();
     void       recordApiUsage(const QJsonObject& usage);
     bool       usesResponsesApi() const;
     QJsonArray messagesToResponsesInput(const QJsonArray& messages) const;

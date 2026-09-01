@@ -1400,13 +1400,20 @@ void ChatBot::abortActiveReplies() {
     }
 }
 
+void ChatBot::finishStream() {
+    if (m_streamEndEmitted) return;
+    m_streamEndEmitted = true;
+    emit streamEnd();
+}
+
 void ChatBot::makeApiRequest(const QJsonArray& messages) {
     // 递增序列号使旧请求的回调自动失效
     int seq = ++m_requestSeq;
 
     abortActiveReplies();
 
-    m_cancelled = false;
+    m_cancelled        = false;
+    m_streamEndEmitted = false;
 
     if (m_apiKey.isEmpty()) {
         emit errorOccurred("API 密钥未设置\n请进入「设置」页面配置有效的 API 密钥后重试");
@@ -1496,11 +1503,30 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
             QByteArray data = reply->readAll();
             if (data.isEmpty()) return;
 
-            m_responseBuffer  += QString::fromUtf8(data);
-            QStringList lines  = m_responseBuffer.split("\n", Qt::SkipEmptyParts);
+            m_responseBuffer                     += QString::fromUtf8(data);
+            const bool        hasTrailingNewline  = m_responseBuffer.endsWith('\n');
+            const QStringList lines               = m_responseBuffer.split("\n", Qt::KeepEmptyParts);
+            m_responseBuffer.clear();
 
-            for (const QString& line : lines) {
-                QString trimmedLine = line.trimmed();
+            for (int lineIndex = 0; lineIndex < lines.size(); ++lineIndex) {
+                const QString& line          = lines.at(lineIndex);
+                QString        trimmedLine   = line.trimmed();
+                const bool     isPartialLine = !hasTrailingNewline && lineIndex == lines.size() - 1;
+                if (isPartialLine) {
+                    if (!trimmedLine.startsWith("data: ")) {
+                        m_responseBuffer = line;
+                        break;
+                    }
+                    const QString candidate = trimmedLine.mid(6);
+                    if (candidate.trimmed() != "[DONE]") {
+                        QJsonParseError partialError;
+                        QJsonDocument::fromJson(candidate.toUtf8(), &partialError);
+                        if (partialError.error != QJsonParseError::NoError) {
+                            m_responseBuffer = line;
+                            break;
+                        }
+                    }
+                }
                 if (!trimmedLine.startsWith("data: ")) continue;
 
                 QString jsonData = trimmedLine.mid(6);
@@ -1551,7 +1577,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                     m_currentStreamBuffer.clear();
                     m_currentReasoningBuffer.clear();
                     m_toolCallsBuffer.clear();
-                    emit streamEnd();
+                    finishStream();
                     continue;
                 }
 
@@ -1599,7 +1625,8 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                         const QJsonObject item     = obj["item"].toObject();
                         const QString     itemType = item["type"].toString();
                         if (itemType == "function_call") {
-                            emit toolCallProgress(QString("正在调用：%1").arg(item["name"].toString("工具")), false);
+                            // 本地函数工具稍后会由 dispatchToolCalls 按真实 toolCallId 建卡，
+                            // 此处不创建无 ID 的通用进度卡，避免同一次调用显示两项工具。
                             const int index                                  = m_toolCallsBuffer.size();
                             m_responseToolItemIndexes[item["id"].toString()] = index;
                             m_toolCallsBuffer[index]                         = json{
@@ -1648,7 +1675,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             emit errorOccurred("API 请求失败\n" + detail);
                             m_currentStreamBuffer.clear();
                             m_toolCallsBuffer.clear();
-                            emit streamEnd();
+                            finishStream();
                             continue;
                         }
                         if (m_serverToolCallActive) {
@@ -1724,7 +1751,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                         m_currentReasoningBuffer.clear();
                         m_toolCallsBuffer.clear();
                         m_responseToolItemIndexes.clear();
-                        emit streamEnd();
+                        finishStream();
                     }
                     continue;
                 }
@@ -1779,15 +1806,6 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                     }
                 }
             }
-
-            if (m_responseBuffer.endsWith("\n")) {
-                m_responseBuffer.clear();
-            } else {
-                int lastNewline = m_responseBuffer.lastIndexOf("\n");
-                if (lastNewline != -1 && lastNewline < m_responseBuffer.length() - 1)
-                    m_responseBuffer = m_responseBuffer.mid(lastNewline + 1);
-                else m_responseBuffer.clear();
-            }
         });
     }
 }
@@ -1832,6 +1850,12 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                     emit messagesChanged();
                 }
             }
+            if (m_serverToolCallActive) {
+                emit toolCallProgress("服务器工具执行未完成", true);
+                m_serverToolCallActive = false;
+                m_serverToolCallName.clear();
+            }
+            finishStream();
         } else {
             QByteArray    response = reply->readAll();
             QJsonDocument doc      = QJsonDocument::fromJson(response);
@@ -1952,7 +1976,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
             return;
         }
 
-        if (isStream) emit streamEnd();
+        if (isStream) finishStream();
 
         int        httpStatus   = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         QByteArray responseBody = reply->readAll();
@@ -1996,6 +2020,11 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
 void ChatBot::editMessage(int index, const QString& newContent) {
     auto& msgs = currentMessages();
     if (index < 0 || index >= msgs.size()) return;
+
+    if (msgs[index].role != "user") {
+        warn("拒绝编辑非用户消息，索引 {} 的 role={}", index, msgs[index].role.toStdString());
+        return;
+    }
 
     QString currentRole = msgs[index].role;
     msgs[index].content = newContent;

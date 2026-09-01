@@ -340,6 +340,23 @@ void MusicPlayer::finishScanPause() {
     QTimer::singleShot(0, this, &MusicPlayer::restoreScanPausePosition);
 }
 
+void MusicPlayer::seekToPosition(qint64 position) {
+    auto* manager = YPointer<YMediaPlayerManager>::getInstance();
+    if (position < 0) {
+        position = 0;
+    }
+
+    const auto currentPosition = PEN_CALL(int64_t, "_ZNK19YMediaPlayerManager10currentPosEv", void*)(manager);
+    const auto targetPosition  = static_cast<int64_t>(position);
+    if (targetPosition > currentPosition) {
+        const auto delta = targetPosition - currentPosition;
+        PEN_CALL(int64_t, "_ZN19YMediaPlayerManager13onFastForwardEx", void*, int64_t)(manager, delta);
+    } else if (targetPosition < currentPosition) {
+        const auto delta = currentPosition - targetPosition;
+        PEN_CALL(int64_t, "_ZN19YMediaPlayerManager14onFastBackwardEx", void*, int64_t)(manager, delta);
+    }
+}
+
 void MusicPlayer::releaseAudio() {
     mPausedByScan              = false;
     mPlaybackResumedDuringScan = false;

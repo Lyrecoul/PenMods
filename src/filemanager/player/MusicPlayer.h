@@ -50,6 +50,9 @@ public:
     [[nodiscard]] bool getPauseOnScan() const;
     void setPauseOnScan(bool enabled);
 
+    /// 供 QML 调用：将当前音频定位到指定的毫秒位置
+    Q_INVOKABLE void seekToPosition(qint64 position);
+
     /// 供 QML 调⽤：释放当前 MUSIC 引⽤（播放停⽌/关闭播放器时）
     Q_INVOKABLE void releaseAudio();
 

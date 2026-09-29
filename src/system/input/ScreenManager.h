@@ -21,6 +21,8 @@ namespace mod {
 class ScreenManager : public QObject, public Singleton<ScreenManager> {
     Q_OBJECT
 
+    Q_PROPERTY(QString autoSleepDuration READ getAutoSleepDurationStr WRITE setAutoSleepDurationStr NOTIFY
+                   autoSleepDurationChanged);
     Q_PROPERTY(QString autoShutdownDuration READ getAutoShutdownDurationStr WRITE setAutoShutdownDurationStr NOTIFY
                    autoShutdownDurationChanged);
     Q_PROPERTY(int intelSleep READ getIntelSleep WRITE setIntelSleep NOTIFY intelSleepChanged);

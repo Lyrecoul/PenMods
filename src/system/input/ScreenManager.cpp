@@ -14,8 +14,10 @@
 
 #include "common/Event.h"
 
-#include <QQmlContext>
+#include <QCoreApplication>
 #include <QDebug>
+#include <QMouseEvent>
+#include <QQmlContext>
 
 namespace mod {
 
@@ -30,6 +32,16 @@ ScreenManager::ScreenManager() {
 
     connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView& view, QQmlContext* context) {
         context->setContextProperty("screenManager", this);
+
+        // Install the filter on the application object so it observes events sent
+        // to every receiver, including windows/scenes created by plugins.
+        if (!mEventFilterInstalled) {
+            if (auto* app = QCoreApplication::instance()) {
+                app->installEventFilter(this);
+                mEventFilterInstalled = true;
+                qInfo() << "screenManager: installed global input event filter";
+            }
+        }
     });
 
     connect(&Event::getInstance(), &Event::currentPageIndexChanged, this, [this](int) {
@@ -105,6 +117,45 @@ void ScreenManager::setSystemBase(YSystemBase* systemBase) {
         mSystemBase = systemBase;
         qInfo() << "captured YSystemBase instance";
     }
+}
+
+bool ScreenManager::eventFilter(QObject* watched, QEvent* event) {
+    switch (event->type()) {
+    case QEvent::MouseButtonPress:
+    case QEvent::MouseButtonRelease:
+    case QEvent::MouseButtonDblClick:
+    case QEvent::KeyPress:
+    case QEvent::KeyRelease:
+    case QEvent::Wheel:
+    case QEvent::TouchBegin:
+    case QEvent::TouchUpdate:
+    case QEvent::TouchEnd:
+    case QEvent::TabletPress:
+    case QEvent::TabletMove:
+    case QEvent::TabletRelease:
+        resetInactivityTimer();
+        break;
+    case QEvent::MouseMove: {
+        // Only treat dragging/scrolling as activity; a bare hover would let touch
+        // noise keep the pen awake forever.
+        auto* mouseEvent = static_cast<QMouseEvent*>(event);
+        if (mouseEvent->buttons() != Qt::NoButton) resetInactivityTimer();
+        break;
+    }
+    default:
+        break;
+    }
+    return QObject::eventFilter(watched, event);
+}
+
+void ScreenManager::onScreenOn() {
+    qInfo() << "screen on: reset inactivity shutdown timer";
+    resetInactivityTimer();
+}
+
+void ScreenManager::onScreenOff() {
+    qInfo() << "screen off: reset inactivity shutdown timer";
+    resetInactivityTimer();
 }
 
 void ScreenManager::resetInactivityTimer() {
@@ -203,6 +254,18 @@ void ScreenManager::rtSetAutoScreenOff(bool val) {
 PEN_HOOK(void*, _ZN11YSystemBase16onPowerLongPressEv, void* self) {
     mod::ScreenManager::getInstance().setSystemBase(reinterpret_cast<YSystemBase*>(self));
     return origin(self);
+}
+
+// Screen state transitions are reliable user-activity signals: waking the pen
+// consumes the first tap inside the input daemon, so it never reaches Qt.
+PEN_HOOK(void, _ZN11YSystemBase10onScreenOnEv, void* self) {
+    mod::ScreenManager::getInstance().onScreenOn();
+    origin(self);
+}
+
+PEN_HOOK(void, _ZN11YSystemBase11onScreenOffEv, void* self) {
+    mod::ScreenManager::getInstance().onScreenOff();
+    origin(self);
 }
 
 PEN_HOOK(uint64, _ZN7YGlobal27isInPlayerCenterPageChangedEv, uint64 self, uint64 a2, uint64 a3, uint64 a4, uint64 a5) {

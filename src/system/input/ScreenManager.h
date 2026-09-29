@@ -13,6 +13,7 @@
 
 #include "mod/Config.h"
 
+#include <QEvent>
 #include <QTimer>
 
 namespace mod {
@@ -47,6 +48,10 @@ public:
 
     Q_INVOKABLE void reportAction(const QString&);
 
+    // Captures every input event in the application (including plugin pages) so
+    // that any real user interaction resets the inactivity shutdown timer.
+    bool eventFilter(QObject* watched, QEvent* event) override;
+
     // runtime
     void rtSetAutoScreenOff(bool);
 
@@ -60,6 +65,12 @@ public:
     void setSystemBase(YSystemBase* systemBase);
     void resetInactivityTimer();
     void requestPowerOff();
+
+    // Screen state transitions are treated as user activity as well: the tap that
+    // wakes the pen is consumed by the input daemon and may never reach Qt, so a
+    // screen-on event is the only reliable "wake" notification.
+    void onScreenOn();
+    void onScreenOff();
 
 signals:
 
@@ -85,6 +96,8 @@ private:
     bool mAudioLockActive = false;
 
     YSystemBase* mSystemBase = nullptr;
+
+    bool mEventFilterInstalled = false;
 
     // Tmp saving;
     bool      mLrcShowing   = false;

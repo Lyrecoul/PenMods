@@ -17,13 +17,26 @@
 namespace mod {
 
 KeyBoard::KeyBoard() {
-    auto& config  = mod::Config::getInstance();
-    json  aiCfg   = config.read("ai");
+    auto& config         = mod::Config::getInstance();
+    json  aiCfg          = config.read("ai");
     m_autoSendScanConfig = aiCfg.contains("auto_send_scan") ? aiCfg["auto_send_scan"].get<bool>() : true;
+
+    mCfg             = config.read(mClassName);
+    m_keyboardLayout = QString::fromStdString(mCfg.value("layout", std::string("native")));
+    if (m_keyboardLayout != "compact") m_keyboardLayout = "native";
 
     connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView& view, QQmlContext* context) {
         context->setContextProperty("keyBoard", this);
     });
+}
+
+void KeyBoard::setKeyboardLayout(const QString& value) {
+    const QString normalized = value == "compact" ? "compact" : "native";
+    if (m_keyboardLayout == normalized) return;
+    m_keyboardLayout = normalized;
+    mCfg["layout"]   = normalized.toStdString();
+    WRITE_CFG;
+    emit keyboardLayoutChanged();
 }
 
 void KeyBoard::setAutoSendScan(bool value) {

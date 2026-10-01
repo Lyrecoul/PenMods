@@ -138,6 +138,9 @@ Config::Config() : Logger("Config") {
         {"capture", {
             {"enabled", false}
         }},
+        {"keyboard", {
+            {"layout", "native"}
+        }},
         {"ai", {
             {"auto_send_scan", true},
             {"speech_assistant", false},

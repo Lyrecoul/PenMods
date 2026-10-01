@@ -40,6 +40,10 @@ PCH: `src/base/Base.h` (STL, Qt, spdlog, Hook.h). All `.cpp` files use it automa
 
 ## Commands That Must Run Outside the Sandbox
 
+> Environment note: this applies to sandboxed agents such as Codex. On an unsandboxed host (the maintainer's
+> `pi` setup) these commands run directly — `xmake f` / `xmake build` with the Zig toolchain and all `adb`
+> commands are verified working with no special handling.
+
 The following commands require local/host execution (or explicit elevated execution outside the agent sandbox):
 
 - All xmake configure and build commands that use the Zig toolchain, including `xmake f ...` and
@@ -55,6 +59,10 @@ The following commands require local/host execution (or explicit elevated execut
 Resource generation with `scripts/gen_qt_res.sh` only writes inside the repository and may run in the sandbox.
 For the QML workflow below, run the generation step in the sandbox if desired, then run the xmake and ADB steps
 outside it.
+
+If an xmake build fails with `cannot runv(/tmp/.xmake*/zigcc/c++, ...), No such file or directory`, the cached
+Zig compiler wrapper is stale (its `/tmp` path was cleaned, e.g. after a reboot). Re-run `xmake f ...` to
+regenerate it; do not patch the wrapper by hand.
 
 ## Architecture
 
@@ -74,7 +82,7 @@ outside it.
 ### Common Services
 
 - `src/common/Event.h` — Qt signal/slot event bus: `beforeUiInitialization`, `uiCompleted`, `homeButtonPressed`, etc.
-- `src/common/Config` — nlohmann_json backed by `/userdata/PenMods/config.json`; macros `WRITE_CFG` / `UPDATE_CFG`
+- `src/mod/Config` — nlohmann_json backed by `/userdata/PenModsconfig.json` (module dir + `config.json`, no slash); macros `WRITE_CFG` / `UPDATE_CFG`. New keys added to defaults are auto-filled on load.
 - `src/common/Utils.h` — `exec()` (shell), `H()` (DJB2 hash for string dispatch), `showToast()`, `fuzzyLrcMatch()`
 - `src/common/service/Singleton.h` — CRTP base template for all major classes
 
@@ -107,7 +115,9 @@ Package `com.github.penuniverse` (1.0). Context properties registered in Engine.
 
 ### QML Resource Workflow
 
-- Edit the source QML files under `resource/models/YDP02X/`.
+- Edit the source QML files under `resource/models/YDP02X/`. The whole `qml/` tree is listed in
+  `.git/info/exclude`, so it is untracked/ignored by git — only the regenerated `qrc_qml.h` is committed. Stage
+  that generated header together with the C++ changes.
 - `resource/models/YDP02X/qrc_qml.h` is generated output. Never edit or format it manually, including whitespace-only fixes; any manual change will be overwritten by the next resource generation.
 - After any QML or bundled resource change, regenerate, build, and deploy with:
   ```sh
@@ -133,6 +143,20 @@ Package `com.github.penuniverse` (1.0). Context properties registered in Engine.
 
 Plugins live in `/userdisk/PenMods/plugins/<id>/` with `metadata.json` and optional `.so`. The `.so` must export `init_plugin()` and optionally `init_plugin_with_hook_api(PluginHookAPI*)`. `PluginSDK.h` defines the public C ABI. Disabled via `.disabled` marker file.
 
+### Keyboard & Rime
+
+- `mod::KeyBoard` is the `keyBoard` context property and owns `keyboardLayout` (`"native"` / `"compact"`), persisted
+  under the `keyboard` section of the config. The QML character keyboards render from row models:
+  `YInputTextCharsModelBase` is a `Column` of `Row`s, and the `YInputText{Lower,Upper,Number,Symbol}Chars` pages
+  provide the `rows`. Compact mode uses QWERTY (10/9/7) for letters and 7 columns for digits/symbols; native mode
+  reproduces the original 5-per-row `Flow` left-aligned layout.
+- `rime::Backend` is the `rime` context property and wraps librime maintenance/schema APIs: `schemaListJson()`,
+  `selectSchema()`, `redeploy()`, `syncUserData()`. `select_schema` persists the choice to `user.yaml`. Long-running
+  maintenance/sync runs on a `QThreadPool` worker and reports back through queued signals — never block the UI
+  thread. Each `YInputPage` creates its own `RimeWrapper` session, so a changed layout or schema takes effect on the
+  next input-page open.
+- Rime data dir is `/userdisk/Music/Rime` (schema + user data + build staging).
+
 ## Deployment Paths (on-device)
 
 | Path | Content |
@@ -140,7 +164,52 @@ Plugins live in `/userdisk/PenMods/plugins/<id>/` with `metadata.json` and optio
 | `/userdata/PenMods/libPenMods.so` | Main mod library |
 | `/userdata/PenMods/libPenModsResources.so` | Optional Qt resource overrides |
 | `/userdisk/PenMods/plugins/<id>/` | Plugin directory |
-| `/userdisk/PenMods/config.json` | User config |
+| `/userdata/PenModsconfig.json` | User config (note: no slash before `config.json`) |
+| `/userdata/applog/DictPen_<timestamp>.log` | `YoudaoDictPen` stdout: spdlog + QML `console.log` |
+| `/tmp/rime/` | librime logs |
+| `/userdisk/Music/Rime/` | Rime user/shared data dir |
+
+## On-Device UI Verification
+
+The device has no Android `logcat`; `YoudaoDictPen` writes stdout to `/userdata/applog/DictPen_<YYYYMMDD_HHMMSS>.log`.
+QML `console.log(...)` lines appear there prefixed with `[qml]`. After restarting the app, grep that file for
+`ReferenceError|TypeError|Unable to assign|Cannot read|is not a function` to catch broken QML bindings.
+
+### Screen orientation
+
+- The physical panel is 170×320 (portrait) and Weston runs with `transform=270` (`/etc/xdg/weston/weston.ini`), so
+  the logical Qt UI is 320×170 landscape. `weston-screenshooter`, `evtest`, `/dev/uinput`, and `/dev/fb0` exist on
+  the device, but `/dev/fb0` is blank and the screenshooter debug protocol is disabled by default.
+
+### Screenshots
+
+`weston-screenshooter` needs Weston's debug protocol. Temporarily:
+
+1. Back up `/etc/init.d/S50launcher` and add `--debug` to the `weston ...` command (~line 96).
+2. Reboot (or restart Weston).
+3. `adb shell 'cd /tmp && XDG_RUNTIME_DIR=/var/run WAYLAND_DISPLAY=wayland-0 weston-screenshooter'`, then pull the
+   resulting `wayland-screenshot-*.png`. It is portrait 170×320; rotate 270° (`PIL: img.rotate(270, expand=True)`)
+   to get the 320×170 UI.
+4. Restore the original `/etc/init.d/S50launcher` and reboot when done.
+
+### Touch injection (for UI navigation)
+
+The touchscreen `hyn_ts` reports `ABS_MT_POSITION_X 0..170`, `ABS_MT_POSITION_Y 0..320`, `INPUT_PROP_DIRECT`. Create a
+`/dev/uinput` device with the same geometry and emit MT events. Map a landscape UI point `(lx, ly)` to raw device
+coordinates: `raw_x = ly`, `raw_y = 319 - lx`. Cross-compile the injector for the device:
+
+```sh
+zig cc -target aarch64-linux-gnu.2.27 -O2 -o injector injector.c   # glibc target cannot be -static
+```
+
+Navigation facts: the home page (`YIndexPage`) is a horizontal scroll list (items 112×102) whose last entry is
+`更多设置` → `YSettingPage`; the settings grid is a single vertical column of 58px cells.
+
+### Quick layout checks without touch
+
+`keyBoard.keyboardLayout` is persisted in `/userdata/PenModsconfig.json`. For a no-touch check, edit that JSON
+(`"layout": "compact"` / `"native"`) and restart the app; the preloaded `YInputPage` (`main.qml`
+`preloadMainKeyboard`) instantiates all four character pages at startup, so the layout is exercised immediately.
 
 ## Code Style
 

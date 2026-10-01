@@ -23,6 +23,8 @@ class MusicPlayer : public QObject, public Singleton<MusicPlayer>, private Logge
 
     Q_PROPERTY(bool pauseOnScan READ getPauseOnScan WRITE setPauseOnScan NOTIFY pauseOnScanChanged);
     Q_PROPERTY(bool hideFloatingWindow READ getHideFloatingWindow WRITE setHideFloatingWindow NOTIFY hideFloatingWindowChanged);
+    // 下拉面板上次停留的视图: true = 音乐控制, false = 快捷设置
+    Q_PROPERTY(bool quickPanelMusicView READ getQuickPanelMusicView WRITE setQuickPanelMusicView NOTIFY quickPanelMusicViewChanged);
     Q_PROPERTY(bool shutdownTimerEnabled READ shutdownTimerEnabled NOTIFY shutdownTimerChanged);
     Q_PROPERTY(int shutdownTimerMinutes READ shutdownTimerMinutes NOTIFY shutdownTimerChanged);
     Q_PROPERTY(bool shutdownAfterPlaylist READ shutdownAfterPlaylist WRITE setShutdownAfterPlaylist NOTIFY shutdownTimerChanged);
@@ -57,6 +59,8 @@ public:
     [[nodiscard]] bool getHideFloatingWindow() const;
     void setHideFloatingWindow(bool hidden);
 
+    [[nodiscard]] bool getQuickPanelMusicView() const;
+    void setQuickPanelMusicView(bool showMusicControls);
 
     /// 供 QML 调用：将当前音频定位到指定的毫秒位置
     Q_INVOKABLE void seekToPosition(qint64 position);
@@ -82,6 +86,7 @@ public:
 signals:
     void pauseOnScanChanged();
     void hideFloatingWindowChanged();
+    void quickPanelMusicViewChanged();
     void shutdownTimerChanged();
     void stopRequested();
 
@@ -113,6 +118,7 @@ private:
     QString mTempAudioLink;
     bool    mPauseOnScan{false};
     bool    mHideFloatingWindow{false};
+    bool    mQuickPanelMusicView{false};
     QTimer  mShutdownTimer;
     int     mShutdownTimerMinutes{0};
     bool    mShutdownPending{false};

@@ -27,9 +27,10 @@ namespace mod::filemanager {
 bool MusicPlayer::mIsTakeOver{false};
 
 MusicPlayer::MusicPlayer() : Logger("MusicPlayer") {
-    const auto cfg      = Config::getInstance().read("fm");
-    mPauseOnScan        = cfg.value("pause_on_scan", false);
-    mHideFloatingWindow = cfg.value("hide_floating_window", false);
+    const auto cfg       = Config::getInstance().read("fm");
+    mPauseOnScan         = cfg.value("pause_on_scan", false);
+    mHideFloatingWindow  = cfg.value("hide_floating_window", false);
+    mQuickPanelMusicView = cfg.value("quick_panel_music_view", false);
 
     connect(&Event::getInstance(), &Event::ocrStarted, this, &MusicPlayer::onOcrStarted);
     connect(&mShutdownTimer, &QTimer::timeout, this, [this]() {
@@ -286,6 +287,19 @@ void MusicPlayer::setHideFloatingWindow(bool hidden) {
     cfg["hide_floating_window"] = hidden;
     Config::getInstance().write("fm", std::move(cfg));
     emit hideFloatingWindowChanged();
+}
+
+bool MusicPlayer::getQuickPanelMusicView() const { return mQuickPanelMusicView; }
+
+void MusicPlayer::setQuickPanelMusicView(bool showMusicControls) {
+    if (mQuickPanelMusicView == showMusicControls) {
+        return;
+    }
+    mQuickPanelMusicView          = showMusicControls;
+    auto cfg                      = Config::getInstance().read("fm");
+    cfg["quick_panel_music_view"] = showMusicControls;
+    Config::getInstance().write("fm", std::move(cfg));
+    emit quickPanelMusicViewChanged();
 }
 
 void MusicPlayer::setShutdownAfterPlaylist(bool enabled) {

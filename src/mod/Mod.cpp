@@ -178,6 +178,8 @@ PEN_HOOK(bool, license_verify) { return true; }
 
 #include "locker/Locker.h"
 
+#include "media/MediaSession.h"
+
 #include "mod/Updater.h"
 
 #include "recorder/AudioRecorder.h"
@@ -237,6 +239,9 @@ __attribute__((constructor)) static void BeforeMain() {
     INSTANCE(Downloader);
     INSTANCE(Event);
     INSTANCE(Resource);
+
+    // media
+    INSTANCE(MediaSession);
 
     // filemanager
     INSTANCE(filemanager::MusicPlayer);

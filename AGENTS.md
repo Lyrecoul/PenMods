@@ -111,7 +111,7 @@ regenerate it; do not patch the wrapper by hand.
 
 ### QML Integration
 
-Package `com.github.penuniverse` (1.0). Context properties registered in Engine.cpp or constructors: `mod`, `musicPlayer`, `videoPlayer`, `textReader`, `fileManager`, `imageViewer`, `workBookTweaks`, `queryTweaks`, `columnDb`, `batteryInfo`, `locker`, `wallpaperManager`. `PageIndex` is an uncreatable enum type. **All QML must fit 320×170 touchscreen** — prefer Youdao custom components over stock QML.
+Package `com.github.penuniverse` (1.0). Context properties registered in Engine.cpp or constructors: `mod`, `musicPlayer`, `videoPlayer`, `textReader`, `fileManager`, `imageViewer`, `workBookTweaks`, `queryTweaks`, `columnDb`, `batteryInfo`, `locker`, `wallpaperManager`, `mediaSession`. `PageIndex` and `MediaSession` are uncreatable enum types. **All QML must fit 320×170 touchscreen** — prefer Youdao custom components over stock QML.
 
 ### QML Resource Workflow
 
@@ -141,7 +141,7 @@ Package `com.github.penuniverse` (1.0). Context properties registered in Engine.
 
 ### Plugin System
 
-Plugins live in `/userdisk/PenMods/plugins/<id>/` with `metadata.json` and optional `.so`. The `.so` must export `init_plugin()` and optionally `init_plugin_with_hook_api(PluginHookAPI*)`. `PluginSDK.h` defines the public C ABI. Disabled via `.disabled` marker file.
+Plugins live in `/userdisk/PenMods/plugins/<id>/` with `metadata.json` and optional `.so`. The `.so` must export `init_plugin()` and optionally `init_plugin_with_hook_api(PluginHookAPI*)` or `init_plugin_with_media_api(PluginMediaAPI*)`. `PluginSDK.h` defines the public C ABI. Disabled via `.disabled` marker file. The `mediaSession` context property (src/media/MediaSession) lets a plugin that plays its own audio surface its track in the quick-settings panel; `YQuickMusicPlayer.qml`/`YQuickSettingLayer.qml` prefer an active plugin session over `mediaPlayerManager`.
 
 ### Keyboard & Rime
 

@@ -88,6 +88,19 @@ extern "C" void init_plugin_with_hook_api(PluginHookAPI* hook_api) {
 
 框架在 `init_plugin()` 完成后调用此函数并注入 `PluginHookAPI*`。只需要 Hook 系统函数时才需要导出此符号。详见 [Hook API](#hook-api) 一节。
 
+### `init_plugin_with_media_api` — 媒体会话（可选）
+
+```cpp
+PluginMediaAPI* g_media_api = nullptr;
+
+extern "C" void init_plugin_with_media_api(PluginMediaAPI* media_api) {
+    g_media_api = media_api;
+    // 在此上报播放内容，并注册控制回调
+}
+```
+
+框架在 `init_plugin()` 完成后调用此函数并注入 `PluginMediaAPI*`。插件自己播放音频时，导出此符号即可把播放内容显示到系统下拉面板的音乐控制区。详见 [媒体会话](#媒体会话下拉面板音乐控制) 一节。
+
 ### `attach_engine` — QML 引擎就绪（可选）
 
 ```cpp
@@ -206,6 +219,106 @@ Loader {
 插件 QML 文件中可以使用所有已注册的 context property，包括插件自己在 `attach_engine` 中注册的对象。
 
 **屏幕尺寸：** 目标设备屏幕为 320×170，QML 布局须适配此分辨率。优先使用 Youdao 原生 QML 组件而非标准 Qt Quick Controls。
+
+---
+
+## 媒体会话（下拉面板音乐控制）
+
+插件自己播放音频（不走宿主播放器）时，通过媒体会话把播放内容上报给宿主，
+系统的下拉快捷设置面板就会出现音乐控制区，并能控制播放 / 暂停 / 上一首 / 下一首。
+
+宿主提供了一个 context property `mediaSession`，同一时刻只允许一个插件持有会话；
+没有任何插件会话时，面板自动回落到宿主播放器，所以不影响原有行为。
+
+### QML 插件用法
+
+```qml
+import QtQuick 2.12
+import com.github.penuniverse 1.0   // 为了使用 MediaSession.Playing 等枚举
+
+Item {
+    Component.onCompleted: {
+        mediaSession.begin("com.example.myplugin")   // 与 metadata.json 的 id 一致
+        mediaSession.title = "Song"
+        mediaSession.artist = "Artist"
+        mediaSession.duration = 180000               // ms，0 表示未知
+        mediaSession.position = 0                    // ms，插件只需在开始 / 跳转时校正
+        mediaSession.setLyrics("当前歌词行", "翻译")
+        mediaSession.playState = MediaSession.Playing
+    }
+
+    Connections {
+        target: mediaSession
+        function onPlayRequested() { /* ... */ mediaSession.playState = MediaSession.Playing }
+        function onPauseRequested() { /* ... */ mediaSession.playState = MediaSession.Paused }
+        function onNextRequested() { /* ... */ }
+        function onPrevRequested() { /* ... */ }
+        function onStopRequested() { /* 停止播放 */ mediaSession.end() }
+        function onSeekRequested(ms) { /* ... */ }
+        function onOpenRequested() { /* 打开插件自己的播放页，可选 */ }
+        function onSessionRevoked() { /* 被其它插件接管，应停止播放并 end() */ }
+    }
+}
+```
+
+| 成员 | 说明 |
+|---|---|
+| `begin(pluginId)` / `end()` | 声明 / 释放会话，失败返回 false |
+| `active`（只读） | 面板据此选择数据源 |
+| `title` / `artist` / `album` / `cover` | 曲目信息，`cover` 可为 URL 或本地路径 |
+| `duration` / `position`（ms） | 进度；会话激活且处于播放状态时宿主会自行按 500ms 推进，插件只需在开始 / 跳转时校正 |
+| `playState` | `MediaSession.Stopped` / `MediaSession.Playing` / `MediaSession.Paused` |
+| `setLyrics(main, trans)` | 当前歌词行，传空串表示没有歌词 |
+| 控制信号 | `playRequested` / `pauseRequested` / `toggleRequested` / `nextRequested` / `prevRequested` / `stopRequested` / `seekRequested(ms)` / `openRequested` |
+
+面板顶部的进度条用 `position / duration` 计算；`duration` 为 0 时进度条为空。
+
+### C / C++ 插件用法
+
+导出 `init_plugin_with_media_api`，用注入的 `PluginMediaAPI` 上报状态：
+
+```cpp
+PluginMediaAPI* g_media_api = nullptr;
+static void* g_session = nullptr;
+
+static void on_media_pause(void* user) { my_player_pause(); }
+
+extern "C" void init_plugin_with_media_api(PluginMediaAPI* api) {
+    g_media_api = api;
+
+    g_session = api->beginSession("com.example.myplugin");
+    api->setTrack(g_session, "Song", "Artist", "Album", nullptr);
+    api->setDuration(g_session, 180000);
+    api->setPosition(g_session, 0);
+    api->setLyrics(g_session, "当前歌词行", nullptr);
+    api->setPlayState(g_session, PLUGIN_MEDIA_PLAYING);
+
+    PluginMediaCallbacks cbs = { 0 };
+    cbs.structSize = sizeof(cbs);
+    cbs.onPause = on_media_pause;
+    api->setCallbacks(g_session, &cbs, nullptr);
+}
+```
+
+| 函数 | 说明 |
+|---|---|
+| `beginSession(pluginId)` | 返回会话 handle，失败返回 NULL |
+| `endSession(handle)` | 释放会话 |
+| `setTrack(handle, title, artist, album, cover)` | 每次调用整体替换，NULL 表示该字段为空 |
+| `setPlayState(handle, state)` | 取值见 `PluginMediaPlayState` |
+| `setPosition` / `setDuration` | 单位 ms |
+| `setLyrics(handle, main, trans)` | NULL 表示清空 |
+| `setCallbacks(handle, cbs, user)` | 注册控制回调，返回 0 表示成功 |
+
+`PluginMediaAPI` / `PluginMediaCallbacks` 都以 `structSize` 开头，向后兼容；
+所有函数可从任意线程调用，宿主会自行 marshal 到 UI 线程，但回调在 UI 线程执行，
+回调里不要做阻塞操作。
+
+### 生命周期
+
+插件被禁用或卸载时，`PluginManager` 会自动释放它持有的会话，面板回落宿主播放器。
+如果插件选择主动结束（例如播放完毕），记得自己调用 `end()` / `endSession()`，
+否则面板会一直显示最后上报的内容。
 
 ---
 

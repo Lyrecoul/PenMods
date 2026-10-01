@@ -2,6 +2,7 @@
 #include "PluginSDK.h"
 #include "QmlPluginWrapper.h"
 #include "common/Event.h"
+#include "media/MediaSession.h"
 #include <QDir>
 #include <QFile>
 #include <QJsonArray>
@@ -232,6 +233,7 @@ bool PluginManager::loadSo(PluginInfo& info) {
         m_loadedLibraries.insert(info.id, lib);
         info.isLoaded = true;
         initializePluginHookAPI(info.id, lib);
+        initializePluginMediaAPI(info.id, lib);
         spdlog::info("Successfully loaded SO: {}", info.id.toStdString());
         return true;
     }
@@ -257,6 +259,9 @@ void PluginManager::setPluginPersistence(const PluginInfo& info, bool enable) {
 }
 
 void PluginManager::unloadSo(const QString& pluginId) {
+    // 插件卸载前先释放它持有的媒体会话，避免面板停留在一张没有内容的页面。
+    MediaSession::getInstance().releaseFor(pluginId);
+
     QLibrary* lib = m_loadedLibraries.take(pluginId);
     if (!lib) return;
     if (lib->isLoaded()) {
@@ -400,6 +405,27 @@ void PluginManager::initializePluginHookAPI(const QString& id, QLibrary* lib) {
         spdlog::info("Hook API initialized for plugin: {}", id.toStdString());
     } catch (const std::exception& e) {
         spdlog::error("Exception in init_plugin_with_hook_api for plugin {}: {}", id.toStdString(), e.what());
+    }
+}
+
+void PluginManager::initializePluginMediaAPI(const QString& id, QLibrary* lib) {
+    if (!lib || !lib->isLoaded()) return;
+
+    typedef void (*InitPluginWithMediaAPIFunc)(PluginMediaAPI*);
+    auto initWithMediaApi = reinterpret_cast<InitPluginWithMediaAPIFunc>(
+        lib->resolve("init_plugin_with_media_api")
+    );
+
+    if (!initWithMediaApi) {
+        spdlog::debug("Plugin {} does not export init_plugin_with_media_api(), skipped.", id.toStdString());
+        return;
+    }
+
+    try {
+        initWithMediaApi(MediaSession::pluginApi());
+        spdlog::info("Media API initialized for plugin: {}", id.toStdString());
+    } catch (const std::exception& e) {
+        spdlog::error("Exception in init_plugin_with_media_api for plugin {}: {}", id.toStdString(), e.what());
     }
 }
 

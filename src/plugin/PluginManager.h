@@ -44,6 +44,7 @@ private:
     void setPluginPersistence(const PluginInfo& info, bool enable);
     void attachEngineToLoadedPlugins();
     void initializePluginHookAPI(const QString& id, QLibrary* lib);
+    void initializePluginMediaAPI(const QString& id, QLibrary* lib);
 
     friend class Singleton<PluginManager>;
 };

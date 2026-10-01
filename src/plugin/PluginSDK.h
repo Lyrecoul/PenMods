@@ -70,6 +70,119 @@ typedef struct {
     int (*hookFunction)(void* targetAddr, void* detourFunc, void** originalFunc);
 } PluginHookAPI;
 
+// ==================== Media API ====================
+
+/**
+ * @brief 媒体会话 ABI 版本，宿主填入 PluginMediaAPI::abiVersion
+ */
+#define PLUGIN_MEDIA_ABI_VERSION 1u
+
+/**
+ * @brief 播放状态，取值与 MediaSession::PlayState 一致
+ */
+typedef enum PluginMediaPlayState {
+    PLUGIN_MEDIA_STOPPED = 0,
+    PLUGIN_MEDIA_PLAYING = 1,
+    PLUGIN_MEDIA_PAUSED  = 2,
+} PluginMediaPlayState;
+
+/**
+ * @brief 控制事件回调
+ *
+ * 面板上的按钮会触发这些回调，全部在 UI 线程调用，回调里不要做阻塞操作。
+ * structSize 必须填 sizeof(PluginMediaCallbacks)。
+ */
+typedef struct PluginMediaCallbacks {
+    uint32_t structSize;
+    void (*onPlay)(void* user);
+    void (*onPause)(void* user);
+    void (*onToggle)(void* user);
+    void (*onNext)(void* user);
+    void (*onPrev)(void* user);
+    void (*onStop)(void* user);
+    void (*onSeek)(void* user, int64_t positionMs);
+    void (*onOpen)(void* user);
+} PluginMediaCallbacks;
+
+/**
+ * @brief 媒体会话接口 - 供外部插件使用
+ *
+ * PluginManager 会在调用插件的 init_plugin_with_media_api 时注入此接口。
+ * 插件把自己的播放内容上报到这里，系统下拉面板的音乐控制区就会显示并控制它；
+ * 插件停止时调用 endSession()，面板会自动回落宿主播放器。
+ *
+ * 所有函数都可以从任意线程调用，宿主会自行 marshal 到 UI 线程。
+ *
+ * 示例：
+ *   static void* g_session = NULL;
+ *
+ *   static void on_media_pause(void* user) { my_player_pause(); }
+ *
+ *   void start() {
+ *       g_session = g_media_api->beginSession("com.example.myplugin");
+ *       g_media_api->setTrack(g_session, "Song", "Artist", "Album", NULL);
+ *       g_media_api->setDuration(g_session, 180000);
+ *       g_media_api->setPlayState(g_session, PLUGIN_MEDIA_PLAYING);
+ *
+ *       PluginMediaCallbacks cbs = { 0 };
+ *       cbs.structSize = sizeof(cbs);
+ *       cbs.onPause = on_media_pause;
+ *       g_media_api->setCallbacks(g_session, &cbs, NULL);
+ *   }
+ */
+typedef struct PluginMediaAPI {
+    uint32_t structSize;   //!< 由宿主填充，插件只读
+    uint32_t abiVersion;   //!< 由宿主填充，插件只读；当前为 PLUGIN_MEDIA_ABI_VERSION
+
+    /**
+     * @brief 声明媒体会话
+     * @param pluginId 插件唯一标识（与 metadata.json 的 id 一致），不能为 NULL
+     * @return 会话 handle，失败返回 NULL
+     *
+     * 同一时刻只允许一个插件持有会话；后调用者会接管，旧持有者收到 onStop 回调。
+     */
+    void* (*beginSession)(const char* pluginId);
+
+    /**
+     * @brief 释放媒体会话，面板回落到宿主播放器
+     */
+    void (*endSession)(void* handle);
+
+    /**
+     * @brief 上报曲目信息（每次调用会整体替换，NULL 或空串表示该字段为空）
+     * @param cover 封面 URL 或本地路径，可为 NULL
+     */
+    void (*setTrack)(void* handle, const char* title, const char* artist, const char* album, const char* cover);
+
+    /**
+     * @brief 上报播放状态
+     * @param state PluginMediaPlayState 取值
+     */
+    void (*setPlayState)(void* handle, int state);
+
+    /**
+     * @brief 上报播放进度；会话激活期间宿主会自行按秒推进，插件只需在开始 / 跳转时校正
+     */
+    void (*setPosition)(void* handle, int64_t positionMs);
+
+    /**
+     * @brief 上报总时长，0 表示未知
+     */
+    void (*setDuration)(void* handle, int64_t durationMs);
+
+    /**
+     * @brief 上报当前歌词行，NULL 表示清空
+     * @param transLyric 翻译歌词，可为 NULL
+     */
+    void (*setLyrics)(void* handle, const char* mainLyric, const char* transLyric);
+
+    /**
+     * @brief 注册控制事件回调
+     * @return 0 表示成功，非 0 表示 handle 已失效
+     */
+    int (*setCallbacks)(void* handle, const PluginMediaCallbacks* callbacks, void* user);
+} PluginMediaAPI;
+
 // ==================== 便利宏定义（供插件使用） ====================
 
 /**
@@ -85,6 +198,20 @@ typedef struct {
  *   }
  */
 extern PluginHookAPI* g_hook_api;
+
+/**
+ * @brief 全局媒体接口指针（插件应该在 init_plugin_with_media_api 中初始化）
+ *
+ * 示例：
+ *   extern PluginMediaAPI* g_media_api;
+ *
+ *   extern "C" {
+ *       void init_plugin_with_media_api(PluginMediaAPI* media_api) {
+ *           g_media_api = media_api;
+ *       }
+ *   }
+ */
+extern PluginMediaAPI* g_media_api;
 
 /**
  * @brief 查询符号地址的便利宏

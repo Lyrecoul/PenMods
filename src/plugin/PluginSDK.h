@@ -148,14 +148,17 @@ typedef struct PluginMediaAPI {
     /**
      * @brief 声明媒体会话
      * @param pluginId 插件唯一标识（与 metadata.json 的 id 一致），不能为 NULL
-     * @return 会话 handle，失败返回 NULL
+     * @return 会话 handle（不透明令牌），失败返回 NULL
      *
-     * 同一时刻只允许一个插件持有会话；后调用者会接管，旧持有者收到 onStop 回调。
+     * 同一时刻只允许一个插件持有会话；后调用者会接管，旧持有者收到 onSessionRevoked 回调。
+     * 被接管后旧 handle 立即失效，后续用它的调用一律被丢弃（可重新 beginSession 拿新 handle）。
      */
     void* (*beginSession)(const char* pluginId);
 
     /**
      * @brief 释放媒体会话，面板回落到宿主播放器
+     *
+     * 只有当前属主的 handle 有效，陈旧 handle 调用是 no-op。
      */
     void (*endSession)(void* handle);
 

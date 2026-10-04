@@ -31,27 +31,63 @@ namespace {
 // 插件 C ABI
 //
 // 插件可能在任意线程调用，这里统一把状态变更 marshal 到 UI 线程；
-// handle 只是一次 begin/end 周期内的不透明令牌，用来丢弃过期插件的调用。
+// handle 是一次 begin/end 周期内的不透明令牌，用来丢弃过期插件的调用。
+//
+// 令牌是单调递增的整数（编码在 void* 里）而不是指针：指针版本会在接管时
+// delete + new，分配器复用同一地址，于是被接管插件的陈旧 handle 仍然“存活”，
+// 能误操作新属主的会话。整数令牌永不复用，天然作废。
+//
+// 状态全部放在函数内静态对象里：插件是在 BeforeMain 里加载的，文件级静态对象
+// （尤其是 QString 这种非平凡构造的）此时可能还没构造，直接用会空指针崩溃。
 // ------------------------------------------------------------------
 
-struct MediaSessionHandle {
-    QString pluginId;
+struct MediaApiState {
+    uint64_t             nextHandle{0};    // 只增不减
+    uint64_t             currentHandle{0}; // 0 表示当前没有发出去的 C 侧 handle
+    QString              handlePluginId;
+    QMutex               mutex;
+    PluginMediaCallbacks callbacks{};
+    void*                callbackUser{nullptr};
+    bool                 hasCallbacks{false};
 };
 
-QMutex               g_mutex;
-MediaSessionHandle*  g_handle{nullptr};
-PluginMediaCallbacks g_callbacks{};
-void*                g_callbackUser{nullptr};
-bool                 g_hasCallbacks{false};
+MediaApiState& state() {
+    static MediaApiState s;
+    return s;
+}
 
 template <typename F>
 void postToUi(F&& fn) {
     QMetaObject::invokeMethod(&MediaSession::getInstance(), std::forward<F>(fn), Qt::QueuedConnection);
 }
 
+void* toHandle(uint64_t token) { return reinterpret_cast<void*>(static_cast<uintptr_t>(token)); }
+
+/// 需持有 state().mutex
+bool handleAliveLocked(void* handle) {
+    return handle != nullptr && static_cast<uint64_t>(reinterpret_cast<uintptr_t>(handle)) == state().currentHandle;
+}
+
 bool handleAlive(void* handle) {
-    QMutexLocker locker(&g_mutex);
-    return handle != nullptr && handle == g_handle;
+    QMutexLocker locker(&state().mutex);
+    return handleAliveLocked(handle);
+}
+
+/// 会话结束后作废 C 侧 handle。
+void clearHandle() {
+    QMutexLocker locker(&state().mutex);
+    state().currentHandle = 0;
+    state().handlePluginId.clear();
+}
+
+/// 会话易主时调用：C 侧 handle 不属于新属主就作废，否则旧属主的上报仍会被当成当前会话接收。
+void discardHandleUnlessOwnedBy(const QString& pluginId) {
+    QMutexLocker locker(&state().mutex);
+    if (state().currentHandle == 0 || state().handlePluginId == pluginId) {
+        return;
+    }
+    state().currentHandle = 0;
+    state().handlePluginId.clear();
 }
 
 void* apiBeginSession(const char* pluginId) {
@@ -60,27 +96,27 @@ void* apiBeginSession(const char* pluginId) {
         return nullptr;
     }
 
-    QMutexLocker locker(&g_mutex);
-    if (g_handle && g_handle->pluginId == id) {
-        return g_handle;
+    QMutexLocker locker(&state().mutex);
+    if (state().currentHandle != 0 && state().handlePluginId == id) {
+        return toHandle(state().currentHandle);
     }
-    delete g_handle;
-    g_handle     = new MediaSessionHandle{id};
-    void* handle = g_handle;
+    state().currentHandle  = ++state().nextHandle;
+    state().handlePluginId = id;
+    const uint64_t token   = state().currentHandle;
     locker.unlock();
 
     postToUi([id] { MediaSession::getInstance().begin(id); });
-    return handle;
+    return toHandle(token);
 }
 
 void apiEndSession(void* handle) {
     {
-        QMutexLocker locker(&g_mutex);
-        if (handle == nullptr || handle != g_handle) {
+        QMutexLocker locker(&state().mutex);
+        if (!handleAliveLocked(handle)) {
             return;
         }
-        delete g_handle;
-        g_handle = nullptr;
+        state().currentHandle = 0;
+        state().handlePluginId.clear();
     }
     postToUi([] { MediaSession::getInstance().end(); });
 }
@@ -145,49 +181,49 @@ int apiSetCallbacks(void* handle, const PluginMediaCallbacks* callbacks, void* u
     const bool has = callbacks != nullptr;
     // 回调状态只在 UI 线程读写（dispatch* 也在 UI 线程）。
     postToUi([copy, has, user] {
-        g_callbacks    = copy;
-        g_callbackUser = user;
-        g_hasCallbacks = has;
+        state().callbacks    = copy;
+        state().callbackUser = user;
+        state().hasCallbacks = has;
     });
     return 0;
 }
 
 void dispatchPlay() {
-    if (g_hasCallbacks && g_callbacks.onPlay) g_callbacks.onPlay(g_callbackUser);
+    if (state().hasCallbacks && state().callbacks.onPlay) state().callbacks.onPlay(state().callbackUser);
 }
 void dispatchPause() {
-    if (g_hasCallbacks && g_callbacks.onPause) g_callbacks.onPause(g_callbackUser);
+    if (state().hasCallbacks && state().callbacks.onPause) state().callbacks.onPause(state().callbackUser);
 }
 void dispatchToggle() {
-    if (g_hasCallbacks && g_callbacks.onToggle) g_callbacks.onToggle(g_callbackUser);
+    if (state().hasCallbacks && state().callbacks.onToggle) state().callbacks.onToggle(state().callbackUser);
 }
 void dispatchNext() {
-    if (g_hasCallbacks && g_callbacks.onNext) g_callbacks.onNext(g_callbackUser);
+    if (state().hasCallbacks && state().callbacks.onNext) state().callbacks.onNext(state().callbackUser);
 }
 void dispatchPrev() {
-    if (g_hasCallbacks && g_callbacks.onPrev) g_callbacks.onPrev(g_callbackUser);
+    if (state().hasCallbacks && state().callbacks.onPrev) state().callbacks.onPrev(state().callbackUser);
 }
 void dispatchStop() {
-    if (g_hasCallbacks && g_callbacks.onStop) g_callbacks.onStop(g_callbackUser);
+    if (state().hasCallbacks && state().callbacks.onStop) state().callbacks.onStop(state().callbackUser);
 }
 void dispatchSeek(int position) {
-    if (g_hasCallbacks && g_callbacks.onSeek) g_callbacks.onSeek(g_callbackUser, position);
+    if (state().hasCallbacks && state().callbacks.onSeek) state().callbacks.onSeek(state().callbackUser, position);
 }
 void dispatchOpen() {
-    if (g_hasCallbacks && g_callbacks.onOpen) g_callbacks.onOpen(g_callbackUser);
+    if (state().hasCallbacks && state().callbacks.onOpen) state().callbacks.onOpen(state().callbackUser);
 }
 
 void clearCallbacks() {
-    g_hasCallbacks = false;
-    g_callbackUser = nullptr;
-    g_callbacks    = {};
+    state().hasCallbacks = false;
+    state().callbackUser = nullptr;
+    state().callbacks    = {};
 }
 
 // 会话被接管：先通知旧属主，然后清掉它的回调。会话已经易主，这些回调不再有效，
 // 留着会让下一次接管把它们误当成当前属主。
 void dispatchRevoked() {
-    if (g_hasCallbacks && g_callbacks.onSessionRevoked) {
-        g_callbacks.onSessionRevoked(g_callbackUser);
+    if (state().hasCallbacks && state().callbacks.onSessionRevoked) {
+        state().callbacks.onSessionRevoked(state().callbackUser);
     }
     clearCallbacks();
 }
@@ -224,12 +260,13 @@ MediaSession::MediaSession() : Logger("MediaSession") {
     // 会话被接管时通知旧属主的 onSessionRevoked（没有注册则该回调为空）。
     connect(this, &MediaSession::sessionRevoked, this, &dispatchRevoked);
 
-    // 会话结束后清掉 C ABI 回调，否则插件被卸载后面板再发控制事件就是野指针。
+    // 会话结束后清掉 C ABI 回调与 handle，否则插件被卸载后面板再发控制事件就是野指针。
     connect(this, &MediaSession::activeChanged, this, [] {
         if (MediaSession::getInstance().active()) {
             return;
         }
         clearCallbacks();
+        clearHandle();
     });
 
     connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView& view, QQmlContext* context) {
@@ -283,6 +320,11 @@ bool MediaSession::begin(const QString& pluginId) {
     if (mActive && mOwnerPluginId == pluginId) {
         return true;
     }
+
+    // C 侧 handle 必须属于当前属主：被 QML 插件接管后，旧 C 插件的 handle 立即作废。
+    // （C -> C 的接管由 apiBeginSession 同步换发新令牌，这里会保留它。）
+    discardHandleUnlessOwnedBy(pluginId);
+
     if (mActive) {
         info("Media session '{}' taken over by '{}'.", mOwnerPluginId.toStdString(), pluginId.toStdString());
         // 收到 sessionRevoked 的必然是旧属主。它此时调 end() 会误关即将接管的新会话，

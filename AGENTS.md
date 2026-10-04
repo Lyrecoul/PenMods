@@ -385,6 +385,21 @@ Then add an entry to `updates.json` (`size`/`md5` are those of the **zip**, not 
 }
 ```
 
+### jsDelivr 刷新纪律(否则每次发布都会被卡住)
+
+- 设备拉的是 `@main/updates.json`,jsDelivr 给它的响应头是 `cache-control: public,
+  max-age=604800, s-maxage=43200` —— **CDN 层缓存 12 小时,且每个边缘节点独立缓存**。所以发布后
+  "有的设备看得到新版本、有的看不到"是正常现象,不是发布失败。
+- `purge.jsdelivr.net` 是唯一能让它立刻生效的手段,但它**按路径限流**:连着 purge 几次之后会返回
+  `"throttled": true` 和 `throttlingReset`(约 3300 秒的滚动窗口)。**换 IP 不能重置**——限流跟路径走,
+  不跟来源走。实测:同一路径连续 purge 5 次后,窗口内再 purge 全部被拒。
+- 因此**每个版本只 purge 一次**,就在推送之后立刻做。若已经被限流,只能等窗口过去或等 12 小时的 TTL。
+- 判断"发布是否成功"要看 GitHub 和**带 tag 的产物 URL**(`@vX.Y.Z/update_*.zip` 是全新路径,
+  不受缓存影响,md5 必须与清单一致),不要用 `@main` 的响应来判断。
+- 查询字符串(`?cb=123`)对 jsDelivr 的缓存**无效**,不要指望用它绕过。
+- (备选方案:把 `updates.json` 放到 `raw.githubusercontent.com`,TTL 只有 5 分钟,但国内可达性存疑;
+  真要做建议给 `Updater` 加多个 URL 回退。目前不改。)
+
 Manifest rules enforced by `Updater::check()`: every entry the device may be running must be listed, otherwise the
 check aborts with `Cannot get self version from mod_versions`; keep older entries alongside new ones. An optional
 `"next": [X, Y, Z]` on an entry forces the upgrade path to that version instead of the highest in the list.

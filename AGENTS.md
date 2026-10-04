@@ -250,8 +250,10 @@ adb shell 'md5sum /dev/block/by-name/misc'   # must be 50e0f9d40f6912cbff7ac89b7
 adb shell 'reboot'
 ```
 
-Note: plugin init runs *after* `loadSo()` deletes its `.loading` marker, so a crash inside `init_plugin_with_media_api`
-is never auto-disabled — it loops until the firmware gives up and reboots to recovery.
+`loadSo()` keeps the `.loading` marker until `init_plugin`, `attach_engine`, `init_plugin_with_hook_api` and
+`init_plugin_with_media_api` have all returned, so a crash in any of them is covered by the crash self-heal (the plugin
+is auto-disabled on the next start). Keep that ordering: removing the marker earlier turns any init crash into an
+infinite crash loop, which the firmware escalates into a `misc` `boot-recovery` reboot.
 
 ## Deployment Paths (on-device)
 

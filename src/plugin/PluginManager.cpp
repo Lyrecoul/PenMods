@@ -228,12 +228,16 @@ bool PluginManager::loadSo(PluginInfo& info) {
             }
         }
 
-        // ---- 阶段 3: 注册到 map，再初始化 Hook API ----
-        QFile::remove(loadingFlagPath);
+        // ---- 阶段 3: 注册到 map，再初始化 Hook / Media API ----
         m_loadedLibraries.insert(info.id, lib);
         info.isLoaded = true;
         initializePluginHookAPI(info.id, lib);
         initializePluginMediaAPI(info.id, lib);
+
+        // 到这里才算加载完：init_plugin_with_media_api 等回调里的崩溃也要能被崩溃自愈覆盖，
+        // 所以标记必须留到最后才删（否则插件会无限崩溃重启，把设备拖进 recovery）。
+        QFile::remove(loadingFlagPath);
+
         spdlog::info("Successfully loaded SO: {}", info.id.toStdString());
         return true;
     }

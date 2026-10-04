@@ -176,7 +176,14 @@ Plugins live in `/userdisk/PenMods/plugins/<id>/` with `metadata.json` and optio
   owner) as the plugin-facing release, and keep the `mRevoking` guard around the `sessionRevoked` emit — a takeover
   must not let the previous owner's `end()` tear down the incoming session. A takeover also fires
   `PluginMediaCallbacks::onSessionRevoked` (an additive, `structSize`-gated field) for the C ABI, since a C plugin's
-  handle is invalidated by the takeover and no later status call reaches the panel. Panel visibility is exactly
+  handle is invalidated by the takeover and no later status call reaches the panel.
+- The C ABI session handle is a monotonically increasing integer token encoded in the `void*`, never a pointer: a
+  takeover used to `delete`/`new` the handle object, the allocator handed back the same address, and the stale handle
+  from the revoked plugin still passed the liveness check. Keep tokens non-reusable.
+- **All C ABI state lives in the function-local `state()` singleton in `MediaSession.cpp`.** `init_plugin*` runs inside
+  `BeforeMain()`, which can execute before this library's own static initializers; a file-scope `QString` (or any
+  non-trivially-constructed object) is still null there and dereferences to a crash. Never move that state back to
+  namespace scope. Panel visibility is exactly
   `mediaSession.active`, so a `Stopped` session keeps its card (that is the intended resume path); do not auto-expire it.
 
 ### Keyboard & Rime
@@ -200,6 +207,51 @@ around `/userdisk/mpv/bin/mpv` (0.36.0, `vo=wlshm`, config in `/userdisk/mpv/con
 so it never learns about left/right hand mode; the mod passes `--video-rotate=180` in left-hand mode. `--video-rotate`
 rotates the video frame only — subtitles/OSD are composited by the VO afterwards and stay unrotated (add `--vf=sub` to
 render them into the frame before the autorotate post-filter if that ever needs to change).
+
+## Device Deployment & Recovery
+
+### Deploying a new `libPenMods.so` / plugin `.so`
+
+`libPenMods.so` reaches the app through a `NEEDED` entry on `YoudaoDictPen` (see `/userdisk/penmods/patch.sh`), so a
+running app has it mapped. Overwriting it in place (`adb push` directly onto `/userdata/PenMods/libPenMods.so`) mutates
+pages of a live mapping and makes the app execute mismatched code — it segfaults, the guardian restarts it, and the
+firmware escalates a few crashes in a row into a `misc` `boot-recovery` reboot, leaving the device in the Rockchip
+recovery ramdisk. Push to a scratch name and rename instead, which leaves the running process on the old inode:
+
+```sh
+adb push build/linux/arm64-v8a/release/libPenMods.so /userdata/PenMods/libPenMods.tmp.so
+adb shell 'mv -f /userdata/PenMods/libPenMods.tmp.so /userdata/PenMods/libPenMods.so'
+```
+
+The same applies to an already-loaded plugin `.so` under `/userdisk/PenMods/plugins/<id>/`. After the rename, restart
+the app (`killall YoudaoDictPen`) to pick the new file up.
+
+Recovering a device already stuck there needs `adb shell auth`, a `misc` reflash and a reboot — see
+[Recovering from a crash loop → recovery](#recovering-from-a-crash-loop--recovery).
+
+### Recovering from a crash loop → recovery
+
+Symptom: ADB reconnects with the device in a ramdisk root (`rootfs on / type rootfs`, only `/userdata` + `/userdisk`
+mounted) and every `adb shell` answers `login with "adb shell auth" to continue.`. `YoudaoDictPen` is not running and
+`/userdata/syslog/messages` holds repeated `unhandled level 2 translation fault ... Comm: YoudaoDictPen` dumps. The
+firmware wrote `boot-recovery` + `recovery --recovery_online` into the BCB at offset `0x4000` of `/dev/block/by-name/misc`.
+
+`system_a` itself is fine — do not "repair" it. Mount it read-only only to confirm, then run:
+
+```sh
+adb shell auth                      # password: CherryYoudao
+# remove whatever caused the crash first, e.g. the offending plugin dir
+adb shell 'rm -rf /userdisk/PenMods/plugins/<id>'
+# restore a good library from a copy you kept as /userdata/PenMods/libPenMods.known_good.so
+adb shell 'cp -f /userdata/PenMods/libPenMods.known_good.so /userdata/PenMods/libPenMods.so'
+# clear the boot marker with the known-good misc image kept on the device
+adb shell 'dd if=/userdisk/Music/OTHERS/misc.img of=/dev/block/by-name/misc bs=4096 conv=fsync; sync'
+adb shell 'md5sum /dev/block/by-name/misc'   # must be 50e0f9d40f6912cbff7ac89b7862ab4c
+adb shell 'reboot'
+```
+
+Note: plugin init runs *after* `loadSo()` deletes its `.loading` marker, so a crash inside `init_plugin_with_media_api`
+is never auto-disabled — it loops until the firmware gives up and reboots to recovery.
 
 ## Deployment Paths (on-device)
 

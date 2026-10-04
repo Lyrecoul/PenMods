@@ -31,11 +31,42 @@ six symbols in a shim built with the *vendor's* toolchain — the same GCC 6.x /
 libstdc++ 6.0.22 combination the vendor libraries use — and let it shadow the real library.
 The shim runs PP-OCRv5 mobile rec (as an ncnn model) on the line crop it is handed.
 
+## Install (the simple path)
+
+```sh
+scripts/fetch-deps.sh && scripts/build.sh && scripts/make-bundle.sh
+# -> dist/penmods-ppocr.sh, a single self-contained file (~8 MB: shim + model)
+```
+
+Then, on the device, push that one file and run it:
+
+```sh
+adb push dist/penmods-ppocr.sh /userdisk/
+adb shell 'sh /userdisk/penmods-ppocr.sh'
+```
+
+It unpacks the payload, stages it, enables the shim, verifies with the dynamic loader that
+`libyocr.so` resolves to the shim and that nothing is missing, restarts the app and reports the
+result. The same file then manages everything:
+
+| Command | Effect |
+|---|---|
+| `sh penmods-ppocr.sh` | install + enable (default) |
+| `sh penmods-ppocr.sh status` | what is installed / active, plus the last recognitions |
+| `sh penmods-ppocr.sh disable` | back to the vendor engine (payload stays staged) |
+| `sh penmods-ppocr.sh enable` | enable again |
+| `sh penmods-ppocr.sh h 32` | target height 16..64 (48 = most accurate, applies immediately) |
+| `sh penmods-ppocr.sh remove` | uninstall everything |
+
+`enable`/`disable` restart the app, because `libyocr.so` is resolved by the dynamic loader at
+process start — the guardian relaunches it within a few seconds.
+
 ## Build
 
 ```sh
 scripts/fetch-deps.sh     # ncnn 20240820 + PP-OCRv5 mobile rec (cached in .cache/, untracked)
 scripts/build.sh          # -> build/libyocr.so (+ build/ab_test)
+scripts/make-bundle.sh    # -> dist/penmods-ppocr.sh
 ```
 
 Requirements: an `aarch64-linux-gnu-g++` cross toolchain **with OpenMP and a glibc 2.27
@@ -43,15 +74,17 @@ sysroot** (on Arch: `aarch64-linux-gnu-gcc`). zig will not do: ncnn threads ever
 `#pragma omp parallel for`, and zig's `-fopenmp` has no `omp.h`/runtime, which makes the whole
 model run single-threaded (measured 3.8x slower).
 
-## Deploy / tune / revert
+## Developer path (`scripts/deploy.sh`)
 
-```sh
-scripts/deploy.sh on 48    # install, restart the app (48 = most accurate)
-scripts/deploy.sh status   # what is installed and loaded
-scripts/deploy.sh log      # per-line timing + recognized text
-scripts/deploy.sh h 32     # change target height (no restart needed)
-scripts/deploy.sh off      # revert to the vendor engine
-```
+`scripts/deploy.sh` does the same thing straight from the build tree, which is handier while
+iterating; it additionally checks that a fixed 32-byte `abi`/`structSize` surface still matches.
+The one-file installer is what users should get.
+
+| Command | Effect |
+|---|---|
+| `scripts/deploy.sh on [h]` | push build output + models, enable, restart |
+| `scripts/deploy.sh off` | revert to the vendor engine |
+| `scripts/deploy.sh h <n>` / `status` / `log` | knob / state / per-line log |
 
 Installed files, all on `/userdisk` (nothing in `/oem`/system is modified):
 

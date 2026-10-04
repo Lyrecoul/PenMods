@@ -1,0 +1,177 @@
+#!/bin/sh
+# ---------------------------------------------------------------------------
+# PenMods experimental PP-OCRv5 OCR backend -- one-file installer
+#
+# This file is self-contained: the shim and the model are appended as a gzip
+# payload after a 4096-byte header, so installing needs nothing but this file.
+#
+#   adb push penmods-ppocr.sh /userdisk/
+#   adb shell 'sh /userdisk/penmods-ppocr.sh'            # install + enable
+#
+#   sh penmods-ppocr.sh status      # what is installed / active right now
+#   sh penmods-ppocr.sh disable     # back to the vendor engine (keeps the payload)
+#   sh penmods-ppocr.sh enable      # enable again
+#   sh penmods-ppocr.sh h 32        # target height 16..64 (48 = most accurate)
+#   sh penmods-ppocr.sh remove      # uninstall everything
+#
+# The app is restarted after enable/disable/remove because libyocr.so is resolved
+# by the dynamic loader at process start -- swapping it only affects the next
+# launch. The guardian relaunches the app within a few seconds.
+# ---------------------------------------------------------------------------
+set -e
+
+PAYLOAD_OFFSET=8192
+STAGE=/userdisk/ppocr_backend
+MODELS=/userdisk/ppocr_models
+SHADOW_DIR=/userdisk/Qtlib
+SHADOW=$SHADOW_DIR/libyocr.so
+H_FILE=/userdisk/ppocr_target_h
+LOG=/userdisk/ppocr_shim.log
+VENDOR=/oem/YoudaoDictPen/output/aarch64_libs/libyocr.so
+APP_DIR=/oem/YoudaoDictPen/output
+APP_LIBS=$APP_DIR/libs
+
+say() { echo "[ppocr] $*"; }
+
+need_root_check() {
+    [ "$(id -u)" = 0 ] || { say "run this on the device as root (adb shell is root)"; exit 1; }
+}
+
+unpack_payload() {
+    tmp=$(mktemp -d /tmp/ppocr.XXXXXX)
+    tail -c +$((PAYLOAD_OFFSET + 1)) "$0" | tar xz -C "$tmp"
+    [ -s "$tmp/libyocr.so" ] || { say "payload missing/corrupt"; exit 1; }
+    say "payload unpacked ($(du -sh "$tmp" | cut -f1))" >&2
+    echo "$tmp"          # stdout is the return value: keep log lines on stderr
+}
+
+install_payload() {
+    tmp=$1
+    mkdir -p "$STAGE" "$MODELS"
+    # Stored centrally; enable/disable only moves the shadow copy, so switching
+    # never needs the payload again.
+    cp -f "$tmp/libyocr.so" "$STAGE/libyocr.so.new"
+    mv -f "$STAGE/libyocr.so.new" "$STAGE/libyocr.so"
+    cp -f "$tmp"/PP_OCRv5_mobile_rec.ncnn.param "$tmp"/PP_OCRv5_mobile_rec.ncnn.bin "$MODELS/"
+    [ -f "$H_FILE" ] || echo 48 > "$H_FILE"
+    rm -rf "$tmp"
+    say "installed -> $STAGE (shim) + $MODELS (model)"
+}
+
+# Never write the shadow file in place while an app may have it mapped.
+enable_shim() {
+    [ -s "$STAGE/libyocr.so" ] || { say "not installed yet -- run without arguments first"; exit 1; }
+    mkdir -p "$SHADOW_DIR"
+    cp -f "$STAGE/libyocr.so" "$SHADOW.new.$$"
+    mv -f "$SHADOW.new.$$" "$SHADOW"
+    sync
+    say "enabled  -> $SHADOW"
+}
+
+disable_shim() {
+    rm -f "$SHADOW"
+    sync
+    say "disabled -> vendor engine ($VENDOR)"
+}
+
+restart_app() {
+    sync
+    killall YoudaoDictPen 2>/dev/null || true
+    printf '[ppocr] restarting the app'
+    i=0
+    while [ $i -lt 30 ]; do
+        sleep 2
+        if pidof YoudaoDictPen >/dev/null 2>&1; then
+            echo " ok (pid $(pidof YoudaoDictPen | awk '{print $1}'))"
+            return 0
+        fi
+        printf '.'
+        i=$((i + 1))
+    done
+    echo
+    say "the app did not come back in 60s -- check /userdata/applog/DictPen_*.log"
+    return 1
+}
+
+# Loader pre-flight: verify libyocr.so resolves to the intended file and that
+# nothing is missing, before the app is restarted into a broken setup.
+preflight() {
+    want=$1
+    resolved=$(cd "$APP_DIR" && LD_LIBRARY_PATH=$SHADOW_DIR:$APP_LIBS LD_TRACE_LOADED_OBJECTS=1 ./YoudaoDictPen 2>&1 | grep -m1 libyocr || true)
+    say "loader: $resolved"
+    # the vendor library is reachable both as /oem/.../aarch64_libs/libyocr.so and through
+    # the aarch64_libs symlink /oem/.../output/libs/libyocr.so, so only require "not ours"
+    case "$want" in
+    shim) case "$resolved" in *"$SHADOW"*) return 0 ;; esac ;;
+    vendor) case "$resolved" in ""|*"$SHADOW"*) ;; *) return 0 ;; esac ;;
+    esac
+    say "unexpected libyocr resolution -- not restarting the app"
+    return 1
+}
+
+do_status() {
+    if [ -f "$SHADOW" ]; then
+        echo "backend   : PP-OCRv5 (enabled)"
+    else
+        echo "backend   : vendor engine"
+    fi
+    echo "payload   : $([ -s "$STAGE/libyocr.so" ] && echo "installed ($STAGE)" || echo "not installed")"
+    echo "model     : $(ls "$MODELS" 2>/dev/null | tr '\n' ' ')"
+    echo "target_h  : $(cat "$H_FILE" 2>/dev/null || echo '(default 32)')"
+    pid=$(pidof YoudaoDictPen 2>/dev/null | awk '{print $1}')
+    [ -n "$pid" ] && echo "app pid   : $pid"
+    [ -n "$pid" ] && echo "libyocr   : $(grep -m1 -a libyocr /proc/$pid/maps 2>/dev/null | awk '{print $6}')"
+    if [ -s "$LOG" ]; then
+        echo "--- last recognitions ---"
+        tail -3 "$LOG"
+    fi
+}
+
+need_root_check
+
+case "${1:-install}" in
+install)
+    tmp=$(unpack_payload)
+    install_payload "$tmp"
+    enable_shim
+    preflight shim || exit 1
+    restart_app
+    echo
+    say "PP-OCRv5 backend is active."
+    say "  status / disable / enable / h <16..64> / remove"
+    say "  scan a line now; the recognized text is logged to $LOG"
+    ;;
+enable)
+    enable_shim
+    preflight shim || exit 1
+    restart_app
+    say "scan a line; 'sh $0 status' shows the log"
+    ;;
+disable)
+    disable_shim
+    preflight vendor || exit 1
+    restart_app
+    ;;
+h)
+    [ -n "$2" ] || { say "usage: $0 h <16..64>"; exit 1; }
+    echo "$2" > "$H_FILE"
+    say "target height = $2 (applies to the next recognized line, no restart needed)"
+    ;;
+status)
+    do_status
+    ;;
+remove)
+    disable_shim
+    rm -rf "$STAGE" "$MODELS"
+    restart_app
+    say "removed; the vendor engine is active"
+    ;;
+*)
+    sed -n '3,20p' "$0"
+    exit 1
+    ;;
+esac
+
+exit 0
+# ---------------------------------------------------------------------------
+# gzip payload follows; the header above is padded to exactly 4096 bytes by scripts/make-bundle.sh.

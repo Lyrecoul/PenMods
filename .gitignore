@@ -9,3 +9,4 @@ mathjax-server/package-lock.json
 # tools/ppocr-backend: fetched deps and build output
 /tools/ppocr-backend/build/
 /tools/ppocr-backend/vendor/
+/tools/ppocr-backend/dist/

@@ -195,6 +195,7 @@ PEN_HOOK(bool, license_verify) { return true; }
 #include "tweaker/ColumnDBLimiter.h"
 #include "tweaker/KeyBoard.h"
 #include "tweaker/LoggerMonitor.h"
+#include "tweaker/OcrBackend.h"
 #include "tweaker/QueryTweaks.h"
 #include "tweaker/TextBookHelper.h"
 #include "tweaker/WordBookTweaks.h"
@@ -277,6 +278,7 @@ __attribute__((constructor)) static void BeforeMain() {
     INSTANCE(ColumnDBLimiter);
     INSTANCE(KeyBoard);
     INSTANCE(LoggerMonitor);
+    INSTANCE(OcrBackend);
     INSTANCE(QueryTweaks);
     INSTANCE(TextBookHelper);
     INSTANCE(WordBookTweaks);

@@ -61,6 +61,21 @@ result. The same file then manages everything:
 `enable`/`disable` restart the app, because `libyocr.so` is resolved by the dynamic loader at
 process start — the guardian relaunches it within a few seconds.
 
+## In-app switch
+
+After the payload is installed, the backend is also reachable from the mod's own settings:
+**更多设置 → 系统调整 → 实验性功能**.
+
+| Row | Effect |
+|---|---|
+| 使用 PP-OCRv5 识别引擎 | enable/disable. Swaps the loader-shadow file and restarts the app (a few seconds), because `libyocr.so` is resolved by the loader at process start. Shown disabled with a hint when the payload is missing. |
+| 识别精度优先（较慢） | target height 48 vs 32 — applies to the next recognized line, no restart. |
+
+It is backed by `mod::OcrBackend` (`src/tweaker/OcrBackend.cpp`, context property `ocrBackend`)
+and reads exactly the same files the shim does (`/userdisk/ppocr_backend`,
+`/userdisk/Qtlib/libyocr.so`, `/userdisk/ppocr_target_h`), so the shell path and the UI never
+disagree and there is no second source of truth to keep in sync.
+
 ## Build
 
 ```sh

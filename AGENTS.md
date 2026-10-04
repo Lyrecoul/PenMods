@@ -233,6 +233,12 @@ channel count as `cn-1`; a crop can be a non-continuous ROI so rows must be walk
 `step.p[0]`; the network has one output class beyond the dictionary (the space) and dropping it
 concatenates English words; and a crop's height is already ~48 before we see it, so lowering
 `target_h` is a second resample that costs dense-Chinese accuracy (knob: `/userdisk/ppocr_target_h`).
+- The backend is toggled either from the shell (`penmods-ppocr.sh`, or `scripts/deploy.sh` while
+developing) or from the mod's settings page (**更多设置 → 系统调整 → 实验性功能**, backed by
+`src/tweaker/OcrBackend.cpp` / context property `ocrBackend`). Both read the same three files
+(`/userdisk/ppocr_backend`, `/userdisk/Qtlib/libyocr.so`, `/userdisk/ppocr_target_h`) — keep it
+that way instead of adding a config key that can drift out of sync with reality. Enabling or
+disabling has to restart the app; the accuracy/speed knob does not.
 - Deployment shadows the vendor library via the app's own `LD_LIBRARY_PATH`
 (`/userdisk/Qtlib/` is its first entry and does not otherwise exist). `scripts/deploy.sh on|off`
 handles install/revert, including a loader pre-flight (`LD_TRACE_LOADED_OBJECTS`) before the app

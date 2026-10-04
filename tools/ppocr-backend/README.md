@@ -1,137 +1,128 @@
-# Experimental OCR backend (PP-OCRv5 + ncnn)
+# 实验性 OCR 后端（PP-OCRv5 + ncnn）
 
-Replaces the pen's **line recognition** stage with PaddleOCR's PP-OCRv5 mobile recognizer
-running on ncnn. Everything else in the scan pipeline (camera, stitching, line
-detection/segmentation) is untouched.
+把词典笔的**逐行识别**换成了飞桨 PP-OCRv5 mobile 识别模型（跑在 ncnn 上）。扫描链路里的其它环节
+（摄像头、拼接、行检测/切分）都不动。
 
-> **Status: experimental, opt-in, off by default.** It swaps a vendor `.so` at load time via
-> `LD_LIBRARY_PATH` shadowing. It is not part of the xmake build, ships no installer and is
-> not covered by the OTA. See `doc/PPOCR_BACKEND_ANALYSIS.md` for the reverse engineering and
-> the measured numbers.
+> **状态：实验性、可选、默认关闭。** 它通过在 `LD_LIBRARY_PATH` 里“影子覆盖”厂商的一个 `.so` 来生效，
+> 不参与 xmake 构建，也不随 OTA 发布。逆向过程与实测数据见 `doc/PPOCR_BACKEND_ANALYSIS.md`。
 
-## Why it exists
+## 为什么需要它
 
-The shipped engine (`/oem/YoudaoDictPen/output/aarch64_libs/libyocr.so`) is a CRNN + a 150 MB
-FST language model. On real pen scans of Chinese textbook pages it garbles long lines; in our
-A/B it turned `学员凭此承诺书进入相关科目考试场，在应考技能考试科目` into
-`学员赁进进推的能进科目`. PP-OCRv5 mobile reads those lines correctly at the cost of latency
-(roughly 0.2–2 s per line depending on height and length, vs ~0.25 s for the vendor).
+出厂引擎（`/oem/YoudaoDictPen/output/aarch64_libs/libyocr.so`）是 CRNN + 一个 150 MB 的 FST 语言模型。
+在真实笔扫的中文教材页面上它会读错长句：我们的 A/B 里它把
+`学员凭此承诺书进入相关科目考试场，在应考技能考试科目` 读成了 `学员赁进进推的能进科目`。
+PP-OCRv5 mobile 能把这些句子读对，代价是延迟更高（每行约 0.2–2 s，视输入高度和长度而定；厂商约 0.25 s）。
 
-## How it works
+## 工作原理
 
-`libYoudaoStitch.so` imports exactly six symbols from `libyocr.so`, the interesting one being
+`libYoudaoStitch.so` 只从 `libyocr.so` 导入 6 个符号，其中关键的一个是：
 
 ```cpp
 std::string yocr_recognize(const cv::Mat& lineCrop);
 ```
 
-`cv::Mat` and `std::string` are libstdc++/OpenCV-3.4 C++ ABI, while `libPenMods.so` is built
-with libc++ (zig), so a PenMods hook cannot take that seam safely. Instead we re-implement the
-six symbols in a shim built with the *vendor's* toolchain — the same GCC 6.x / glibc 2.27 /
-libstdc++ 6.0.22 combination the vendor libraries use — and let it shadow the real library.
-The shim runs PP-OCRv5 mobile rec (as an ncnn model) on the line crop it is handed.
+`cv::Mat` 和 `std::string` 都是 libstdc++ / OpenCV 3.4 的 C++ ABI，而 `libPenMods.so` 用 libc++（zig）编译，
+所以 PenMods 无法安全地 hook 这个接缝。于是我们**用厂商同款工具链**（同样的 GCC 6.x / glibc 2.27 /
+libstdc++ 6.0.22 组合）重新实现这 6 个符号，做成一个 shim 去影子覆盖真正的库，在它收到的行图上跑
+PP-OCRv5 mobile rec（ncnn 模型）。
 
-## Install (the simple path)
+## 安装（推荐方式）
 
 ```sh
 scripts/fetch-deps.sh && scripts/build.sh && scripts/make-bundle.sh
-# -> dist/penmods-ppocr.sh, a single self-contained file (~8 MB: shim + model)
+# -> dist/penmods-ppocr.sh，单文件自包含（约 8 MB：shim + 模型）
 ```
 
-Then, on the device, push that one file and run it:
+然后在设备上推送这一个文件并执行：
 
 ```sh
 adb push dist/penmods-ppocr.sh /userdisk/
 adb shell 'sh /userdisk/penmods-ppocr.sh'
 ```
 
-It unpacks the payload, stages it, enables the shim, verifies with the dynamic loader that
-`libyocr.so` resolves to the shim and that nothing is missing, restarts the app and reports the
-result. The same file then manages everything:
+它会解包、安装、启用，**用动态加载器预检** `libyocr.so` 是否解析到 shim 且没有缺库，然后重启 app 并回报结果。
+之后同一个文件就是管理入口：
 
-| Command | Effect |
+| 命令 | 作用 |
 |---|---|
-| `sh penmods-ppocr.sh` | install + enable (default) |
-| `sh penmods-ppocr.sh status` | what is installed / active, plus the last recognitions |
-| `sh penmods-ppocr.sh disable` | back to the vendor engine (payload stays staged) |
-| `sh penmods-ppocr.sh enable` | enable again |
-| `sh penmods-ppocr.sh h 32` | target height 16..64 (48 = most accurate, applies immediately) |
-| `sh penmods-ppocr.sh remove` | uninstall everything |
+| `sh penmods-ppocr.sh` | 安装 + 启用（默认） |
+| `sh penmods-ppocr.sh status` | 当前安装/生效状态，以及最近几次识别日志 |
+| `sh penmods-ppocr.sh disable` | 切回厂商引擎（组件仍保留在设备上） |
+| `sh penmods-ppocr.sh enable` | 再次启用 |
+| `sh penmods-ppocr.sh h 32` | 输入高度 16..64（48 最准），立即生效 |
+| `sh penmods-ppocr.sh remove` | 完整卸载 |
 
-`enable`/`disable` restart the app, because `libyocr.so` is resolved by the dynamic loader at
-process start — the guardian relaunches it within a few seconds.
+`enable` / `disable` 会重启 app，因为 `libyocr.so` 是动态加载器在**进程启动时**解析的；守护进程会在几秒内
+把 app 拉回来。
 
-## In-app switch
+## 主程序里的开关
 
-After the payload is installed, the backend is also reachable from the mod's own settings:
-**更多设置 → 系统调整 → 实验性功能**.
+安装过组件后，也可以在 PenMods 自己的设置里切换：**更多设置 → 系统调整 → 实验性功能**。
 
-| Row | Effect |
+| 开关 | 作用 |
 |---|---|
-| 使用 PP-OCRv5 识别引擎 | enable/disable. Swaps the loader-shadow file and restarts the app (a few seconds), because `libyocr.so` is resolved by the loader at process start. Shown disabled with a hint when the payload is missing. |
-| 识别精度优先（较慢） | target height 48 vs 32 — applies to the next recognized line, no restart. |
+| 使用 PP-OCRv5 识别引擎 | 启用/禁用。会替换影子文件并重启 app（几秒），因为 `libyocr.so` 在进程启动时就被解析了。组件未安装时该行显示“未安装”并置灰 |
+| 识别精度优先（较慢） | 输入高度 48 ↔ 32，下一条识别即生效，不需要重启 |
 
-It is backed by `mod::OcrBackend` (`src/tweaker/OcrBackend.cpp`, context property `ocrBackend`)
-and reads exactly the same files the shim does (`/userdisk/ppocr_backend`,
-`/userdisk/Qtlib/libyocr.so`, `/userdisk/ppocr_target_h`), so the shell path and the UI never
-disagree and there is no second source of truth to keep in sync.
+它由 `mod::OcrBackend`（`src/tweaker/OcrBackend.cpp`，context property `ocrBackend`）实现，读取的正是 shim
+用的那几个文件（`/userdisk/ppocr_backend`、`/userdisk/Qtlib/libyocr.so`、`/userdisk/ppocr_target_h`），
+所以命令行和界面永远一致，不存在第二份会走样的配置。
 
-## Build
+## 从源码构建
 
 ```sh
-scripts/fetch-deps.sh     # ncnn 20240820 + PP-OCRv5 mobile rec (cached in .cache/, untracked)
-scripts/build.sh          # -> build/libyocr.so (+ build/ab_test)
+scripts/fetch-deps.sh     # ncnn 20240820 + PP-OCRv5 mobile rec（缓存到 .cache/，不入库）
+scripts/build.sh          # -> build/libyocr.so（以及 build/ab_test）
 scripts/make-bundle.sh    # -> dist/penmods-ppocr.sh
 ```
 
-Requirements: an `aarch64-linux-gnu-g++` cross toolchain **with OpenMP and a glibc 2.27
-sysroot** (on Arch: `aarch64-linux-gnu-gcc`). zig will not do: ncnn threads every layer with
-`#pragma omp parallel for`, and zig's `-fopenmp` has no `omp.h`/runtime, which makes the whole
-model run single-threaded (measured 3.8x slower).
+要求：`aarch64-linux-gnu-g++` 交叉工具链，**带 OpenMP 且 sysroot 是 glibc 2.27**（Arch 上是
+`aarch64-linux-gnu-gcc`）。**不能用 zig**：ncnn 每一层都靠 `#pragma omp parallel for` 并行，而 zig 的
+`-fopenmp` 没有 `omp.h`/运行时，整个模型会退化成单线程（实测慢 3.8 倍）。
 
-## Developer path (`scripts/deploy.sh`)
+## 开发者路径（`scripts/deploy.sh`）
 
-`scripts/deploy.sh` does the same thing straight from the build tree, which is handier while
-iterating; it additionally checks that a fixed 32-byte `abi`/`structSize` surface still matches.
-The one-file installer is what users should get.
+`scripts/deploy.sh` 直接从构建目录部署，迭代时更顺手：
 
-| Command | Effect |
+| 命令 | 作用 |
 |---|---|
-| `scripts/deploy.sh on [h]` | push build output + models, enable, restart |
-| `scripts/deploy.sh off` | revert to the vendor engine |
-| `scripts/deploy.sh h <n>` / `status` / `log` | knob / state / per-line log |
+| `scripts/deploy.sh on [h]` | 推送构建产物 + 模型，启用并重启 |
+| `scripts/deploy.sh off` | 回退到厂商引擎 |
+| `scripts/deploy.sh h <n>` / `status` / `log` | 调参 / 查看状态 / 查看逐行日志 |
 
-Installed files, all on `/userdisk` (nothing in `/oem`/system is modified):
+## 设备上的文件
 
-| Path | Purpose |
+全部在 `/userdisk`，不修改 `/oem` 与系统分区：
+
+| 路径 | 用途 |
 |---|---|
-| `/userdisk/Qtlib/libyocr.so` | the shim; first entry of the app's `LD_LIBRARY_PATH` shadows the vendor lib |
-| `/userdisk/ppocr_models/PP_OCRv5_mobile_rec.ncnn.{param,bin}` | model (8.2 MB) |
-| `/userdisk/ppocr_target_h` | target height, 16..64 (default 32) |
-| `/userdisk/ppocr_shim.log` | per-call log: input/output dims, ms, text |
+| `/userdisk/Qtlib/libyocr.so` | shim；该目录是 app 的 `LD_LIBRARY_PATH` 首项，用来影子覆盖厂商库 |
+| `/userdisk/ppocr_backend/libyocr.so` | 安装脚本暂存的 shim 本体（`enable`/`disable` 只切换影子文件） |
+| `/userdisk/ppocr_models/PP_OCRv5_mobile_rec.ncnn.{param,bin}` | 模型（8.2 MB） |
+| `/userdisk/ppocr_target_h` | 目标高度，16..64（默认 32） |
+| `/userdisk/ppocr_shim.log` | 每次识别的日志：输入/输出尺寸、耗时、文本 |
 
-Reverting is `rm /userdisk/Qtlib/libyocr.so` + restart the app.
+回退就是删掉 `/userdisk/Qtlib/libyocr.so` 再重启 app。
 
-## Accuracy / latency trade-off
+## 精度 / 延迟权衡
 
-`/userdisk/ppocr_target_h` is the main knob. The app already rescales each line crop to ~48 px
-before calling the recognizer, so `48` means "no second resample" and anything lower is a
-second downscale.
+`/userdisk/ppocr_target_h` 是主要旋钮。app 在调用识别前已经把每行裁切图统一缩放到 ~48 px 高，所以填 `48`
+意味着“不再二次缩放”，填更小的值就是再缩一次。
 
-| target_h | long line (~1400×50) | dense-Chinese accuracy |
+| target_h | 长行（约 1400×50） | 密集中文精度 |
 |---|---|---|
-| 48 | ~1.9–2.1 s | best — keeps 流程控制结构 etc. |
-| 40 | ~1.6 s | in between |
-| 32 | ~0.9–1.0 s | loses strokes on dense Chinese (`流程控制结构` → `流程介绍`) |
-| 24 | ~0.3 s | unusable on long lines |
+| 48 | ~1.9–2.1 s | 最好，能保住 `流程控制结构` 这类词 |
+| 40 | ~1.6 s | 介于两者之间 |
+| 32 | ~0.9–1.0 s | 密集中文丢笔画（`流程控制结构` → `流程介绍`） |
+| 24 | ~0.3 s | 长行不可用 |
 
-English is insensitive to the height (letters are well separated) and reads correctly at 32.
+英文对高度不敏感（字母间距大），32 也能全对。
 
-## Evaluation harness
+## 评测工具
 
-`build/ab_test` runs the vendor engine and PP-OCRv5 on the *same* `cv::Mat` and prints both
-texts and timings. Run it with the vendor library in the loader path (i.e. with the shim
-**off**), or it will compare the shim against itself:
+`build/ab_test` 用**同一张** `cv::Mat` 同时跑厂商引擎和 PP-OCRv5，打印两者的文本与耗时。注意必须在
+**厂商库生效**的加载路径下运行（先 `deploy.sh off`，或者 `LD_LIBRARY_PATH` 里不含 `/userdisk/Qtlib`），
+否则两边都是 shim：
 
 ```sh
 scripts/deploy.sh off
@@ -141,15 +132,12 @@ adb shell 'cd /userdisk && LD_LIBRARY_PATH=/oem/YoudaoDictPen/output/libs \
            /userdisk/ppocr_models/PP_OCRv5_mobile_rec.ncnn.bin /userdisk/some.ppm'
 ```
 
-## Pitfalls already paid for
+## 已经踩过并写进代码的坑
 
-1. OpenCV packs channels as `cn - 1` (`((flags >> 3) & 511) + 1`); the naive form rejects every
-   `CV_8UC3` crop.
-2. Crops can be non-continuous ROIs — walk rows with `step.p[0]`, or the app segfaults.
-3. The network has one extra output class beyond the dictionary: the space. Dropping it
-   concatenates English words.
-4. Never `adb push` over `/userdisk/Qtlib/libyocr.so` while the app runs; push elsewhere and
-   `mv` (see `deploy.sh`).
-5. The cross toolchain must match glibc 2.27, and the shim must link libstdc++ **dynamically**
-   so it shares the app's copy — a statically linked libstdc++ would make `std::string` cross
-   two incompatible runtimes.
+1. OpenCV 的通道数是 `cn - 1` 编码，要用 `((flags >> 3) & 511) + 1`；写成 `(flags >> 3) & 511`
+   会把所有 `CV_8UC3` 裁切图判为不支持。
+2. 裁切图可能是**非连续 ROI**，必须按 `step.p[0]` 逐行取；按 `cols * cn` 取会越界读未映射页，直接把 app 打崩。
+3. 网络输出比字典**多一类**：那一类是空格。丢掉它会让英文单词粘在一起。
+4. app 运行中不要用 `adb push` 覆盖 `/userdisk/Qtlib/libyocr.so`（见 `deploy.sh` 里的说明）。
+5. 交叉工具链的 glibc 必须是 2.27，且 shim 必须**动态**链接 libstdc++，与 app 共用同一份；静态链接会让
+   `std::string` 跨两个不兼容的运行时。

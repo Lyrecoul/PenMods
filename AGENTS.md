@@ -385,20 +385,24 @@ Then add an entry to `updates.json` (`size`/`md5` are those of the **zip**, not 
 }
 ```
 
-### jsDelivr 刷新纪律(否则每次发布都会被卡住)
+### jsDelivr refresh discipline (skip this and every release stalls)
 
-- 设备拉的是 `@main/updates.json`,jsDelivr 给它的响应头是 `cache-control: public,
-  max-age=604800, s-maxage=43200` —— **CDN 层缓存 12 小时,且每个边缘节点独立缓存**。所以发布后
-  "有的设备看得到新版本、有的看不到"是正常现象,不是发布失败。
-- `purge.jsdelivr.net` 是唯一能让它立刻生效的手段,但它**按路径限流**:连着 purge 几次之后会返回
-  `"throttled": true` 和 `throttlingReset`(约 3300 秒的滚动窗口)。**换 IP 不能重置**——限流跟路径走,
-  不跟来源走。实测:同一路径连续 purge 5 次后,窗口内再 purge 全部被拒。
-- 因此**每个版本只 purge 一次**,就在推送之后立刻做。若已经被限流,只能等窗口过去或等 12 小时的 TTL。
-- 判断"发布是否成功"要看 GitHub 和**带 tag 的产物 URL**(`@vX.Y.Z/update_*.zip` 是全新路径,
-  不受缓存影响,md5 必须与清单一致),不要用 `@main` 的响应来判断。
-- 查询字符串(`?cb=123`)对 jsDelivr 的缓存**无效**,不要指望用它绕过。
-- (备选方案:把 `updates.json` 放到 `raw.githubusercontent.com`,TTL 只有 5 分钟,但国内可达性存疑;
-  真要做建议给 `Updater` 加多个 URL 回退。目前不改。)
+- The device fetches `@main/updates.json` and jsDelivr serves it with `cache-control: public,
+  max-age=604800, s-maxage=43200` — a **12 hour CDN TTL, cached independently per edge node**. So
+  after a release, "one device sees the new version while another does not" is expected behaviour
+  and not a failed publish.
+- `purge.jsdelivr.net` is the only way to make it immediate, and it is **rate limited per path**:
+  after a few calls it answers `"throttled": true` with a `throttlingReset` countdown (a ~3300 s
+  rolling window). **Changing IP does not reset it** — the limit follows the path, not the caller
+  (measured: five purges of the same path, after which every purge inside the window is refused).
+- Therefore purge **exactly once per release**, right after the push. If it is already throttled,
+  wait for the window or for the 12 h TTL.
+- Judge a release from GitHub and the **tagged artifact URL** (`@vX.Y.Z/update_*.zip` is a brand new
+  path, immune to any cache, and its md5 must match the manifest) — never from the `@main` response.
+- A query string (`?cb=123`) does **not** bust the jsDelivr cache; do not rely on it.
+- (Alternative: host `updates.json` on `raw.githubusercontent.com`, whose TTL is only 5 minutes, but
+  its reachability from mainland China is uncertain; doing it properly means giving `Updater`
+  multiple URL fallbacks. Not done for now.)
 
 Manifest rules enforced by `Updater::check()`: every entry the device may be running must be listed, otherwise the
 check aborts with `Cannot get self version from mod_versions`; keep older entries alongside new ones. An optional

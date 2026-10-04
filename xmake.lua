@@ -48,7 +48,7 @@ option_end()
 
 set_license('GPL-3.0-only')
 
-set_version('2.0.0')
+set_version('2.3.0')
 
 set_allowedarchs('linux|arm64-v8a')
 

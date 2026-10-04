@@ -292,6 +292,7 @@ PluginMediaAPI* g_media_api = nullptr;
 static void* g_session = nullptr;
 
 static void on_media_pause(void* user) { my_player_pause(); }
+static void on_media_revoked(void* user) { my_player_stop(); }   // 会话被别的插件接管
 
 extern "C" void init_plugin_with_media_api(PluginMediaAPI* api) {
     g_media_api = api;
@@ -306,6 +307,7 @@ extern "C" void init_plugin_with_media_api(PluginMediaAPI* api) {
     PluginMediaCallbacks cbs = { 0 };
     cbs.structSize = sizeof(cbs);
     cbs.onPause = on_media_pause;
+    cbs.onSessionRevoked = on_media_revoked;   // 可选
     api->setCallbacks(g_session, &cbs, nullptr);
 }
 ```
@@ -320,6 +322,10 @@ extern "C" void init_plugin_with_media_api(PluginMediaAPI* api) {
 | `setLyrics(handle, main, trans)` | NULL 表示清空 |
 | `setCallbacks(handle, cbs, user)` | 注册控制回调，返回 0 表示成功 |
 
+回调包括 `onPlay` / `onPause` / `onToggle` / `onNext` / `onPrev` / `onStop` / `onSeek` / `onOpen`，
+以及可选的 `onSessionRevoked`（会话被别的插件抢走时触发，此时 handle 已失效，不需要再 `endSession()`）。
+后者是最后一个字段，按 `structSize` 兼容追加，留 NULL 或旧宿主不认识都不影响其它回调。
+
 `PluginMediaAPI` / `PluginMediaCallbacks` 都以 `structSize` 开头，向后兼容；
 所有函数可从任意线程调用，宿主会自行 marshal 到 UI 线程，但回调在 UI 线程执行，
 回调里不要做阻塞操作。
@@ -332,8 +338,9 @@ extern "C" void init_plugin_with_media_api(PluginMediaAPI* api) {
 - **用户按下面板停止按钮**（`stopRequested`）：停止播放并 `end(pluginId)`，卡片消失，符合按钮语义。
 - **播放自然结束 / 暂停**：只把 `playState` 置成 `Stopped` / `Paused`，**不要** `end()`。卡片会保留，
   用户可以一键续播。宿主没有“空闲自动过期”，何时真正结束由插件决定（例如用户离开你的播放页时）。
-- **被接管**（`sessionRevoked`）：停止自己的播放，不要调用 `end()`。宿主会在广播接管通知期间忽略无条件
-  `end()`，但插件应改用 `end(pluginId)`，它对非属主调用天然是 no-op。
+- **被接管**（QML 的 `sessionRevoked` / C ABI 的 `onSessionRevoked`）：停止自己的播放，不要调用 `end()`。
+  宿主会在广播接管通知期间忽略无条件 `end()`，但插件应改用 `end(pluginId)`，它对非属主调用天然是 no-op。
+  C 插件被接管后 handle 立即失效，后续上报会被丢弃，所以那里是停止播放的唯一信号。
 
 `end()` 之后卡片立即消失、控制信号也不再送达，所以“播放结束后还想留一个续播入口”的唯一办法是
 保留会话（只置 `Stopped`），而不是先 `end()` 再想办法找回入口。

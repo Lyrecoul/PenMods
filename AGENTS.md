@@ -174,7 +174,9 @@ Plugins live in `/userdisk/PenMods/plugins/<id>/` with `metadata.json` and optio
   plugin's session (and clears its C ABI callbacks) when it is disabled. See `doc/PLUGIN_DEV_GUIDE.md`.
   A session belongs to the plugin id passed to `begin()`: keep `end(pluginId)` (owner-checked, no-op for a revoked
   owner) as the plugin-facing release, and keep the `mRevoking` guard around the `sessionRevoked` emit — a takeover
-  must not let the previous owner's `end()` tear down the incoming session. Panel visibility is exactly
+  must not let the previous owner's `end()` tear down the incoming session. A takeover also fires
+  `PluginMediaCallbacks::onSessionRevoked` (an additive, `structSize`-gated field) for the C ABI, since a C plugin's
+  handle is invalidated by the takeover and no later status call reaches the panel. Panel visibility is exactly
   `mediaSession.active`, so a `Stopped` session keeps its card (that is the intended resume path); do not auto-expire it.
 
 ### Keyboard & Rime

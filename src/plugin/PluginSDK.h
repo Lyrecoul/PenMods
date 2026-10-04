@@ -102,6 +102,17 @@ typedef struct PluginMediaCallbacks {
     void (*onStop)(void* user);
     void (*onSeek)(void* user, int64_t positionMs);
     void (*onOpen)(void* user);
+    /**
+     * @brief 会话被其它插件接管（可选，可留 NULL）
+     *
+     * 别的插件调用 beginSession() 抢走会话时，宿主回调这里通知你。
+     * 收到后应停止自己的播放：此时你的 handle 已经失效，后续
+     * setTrack/setPlayState/endSession 都不会生效，也不需要再调 endSession()。
+     *
+     * 该字段是按 structSize 兼容追加的，旧宿主不认识它（不会被调用），
+     * 留 NULL 也不影响其它回调。
+     */
+    void (*onSessionRevoked)(void* user);
 } PluginMediaCallbacks;
 
 /**

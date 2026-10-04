@@ -177,6 +177,21 @@ void dispatchOpen() {
     if (g_hasCallbacks && g_callbacks.onOpen) g_callbacks.onOpen(g_callbackUser);
 }
 
+void clearCallbacks() {
+    g_hasCallbacks = false;
+    g_callbackUser = nullptr;
+    g_callbacks    = {};
+}
+
+// 会话被接管：先通知旧属主，然后清掉它的回调。会话已经易主，这些回调不再有效，
+// 留着会让下一次接管把它们误当成当前属主。
+void dispatchRevoked() {
+    if (g_hasCallbacks && g_callbacks.onSessionRevoked) {
+        g_callbacks.onSessionRevoked(g_callbackUser);
+    }
+    clearCallbacks();
+}
+
 } // namespace
 
 MediaSession::MediaSession() : Logger("MediaSession") {
@@ -206,14 +221,15 @@ MediaSession::MediaSession() : Logger("MediaSession") {
     connect(this, &MediaSession::openRequested, this, &dispatchOpen);
     connect(this, &MediaSession::seekRequested, this, &dispatchSeek);
 
+    // 会话被接管时通知旧属主的 onSessionRevoked（没有注册则该回调为空）。
+    connect(this, &MediaSession::sessionRevoked, this, &dispatchRevoked);
+
     // 会话结束后清掉 C ABI 回调，否则插件被卸载后面板再发控制事件就是野指针。
     connect(this, &MediaSession::activeChanged, this, [] {
         if (MediaSession::getInstance().active()) {
             return;
         }
-        g_hasCallbacks = false;
-        g_callbackUser = nullptr;
-        g_callbacks    = {};
+        clearCallbacks();
     });
 
     connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView& view, QQmlContext* context) {

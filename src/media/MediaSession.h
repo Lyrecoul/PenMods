@@ -47,7 +47,12 @@ public:
     /// 声明一个插件会话；同一插件重复调用是幂等的。失败（id 为空）返回 false。
     Q_INVOKABLE bool begin(const QString& pluginId);
 
-    /// 释放当前会话，面板回落到宿主播放器。
+    /// 释放当前会话（属主校验）：只有当前属主能释放，被接管的旧属主调用是 no-op 并返回 false。
+    /// 插件应始终使用这个重载，这样即使插件被接管后仍在异步收尾，也不会误关新属主的会话。
+    Q_INVOKABLE bool end(const QString& pluginId);
+
+    /// 无条件释放当前会话，面板回落到宿主播放器。宿主内部使用；插件请用 end(pluginId)。
+    /// 在 sessionRevoked 广播期间（即收到接管通知的旧属主回调里）会被忽略。
     Q_INVOKABLE void end();
 
     /// 一次性设置歌词；传空串表示没有歌词。
@@ -111,9 +116,11 @@ private:
     explicit MediaSession();
 
     void reset();
+    void closeSession();
     void syncPositionTimer();
 
     bool    mActive{false};
+    bool    mRevoking{false};
     QString mOwnerPluginId;
 
     QString   mTitle;

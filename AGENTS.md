@@ -172,6 +172,10 @@ Plugins live in `/userdisk/PenMods/plugins/<id>/` with `metadata.json` and optio
   session exists at a time; without one the panel reads the host `mediaPlayerManager`, so the host path is unaffected.
   `YQuickMusicPlayer.qml` / `YQuickSettingLayer.qml` implement that fallback, and `PluginManager::unloadSo()` releases a
   plugin's session (and clears its C ABI callbacks) when it is disabled. See `doc/PLUGIN_DEV_GUIDE.md`.
+  A session belongs to the plugin id passed to `begin()`: keep `end(pluginId)` (owner-checked, no-op for a revoked
+  owner) as the plugin-facing release, and keep the `mRevoking` guard around the `sessionRevoked` emit — a takeover
+  must not let the previous owner's `end()` tear down the incoming session. Panel visibility is exactly
+  `mediaSession.active`, so a `Stopped` session keeps its card (that is the intended resume path); do not auto-expire it.
 
 ### Keyboard & Rime
 

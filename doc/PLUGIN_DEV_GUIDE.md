@@ -227,18 +227,24 @@ Loader {
 插件自己播放音频（不走宿主播放器）时，通过媒体会话把播放内容上报给宿主，
 系统的下拉快捷设置面板就会出现音乐控制区，并能控制播放 / 暂停 / 上一首 / 下一首。
 
-宿主提供了一个 context property `mediaSession`，同一时刻只允许一个插件持有会话；
-没有任何插件会话时，面板自动回落到宿主播放器，所以不影响原有行为。
+宿主提供了一个 context property `mediaSession`（插件 QML 与应用共用根上下文，直接可用）；
+同一时刻只允许一个插件持有会话；没有任何插件会话时，面板自动回落到宿主播放器，
+所以不影响原有行为。
 
 ### QML 插件用法
+
+会话和 `Connections` 应挂在一个**比页面活得久**的对象上（例如 QML singleton），
+原因见 [会话对象要活得比页面久](#会话对象要活得比页面久)：
 
 ```qml
 import QtQuick 2.12
 import com.github.penuniverse 1.0   // 为了使用 MediaSession.Playing 等枚举
 
-Item {
+QtObject {
+    readonly property string pluginId: "com.example.myplugin"   // 与 metadata.json 的 id 一致
+
     Component.onCompleted: {
-        mediaSession.begin("com.example.myplugin")   // 与 metadata.json 的 id 一致
+        mediaSession.begin(pluginId)
         mediaSession.title = "Song"
         mediaSession.artist = "Artist"
         mediaSession.duration = 180000               // ms，0 表示未知
@@ -253,17 +259,21 @@ Item {
         function onPauseRequested() { /* ... */ mediaSession.playState = MediaSession.Paused }
         function onNextRequested() { /* ... */ }
         function onPrevRequested() { /* ... */ }
-        function onStopRequested() { /* 停止播放 */ mediaSession.end() }
+        // 用户按下面板上的停止按钮：停止播放并释放会话（卡片随之消失）
+        function onStopRequested() { /* 停止播放 */ mediaSession.end(pluginId) }
         function onSeekRequested(ms) { /* ... */ }
         function onOpenRequested() { /* 打开插件自己的播放页，可选 */ }
-        function onSessionRevoked() { /* 被其它插件接管，应停止播放并 end() */ }
+        // 被其它插件接管：停止自己的播放即可，不要在这里调 end()
+        function onSessionRevoked() { /* 停止播放 */ }
     }
 }
 ```
 
 | 成员 | 说明 |
 |---|---|
-| `begin(pluginId)` / `end()` | 声明 / 释放会话，失败返回 false |
+| `begin(pluginId)` | 声明 / 接管会话，`pluginId` 与 `metadata.json` 的 id 一致；失败返回 false |
+| `end(pluginId)` | 属主校验的释放：只有当前属主能结束会话，返回是否真的结束了（被接管的旧属主调用是 no-op） |
+| `end()` | 无条件释放会话，兼容旧用法；插件请改用 `end(pluginId)` |
 | `active`（只读） | 面板据此选择数据源 |
 | `title` / `artist` / `album` / `cover` | 曲目信息，`cover` 可为 URL 或本地路径 |
 | `duration` / `position`（ms） | 进度；会话激活且处于播放状态时宿主会自行按 500ms 推进，插件只需在开始 / 跳转时校正 |
@@ -314,11 +324,30 @@ extern "C" void init_plugin_with_media_api(PluginMediaAPI* api) {
 所有函数可从任意线程调用，宿主会自行 marshal 到 UI 线程，但回调在 UI 线程执行，
 回调里不要做阻塞操作。
 
-### 生命周期
+### 会话生命周期与卡片可见性
 
-插件被禁用或卸载时，`PluginManager` 会自动释放它持有的会话，面板回落宿主播放器。
-如果插件选择主动结束（例如播放完毕），记得自己调用 `end()` / `endSession()`，
-否则面板会一直显示最后上报的内容。
+下拉面板的音乐卡片可见性就是 `mediaSession.active`（有插件会话时用插件数据，否则回落宿主播放器），
+所以只要会话还 active —— **包括 `playState = Stopped`** —— 卡片和续播入口就一直在：
+
+- **用户按下面板停止按钮**（`stopRequested`）：停止播放并 `end(pluginId)`，卡片消失，符合按钮语义。
+- **播放自然结束 / 暂停**：只把 `playState` 置成 `Stopped` / `Paused`，**不要** `end()`。卡片会保留，
+  用户可以一键续播。宿主没有“空闲自动过期”，何时真正结束由插件决定（例如用户离开你的播放页时）。
+- **被接管**（`sessionRevoked`）：停止自己的播放，不要调用 `end()`。宿主会在广播接管通知期间忽略无条件
+  `end()`，但插件应改用 `end(pluginId)`，它对非属主调用天然是 no-op。
+
+`end()` 之后卡片立即消失、控制信号也不再送达，所以“播放结束后还想留一个续播入口”的唯一办法是
+保留会话（只置 `Stopped`），而不是先 `end()` 再想办法找回入口。
+
+插件被禁用或卸载时，`PluginManager` 会自动调用 `releaseFor(pluginId)` 释放它持有的会话。
+
+### 会话对象要活得比页面久
+
+插件页由 `YDynamicPageStack` 装载，`backButtonClicked` 后页面会被 `destroy()`（见
+`commons/YDynamicPageStack.qml` 的 `registerPage`）。因此 `Connections { target: mediaSession }`
+以及会话状态（当前曲目、播放列表、控制回调）**不能挂在页面根对象上**，否则用户一返回，
+下拉面板上的控制就全部失效了。把这些放进 QML singleton 或其它比页面长寿的对象里。
+
+C ABI 插件没有这个限制，但 `beginSession` / `endSession` 仍需成对管理。
 
 ---
 

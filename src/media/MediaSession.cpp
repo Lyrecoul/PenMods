@@ -269,7 +269,11 @@ bool MediaSession::begin(const QString& pluginId) {
     }
     if (mActive) {
         info("Media session '{}' taken over by '{}'.", mOwnerPluginId.toStdString(), pluginId.toStdString());
+        // 收到 sessionRevoked 的必然是旧属主。它此时调 end() 会误关即将接管的新会话，
+        // 所以在广播期间把无条件 end() 屏蔽掉（属主校验的 end(pluginId) 本来就会返回 false）。
+        mRevoking = true;
         emit sessionRevoked();
+        mRevoking = false;
     }
 
     mOwnerPluginId = pluginId;
@@ -288,6 +292,22 @@ void MediaSession::end() {
     if (!mActive) {
         return;
     }
+    if (mRevoking) {
+        warn("Ignoring end() from a revoked owner; use end(pluginId) instead.");
+        return;
+    }
+    closeSession();
+}
+
+bool MediaSession::end(const QString& pluginId) {
+    if (!mActive || mRevoking || pluginId.isEmpty() || pluginId != mOwnerPluginId) {
+        return false;
+    }
+    closeSession();
+    return true;
+}
+
+void MediaSession::closeSession() {
     info("Media session closed by '{}'.", mOwnerPluginId.toStdString());
     mActive = false;
     mOwnerPluginId.clear();

@@ -164,6 +164,8 @@ PEN_HOOK(bool, license_verify) { return true; }
 #include "common/Event.h"
 #include "common/Resource.h"
 
+#include "dict/CustomDict.h"
+
 #include "filemanager/FileManager.h"
 #include "filemanager/player/MusicPlayer.h"
 #include "filemanager/player/VideoPlayer.h"
@@ -260,6 +262,9 @@ __attribute__((constructor)) static void BeforeMain() {
 
     // locker
     INSTANCE(Locker);
+
+    // dict
+    INSTANCE(CustomDict);
 
     // recorder
     INSTANCE(AudioRecorder);

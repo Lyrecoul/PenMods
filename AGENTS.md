@@ -111,6 +111,7 @@ persisted as `righthandmode` in `/userdata/DictPenData/NeteaseYoudao/YoudaoDictP
 | `src/common/` | Event bus, Config, Utils, Downloader, Singleton base |
 | `src/mod/` | Entry point (Mod.cpp), Engine, version info, OTA updater |
 | `src/tweaker/` | Feature flags, DB limit patches, wordbook tweaks, keyboard |
+| `src/dict/` | Custom dictionaries (`customDict`): scans `/userdisk/PenMods/dicts/`, queries user-made `.dat` containers through the vendor reader and injects the hit into the main result page as its own section (see `doc/DICT_FORMAT_ANALYSIS.md`) |
 | `src/filemanager/` | File browser, MusicPlayer, VideoPlayer, TextReader, ImageViewer |
 | `src/helper/` | AntiEmbs, NetworkSettings, DeveloperSettings, ServiceManager |
 | `src/system/` | BatteryInfo, InputDaemon, ScreenManager, AudioDaemon |
@@ -129,7 +130,8 @@ persisted as `righthandmode` in `/userdata/DictPenData/NeteaseYoudao/YoudaoDictP
 
 ### QML Integration
 
-Package `com.github.penuniverse` (1.0). Context properties registered in Engine.cpp or constructors: `mod`, `musicPlayer`, `videoPlayer`, `textReader`, `fileManager`, `imageViewer`, `workBookTweaks`, `queryTweaks`, `columnDb`, `batteryInfo`, `locker`, `wallpaperManager`, `mediaSession`. `PageIndex` and `MediaSession` are uncreatable enum types. **All QML must fit 320×170 touchscreen** — prefer Youdao custom components over stock QML.
+Package `com.github.penuniverse` (1.0). Context properties registered in Engine.cpp or constructors: `mod`, `musicPlayer`, `videoPlayer`, `textReader`, `fileManager`, `imageViewer`, `workBookTweaks`, `queryTweaks`, `columnDb`, `batteryInfo`, `locker`, `wallpaperManager`, `mediaSession`,
+`customDict`. `PageIndex` and `MediaSession` are uncreatable enum types. **All QML must fit 320×170 touchscreen** — prefer Youdao custom components over stock QML.
 
 ### QML Resource Workflow
 
@@ -541,4 +543,9 @@ No test suite. Testing via QEMU emulator: build with `--qemu=y`, then `scripts/i
 - `doc/HOOK_SYSTEM_ANALYSIS.md` — internal hooks vs PluginHookAPI
 - `doc/PLUGIN_HOOK_DEV_GUIDE.md` — guide for external plugins
 - `doc/YSOUNDCENTER_ANALYSIS.md` — IDA Pro RE of `YSoundCenter`
+- `doc/DICT_FORMAT_ANALYSIS.md` — offline dictionary (`localdict/*.dat`) container format, how the engine
+  resolves/loads dictionaries, and how far dictionary extension can go (`tools/dict-probe/` holds the
+  reader/writer probe and the vendor-reader validation harnesses)
+- `doc/CUSTOM_DICT_GUIDE.md` — step-by-step guide for authors: write entries (JSONL/TSV) → build a `.dat`
+  → validate → install into `/userdisk/PenMods/dicts/` → what shows up in the result page
 - `binary/YoudaoDictPen.i64` — IDA Pro database for the target binary

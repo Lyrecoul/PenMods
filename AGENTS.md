@@ -208,6 +208,36 @@ so it never learns about left/right hand mode; the mod passes `--video-rotate=18
 rotates the video frame only — subtitles/OSD are composited by the VO afterwards and stay unrotated (add `--vf=sub` to
 render them into the frame before the autorotate post-filter if that ever needs to change).
 
+## Experimental OCR Backend (PP-OCRv5)
+
+`tools/ppocr-backend/` holds an **opt-in, off-by-default** replacement for the pen's line
+recognition stage: PaddleOCR's PP-OCRv5 mobile recognizer on ncnn. Read
+`doc/PPOCR_BACKEND_ANALYSIS.md` for the reverse engineering and measurements, and the
+tool's `README.md` for the how-to. Nothing in `src/` (and therefore nothing in the xmake
+build) depends on it.
+
+- The vendor OCR lives in `/oem/YoudaoDictPen/output/aarch64_libs/libyocr.so` (ncnn + Eigen +
+an FST decoder) with models in `../ocr_model/`. Detection and line segmentation are **not** there —
+they are inside `libYoudaoStitch.so` (`seg_middle_line`/`SegLine`), so replacing `libyocr.so`
+leaves the whole scan pipeline otherwise intact. The shipped app never enables the 150 MB FST
+language model, so the vendor path is greedy decoding and a greedy-vs-greedy comparison is fair.
+- `libYoudaoStitch.so` imports exactly six symbols from `libyocr.so`; the shim re-implements
+them. Do **not** try to hook `yocr_recognize(cv::Mat const&)` from PenMods: its `std::string` /
+`cv::Mat` parameters are libstdc++/OpenCV C++ ABI, while libPenMods.so is libc++ (zig).
+- The shim must be built with an `aarch64-linux-gnu-g++` whose sysroot is glibc 2.27 and which
+ships `omp.h`/`libgomp`, and must link libstdc++ **dynamically**. zig cannot be used: it defines
+`_OPENMP` but has no OpenMP runtime, so every ncnn layer loses its `#pragma omp parallel for`
+and the model runs single-threaded (measured 3.8x slower).
+- Invariants baked into the shim, each of which cost a debugging session: OpenCV encodes the
+channel count as `cn-1`; a crop can be a non-continuous ROI so rows must be walked with
+`step.p[0]`; the network has one output class beyond the dictionary (the space) and dropping it
+concatenates English words; and a crop's height is already ~48 before we see it, so lowering
+`target_h` is a second resample that costs dense-Chinese accuracy (knob: `/userdisk/ppocr_target_h`).
+- Deployment shadows the vendor library via the app's own `LD_LIBRARY_PATH`
+(`/userdisk/Qtlib/` is its first entry and does not otherwise exist). `scripts/deploy.sh on|off`
+handles install/revert, including a loader pre-flight (`LD_TRACE_LOADED_OBJECTS`) before the app
+is restarted. Never `adb push` over that file while the app runs — see the section below.
+
 ## Device Deployment & Recovery
 
 ### Deploying a new `libPenMods.so` / plugin `.so`

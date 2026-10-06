@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -325,7 +326,11 @@ private:
     void       handleNetworkReply(QNetworkReply* reply, bool isStream);
     void       finishStream();
     void       emitContentChunk(const QString& content);
+    void       appendAnswerChunk(const QString& text);
+    void       appendReasoningChunk(const QString& text);
     void       flushEmbeddedContent();
+    void       reclassifyFinalAnswer();
+    QJsonArray buildApiMessagesFromHistory();
     void       recordApiUsage(const QJsonObject& usage);
     bool       usesResponsesApi() const;
     QJsonArray messagesToResponsesInput(const QJsonArray& messages) const;
@@ -400,6 +405,7 @@ private:
     bool    isCommandBlocked(const QString& command);
     void    executeShellCommand(const QString& toolCallId, const QString& command);
     void    cleanupShellExec(const QString& toolCallId);
+    void    abortPendingShellExecs(const QString& reason);
     QString truncateOutput(const QString& output, int maxBytes);
 
     // 数学公式渲染
@@ -420,6 +426,7 @@ private:
 
     void submitToolResultBatched(const QString& toolCallId, const QString& toolName, const QString& result);
     void tryFlushToolBatch();
+    void resolvePendingToolCalls(const QString& reason);
 
     void callVisionProxy(
         const QString&              message,

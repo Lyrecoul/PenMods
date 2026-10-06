@@ -200,6 +200,7 @@ PEN_HOOK(bool, license_verify) { return true; }
 #include "tweaker/OcrBackend.h"
 #include "tweaker/QueryTweaks.h"
 #include "tweaker/TextBookHelper.h"
+#include "tweaker/TouchCalibration.h"
 #include "tweaker/WordBookTweaks.h"
 
 #include "hitokoto/Backend.h"
@@ -286,6 +287,7 @@ __attribute__((constructor)) static void BeforeMain() {
     INSTANCE(OcrBackend);
     INSTANCE(QueryTweaks);
     INSTANCE(TextBookHelper);
+    INSTANCE(TouchCalibration);
     INSTANCE(WordBookTweaks);
 
     // hitokoto

@@ -1,0 +1,35 @@
+--- a/libavformat/tls_openssl.c
++++ b/libavformat/tls_openssl.c
+@@ -249,9 +249,23 @@
+-    if (c->verify && !c->ca_file) {
+-        const char *ca = getenv("SSL_CERT_FILE");
+-        if (!ca || !*ca)
+-            ca = "/etc/ssl/certs/ca-certificates.crt";
+-        if (!SSL_CTX_load_verify_locations(p->ctx, ca, "/etc/ssl/certs")) {
+-            ret = AVERROR(EIO);
+-            goto fail;
+-        }
+-    }
++    if (c->verify && !c->ca_file) {
++        const char *ca = getenv("SSL_CERT_FILE");
++        const char *ca_dir = getenv("SSL_CERT_DIR");
++        int loaded;
++        if (ca && !*ca)
++            ca = NULL;
++        if (ca_dir && !*ca_dir)
++            ca_dir = NULL;
++        if (ca || ca_dir) {
++            loaded = SSL_CTX_load_verify_locations(p->ctx, ca, ca_dir);
++        } else {
++            /* Static builds may have a build-host OPENSSLDIR. Also use the
++             * target's hashed system CA directory, without requiring a bundle. */
++            loaded = SSL_CTX_set_default_verify_paths(p->ctx) &&
++                     SSL_CTX_load_verify_locations(p->ctx, NULL, "/etc/ssl/certs");
++        }
++        if (!loaded) {
++            av_log(h, AV_LOG_ERROR, "Unable to load TLS trust store: %s\n",
++                   ERR_error_string(ERR_get_error(), NULL));
++            ret = AVERROR(EIO);
++            goto fail;
++        }
++    }

@@ -1,0 +1,9 @@
+prefix=${pcfiledir}/..
+includedir=${prefix}/include
+libdir=${pcfiledir}/../../dictpen
+
+Name: libdrm
+Description: Userspace interface to kernel DRM services (library: from device)
+Version: 2.4.121
+Libs: -L${libdir} -ldrm
+Cflags: -I${includedir} -I${includedir}/libdrm

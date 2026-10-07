@@ -1,0 +1,14 @@
+--- a/configure
++++ b/configure
+@@ -1562,10 +1562,10 @@
+     decklink
+     libndi_newtek
+     libfdk_aac
+-    openssl
+ "
+ 
+ EXTERNAL_LIBRARY_VERSION3_LIST="
++    openssl
+     gmp
+     libopencore_amrnb
+     libopencore_amrwb

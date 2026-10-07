@@ -1,0 +1,30 @@
+#ifndef RAII_WRAPPERS_HPP
+#define RAII_WRAPPERS_HPP
+
+#include "FFmpegCore.hpp"
+
+namespace ffmpeg_player {
+
+// 自动管理 AVPacket (压缩数据)
+class PacketPtr {
+public:
+  AVPacket *pkt;
+  PacketPtr() { pkt = av_packet_alloc(); }
+  ~PacketPtr() { av_packet_free(&pkt); }
+  // 禁止拷贝，只能移动（或者按需实现移动语义）
+  PacketPtr(const PacketPtr &) = delete;
+  PacketPtr &operator=(const PacketPtr &) = delete;
+};
+
+// 自动管理 AVFrame (解码后的原始数据)
+class FramePtr {
+public:
+  AVFrame *frame;
+  FramePtr() { frame = av_frame_alloc(); }
+  ~FramePtr() { av_frame_free(&frame); }
+  FramePtr(const FramePtr &) = delete;
+  FramePtr &operator=(const FramePtr &) = delete;
+};
+
+} // namespace ffmpeg_player
+#endif

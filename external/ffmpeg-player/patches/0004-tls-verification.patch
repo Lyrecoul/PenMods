@@ -1,0 +1,39 @@
+--- a/libavformat/tls.h
++++ b/libavformat/tls.h
+@@ -50 +50 @@
+-    {"tls_verify", "Verify the peer certificate",         offsetof(pstruct, options_field . verify),    AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, .flags = TLS_OPTFL }, \
++    {"tls_verify", "Verify the peer certificate",         offsetof(pstruct, options_field . verify),    AV_OPT_TYPE_INT, { .i64 = 1 }, 0, 1, .flags = TLS_OPTFL }, \
+--- a/libavformat/tls_openssl.c
++++ b/libavformat/tls_openssl.c
+@@ -248,2 +248,11 @@
+     }
++    if (c->verify && !c->ca_file) {
++        const char *ca = getenv("SSL_CERT_FILE");
++        if (!ca || !*ca)
++            ca = "/etc/ssl/certs/ca-certificates.crt";
++        if (!SSL_CTX_load_verify_locations(p->ctx, ca, "/etc/ssl/certs")) {
++            ret = AVERROR(EIO);
++            goto fail;
++        }
++    }
+     if (c->cert_file && !SSL_CTX_use_certificate_chain_file(p->ctx, c->cert_file)) {
+@@ -261,3 +270,1 @@
+-    // Note, this doesn't check that the peer certificate actually matches
+-    // the requested hostname.
+     if (c->verify)
+@@ -271,2 +278,15 @@
+     }
++#if OPENSSL_VERSION_NUMBER < 0x30000000L
++#error This build requires Apache-2.0 licensed OpenSSL 3 or newer
++#endif
++    if (c->verify && !c->listen) {
++        X509_VERIFY_PARAM *param = SSL_get0_param(p->ssl);
++        int ok = c->numerichost
++            ? X509_VERIFY_PARAM_set1_ip_asc(param, c->host)
++            : X509_VERIFY_PARAM_set1_host(param, c->host, 0);
++        if (!ok) {
++            ret = AVERROR(EIO);
++            goto fail;
++        }
++    }
+ #if OPENSSL_VERSION_NUMBER >= 0x1010000fL

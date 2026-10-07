@@ -133,3 +133,8 @@ target('QrcExporter')
     add_packages(
         'spdlog',
         'dobby')
+
+-- 内嵌 FFmpeg 播放器插件（Haikure/ffmpeg-player，vendored 在 external/ffmpeg-player/）
+-- 独立 target，产物 qml/FFmpegPlayer/{libffmpegplayerplugin.so,qmldir} 需单独部署：
+--   scripts/deploy_ffmpeg_player.sh
+includes('external/ffmpeg-player')

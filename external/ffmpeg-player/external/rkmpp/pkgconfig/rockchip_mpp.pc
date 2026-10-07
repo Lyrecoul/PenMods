@@ -1,0 +1,9 @@
+prefix=${pcfiledir}/..
+includedir=${prefix}/include
+libdir=${pcfiledir}/../../dictpen
+
+Name: rockchip_mpp
+Description: Rockchip Media Process Platform (headers: host cross build, library: from device)
+Version: 1.3.10
+Libs: -L${libdir} -lrockchip_mpp
+Cflags: -I${includedir}

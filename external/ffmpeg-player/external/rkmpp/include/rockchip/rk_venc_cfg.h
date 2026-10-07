@@ -1,0 +1,54 @@
+/* SPDX-License-Identifier: Apache-2.0 OR MIT */
+/*
+ * Copyright (c) 2015 Rockchip Electronics Co., Ltd.
+ */
+
+#ifndef RK_VENC_CFG_H
+#define RK_VENC_CFG_H
+
+#include "rk_mpp_cfg.h"
+
+typedef void* MppEncCfg;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* userspace encoder config init */
+MPP_RET mpp_enc_cfg_init(MppEncCfg *cfg);
+/* kernel encoder config init */
+MPP_RET mpp_enc_cfg_init_k(MppEncCfg *cfg);
+/* common config deinit */
+MPP_RET mpp_enc_cfg_deinit(MppEncCfg cfg);
+
+MPP_RET mpp_enc_cfg_set_s8(MppEncCfg cfg, const char *name, RK_S8 val);
+MPP_RET mpp_enc_cfg_set_u8(MppEncCfg cfg, const char *name, RK_U8 val);
+MPP_RET mpp_enc_cfg_set_s16(MppEncCfg cfg, const char *name, RK_S16 val);
+MPP_RET mpp_enc_cfg_set_u16(MppEncCfg cfg, const char *name, RK_U16 val);
+MPP_RET mpp_enc_cfg_set_s32(MppEncCfg cfg, const char *name, RK_S32 val);
+MPP_RET mpp_enc_cfg_set_u32(MppEncCfg cfg, const char *name, RK_U32 val);
+MPP_RET mpp_enc_cfg_set_s64(MppEncCfg cfg, const char *name, RK_S64 val);
+MPP_RET mpp_enc_cfg_set_u64(MppEncCfg cfg, const char *name, RK_U64 val);
+MPP_RET mpp_enc_cfg_set_ptr(MppEncCfg cfg, const char *name, void *val);
+MPP_RET mpp_enc_cfg_set_st(MppEncCfg cfg, const char *name, void *val);
+
+MPP_RET mpp_enc_cfg_get_s8(MppEncCfg cfg, const char *name, RK_S8 *val);
+MPP_RET mpp_enc_cfg_get_u8(MppEncCfg cfg, const char *name, RK_U8 *val);
+MPP_RET mpp_enc_cfg_get_s16(MppEncCfg cfg, const char *name, RK_S16 *val);
+MPP_RET mpp_enc_cfg_get_u16(MppEncCfg cfg, const char *name, RK_U16 *val);
+MPP_RET mpp_enc_cfg_get_s32(MppEncCfg cfg, const char *name, RK_S32 *val);
+MPP_RET mpp_enc_cfg_get_u32(MppEncCfg cfg, const char *name, RK_U32 *val);
+MPP_RET mpp_enc_cfg_get_s64(MppEncCfg cfg, const char *name, RK_S64 *val);
+MPP_RET mpp_enc_cfg_get_u64(MppEncCfg cfg, const char *name, RK_U64 *val);
+MPP_RET mpp_enc_cfg_get_ptr(MppEncCfg cfg, const char *name, void **val);
+MPP_RET mpp_enc_cfg_get_st(MppEncCfg cfg, const char *name, void *val);
+
+void mpp_enc_cfg_show(void);
+MPP_RET mpp_enc_cfg_extract(MppEncCfg cfg, MppCfgStrFmt fmt, char **buf);
+MPP_RET mpp_enc_cfg_apply(MppEncCfg cfg, MppCfgStrFmt fmt, char *buf);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* RK_VENC_CFG_H */

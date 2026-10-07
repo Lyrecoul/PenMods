@@ -1,0 +1,3 @@
+module FFmpegPlayer
+plugin ffmpegplayerplugin
+classname FFmpegPlayerPlugin

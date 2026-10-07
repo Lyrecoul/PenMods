@@ -1,0 +1,5 @@
+--- a/libavformat/Makefile
++++ b/libavformat/Makefile
+@@ -136 +136 @@
+-OBJS-$(CONFIG_DASH_DEMUXER)              += dashdec.o
++OBJS-$(CONFIG_DASH_DEMUXER)              += dash.o dashdec.o

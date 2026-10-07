@@ -10,6 +10,7 @@
 #endif
 
 #include <QQmlContext>
+#include <QQmlEngine>
 #include <QQuickView>
 
 #include <QFile>
@@ -25,6 +26,13 @@ PEN_HOOK(void, _ZN22YGuiApplicationPrivate6initUiEv, QWindow** self) {
     auto* context = view.rootContext();
 
     mod::YPointer<QQuickView>::setInstance(&view);
+
+    // 外部 QML 模块（如内嵌 FFmpeg 播放器插件）的部署目录，缺失时静默跳过
+    const char* ExternalQmlDir = "/userdata/PenMods/qml";
+    if (QFile::exists(ExternalQmlDir)) {
+        view.engine()->addImportPath(ExternalQmlDir);
+        spdlog::info("Added external QML import path: {}", ExternalQmlDir);
+    }
 
     emit mod::Event::getInstance().beforeUiInitialization(view, context);
 

@@ -113,6 +113,7 @@ persisted as `righthandmode` in `/userdata/DictPenData/NeteaseYoudao/YoudaoDictP
 | `src/tweaker/` | Feature flags, DB limit patches, wordbook tweaks, keyboard |
 | `src/dict/` | Custom dictionaries (`customDict`): scans `/userdisk/PenMods/dicts/`, queries user-made `.dat` containers through the vendor reader and injects the hit into the main result page as its own section (see `doc/DICT_FORMAT_ANALYSIS.md`) |
 | `src/filemanager/` | File browser, MusicPlayer, VideoPlayer, TextReader, ImageViewer |
+| `external/ffmpeg-player/` | Vendored upstream QML video player plugin (in-scene-graph rendering, ASS/LRC subtitles, MPP hard decode behind a runtime gate) |
 | `src/helper/` | AntiEmbs, NetworkSettings, DeveloperSettings, ServiceManager |
 | `src/system/` | BatteryInfo, InputDaemon, ScreenManager, AudioDaemon |
 | `src/plugin/` | PluginManager, PluginSDK.h (public C ABI), QmlPluginWrapper |
@@ -214,6 +215,42 @@ around `/userdisk/mpv/bin/mpv` (0.36.0, `vo=wlshm`, config in `/userdisk/mpv/con
 so it never learns about left/right hand mode; the mod passes `--video-rotate=180` in left-hand mode. `--video-rotate`
 rotates the video frame only — subtitles/OSD are composited by the VO afterwards and stay unrotated (add `--vf=sub` to
 render them into the frame before the autorotate post-filter if that ever needs to change).
+
+### Embedded FFmpeg Player (QML plugin)
+
+`external/ffmpeg-player/` vendors [`Haikure/ffmpeg-player`](https://github.com/Haikure/ffmpeg-player) v1.0.0
+(GPL-3.0) — a Qt 5 QML video player that renders **into the host scene graph** (custom `QSGNode`, static FFmpeg
+3.4.8 + libass + OpenSSL 3 + libxml2), so the picture follows `YMainWindow.rotation` and PenMods controls can sit on
+top of it. `xmake build ffmpegplayerplugin` produces `build/<plat>/<arch>/<mode>/qml/FFmpegPlayer/`;
+`scripts/deploy_ffmpeg_player.sh` pushes it to `/userdata/PenMods/qml/FFmpegPlayer/` (tmp + rename, then restarts
+the app). `src/mod/Engine.cpp` adds `/userdata/PenMods/qml` as an import path before the main QML loads, so the page
+`resource/models/YDP02X/qml/audiopages/ExternalPlayer.qml` can `import FFmpegPlayer 1.0`;
+`ExternalPlayer::open()` skips the mpv process while that module exists (mpv stays the fallback). Full analysis and
+device measurements: `doc/FFMPEG_PLAYER_ANALYSIS.md`.
+
+- **Hard-decode gate — do not remove.** The stock device tree disables the VPU (`/proc/device-tree/vpu_combo` =
+  `disabled`), and the vendor MPP userspace still reports `mpp_check_support_format() == 0`; `mpp_init()` then
+  dereferences NULL and **kills the whole process** (measured: `unhandled level 2 translation fault (11) at 0x00000000`,
+  `PC is at 0x0`). `Mod::BeforeMain()` therefore sets `FFPLAYER_HWDEC=0` whenever `/dev/vpu_service` is missing. With a
+  VPU-enabled kernel/DTB the same build uses `h264_rkmpp`/`hevc_rkmpp` and `hardwareDecoding` becomes true. Any process
+  that loads this plugin outside the mod (e.g. `qmlscene` smoke tests) must set `FFPLAYER_HWDEC=0` itself — note the
+  device's `adbd` environment may already carry it (`cat /proc/$(pidof adbd)/environ`).
+- **VPU experimental switch.** `src/tweaker/VpuUnlock.*` (context property `vpuUnlock`, switch under
+  更多设置 → 系统微调 → 实验性功能) turns the VPU patch on and off from the UI: it backs the factory boot image up to
+  `/userdisk/PenMods/boot_stock.img` once, rewrites `vpu_combo/status` **inside the DTB in the boot image**
+  (`/userdisk/PenMods/boot_vpu.img`), flashes the active `boot_<slot>` partition with a read-back md5 check, and
+  reboots; turning it off restores the backup and reboots. Only the property *value* is rewritten, never its length —
+  shortening `disabled\0` to 5 bytes would move the next token and corrupt the blob. Node matching must not assume a
+  depth (`vpu_combo` sits under the root). The player page is `qml/audiopages/ExternalPlayer.qml` (tap reveals the OSD when it is
+  hidden and toggles play/pause when it is shown; long press = 2x boost; horizontal drag = seek with preview;
+  `-10s/+10s`/speed/subtitle chips; auto `.ass`/`.lrc` next to the video; plugin-drawn progress bar). The back button
+  lives inside the OSD so the picture stays clean while the OSD is hidden.
+- Build inputs: `PENMODS_FFMPEG_PLAYER_SW=1 xmake f -c …` builds a software-only plug-in variant (or simply remove
+  `external/dictpen/librockchip_mpp.so.1` + `libdrm.so.2`); `openssl3` is pinned to `3.5.6`
+  (xmake-repo has no `3.5.7`) and `network_revision` is bumped to force ffmpeg package rebuilds. `external/dictpen/*.so`
+  are **symlinks** in git (a zip download turns them into text files and breaks `-lrockchip_mpp`). On this dev machine
+  the xmake-repo `python` recipe needed `--enable-optimizations` removed (PGO test flake) because `harfbuzz` builds
+  through `meson`.
 
 ### Touch Calibration (udev rule)
 

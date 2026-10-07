@@ -23,6 +23,10 @@ on:
         options:
           - release
           - debug
+      build_player:
+        description: '同时构建内嵌 FFmpeg 播放器插件（首次约 40 分钟：要从源码编译 FFmpeg/OpenSSL3/libass）'
+        type: boolean
+        default: false
 
 env:
   GCC_BASE_URL: https://github.com/Redbeanw44602/aarch64-linux-gnu-gcc-6.5.0/releases/download/6.5.0
@@ -33,6 +37,9 @@ env:
   BUILD_PLATFORM: ${{ github.event.inputs.build_platform || 'YDP02X' }}
   TARGET_CHANNEL: ${{ github.event.inputs.target_channel || 'dev' }}
   BUILD_MODE: ${{ github.event.inputs.build_mode || 'release' }}
+  # 播放器插件默认不纳入构建：它的依赖链很重（见 external/ffmpeg-player/UPSTREAM.md）。
+  # 手动触发 workflow 并勾选 build_player 时才会一起编出来。
+  PENMODS_WITH_PLAYER: ${{ inputs.build_player && '1' || '' }}
 
 jobs:
   build:
@@ -44,9 +51,12 @@ jobs:
       - name: 更新系统 & 安装基础依赖
         run: |
           pacman -Syu --noconfirm
+          # unzip/perl 只有构建内嵌播放器插件时才会用到（openssl3 是 zip 包、OpenSSL 用 perl），
+          # 但装在容器里成本几乎为零，手动构建时不必再来一次 "no extractor found"
           pacman -S --noconfirm \
             base-devel git zig wget curl \
-            python3 ninja cmake nasm libxcrypt lame opencc qt5-tools qt5-base
+            python3 ninja cmake nasm libxcrypt lame opencc qt5-tools qt5-base \
+            unzip perl
 
       - name: 安装 aarch64-linux-gnu 工具链
         run: |
@@ -75,7 +85,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.XMAKE_PACKAGES_DIR }}
-          key: xmake-packages-${{ hashFiles('xmake.lua', 'xmake/**/*.lua') }}
+          key: xmake-packages-${{ hashFiles('xmake.lua', 'xmake/**/*.lua', 'external/ffmpeg-player/xmake.lua') }}
           restore-keys: |
             xmake-packages-
 

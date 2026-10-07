@@ -30,12 +30,15 @@ external/ffmpeg-player/
 | 所有 `os.scriptdir()` / 相对路径 → `path.join(os.projectdir(), "external", "ffmpeg-player", …)` | 被 `includes()` 载入后，相对路径的基准是根工程目录 |
 | `add_deps("openssl3 3.5.7")` → `3.5.6` | xmake-repo 里没有 3.5.7；按本机已有的版本钉住（上游若更新可跟随调整） |
 | `network_revision = 7` → `8` | 该字段参与 ffmpeg 包哈希，改它可强制重编；也用于让本地旧变体失效 |
+| 文件开头加"默认跳过"开关：没有 `PENMODS_WITH_PLAYER=1` 就 `return`，连 `add_requires` 都不声明 | CI 与只编 libPenMods.so 的人不必为一个 40 分钟的依赖链（FFmpeg/OpenSSL3/libass/harfbuzz→meson→python）和容器里的 `unzip`/`perl` 买单；`xmake build` 仍会成功（插件被跳过并打印一行提示） |
 | `rkmpp = has_device_libs(...)` → `rkmpp = use_rkmpp`（设备库存在即开启；`PENMODS_FFMPEG_PLAYER_SW=1` 可强制软解） | 保留原语义、去掉隐式行为；不用 xmake option 是因为本机 xmake 在工程加载阶段 `get_config()` 读不到 CLI 传进来的值（实测为 nil） |
 
 构建（`xmake f` / `xmake build` 会自动装依赖，不需要 `xmake require`）：
 
 ```sh
-xmake build ffmpegplayerplugin             # 产物 build/<plat>/<arch>/<mode>/qml/FFmpegPlayer/
+# 本子工程默认不参与工程解析（依赖链很重，见下表），需要 PENMODS_WITH_PLAYER=1 显式开启
+PENMODS_WITH_PLAYER=1 xmake f -c <原有配置...> -y
+PENMODS_WITH_PLAYER=1 xmake build ffmpegplayerplugin   # 产物 build/<plat>/<arch>/<mode>/qml/FFmpegPlayer/
 
 # 只出纯软解版本（不链接 MPP/DRM）：
 PENMODS_FFMPEG_PLAYER_SW=1 xmake f -c <原有配置...> -y && xmake build ffmpegplayerplugin

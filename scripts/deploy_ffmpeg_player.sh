@@ -19,7 +19,8 @@ DST_DIR=/userdata/PenMods/qml/FFmpegPlayer
 
 if [ ! -f "$SRC_DIR/libffmpegplayerplugin.so" ]; then
     echo "找不到产物: $SRC_DIR/libffmpegplayerplugin.so"
-    echo "先构建: xmake build ffmpegplayerplugin"
+    echo "先构建（插件的依赖链默认不参与工程解析，见 external/ffmpeg-player/UPSTREAM.md）："
+    echo "  PENMODS_WITH_PLAYER=1 xmake f -c <原有配置...> && xmake build ffmpegplayerplugin"
     exit 1
 fi
 

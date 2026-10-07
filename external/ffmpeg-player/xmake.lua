@@ -11,6 +11,24 @@
 --            否则 librockchip_mpp 会在 mpp_init 里段错误并带走宿主进程。
 -- ============================================================================
 
+-- 本子工程默认**不参与**工程解析：它带来一整套从源码编译的依赖
+-- （FFmpeg 3.4.8 / OpenSSL3 / libxml2 / libass + freetype/harfbuzz/fribidi，
+--   其中 harfbuzz 经 meson 还会拉 xmake-repo 的 python），首次配置约 40 分钟，
+-- 而且需要 unzip（openssl3 是 zip 包）与 perl。CI、以及只想编 libPenMods.so 的人
+-- 没必要为此买单，所以：
+--
+--   PENMODS_WITH_PLAYER=1 xmake f -c <原有配置...> && xmake build ffmpegplayerplugin
+--
+-- 需要时显式开启（内置播放器与 scripts/deploy_ffmpeg_player.sh 都要用到）。
+if not os.getenv("PENMODS_WITH_PLAYER") then
+    -- 工程文件一次调用里会被求值多次，提示只打一次（xmake 的沙箱里没有 _G，直接写全局）
+    if not __penmods_ffplayer_hint then
+        __penmods_ffplayer_hint = true
+        print("ffmpeg-player: skipped (set PENMODS_WITH_PLAYER=1 to build the embedded player plugin)")
+    end
+    return
+end
+
 set_license("GPL-3.0")
 
 local FFPLAYER_DIR = path.join(os.projectdir(), "external", "ffmpeg-player")

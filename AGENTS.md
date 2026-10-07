@@ -245,8 +245,10 @@ device measurements: `doc/FFMPEG_PLAYER_ANALYSIS.md`.
   hidden and toggles play/pause when it is shown; long press = 2x boost; horizontal drag = seek with preview;
   `-10s/+10s`/speed/subtitle chips; auto `.ass`/`.lrc` next to the video; plugin-drawn progress bar). The back button
   lives inside the OSD so the picture stays clean while the OSD is hidden.
-- Build inputs: `PENMODS_FFMPEG_PLAYER_SW=1 xmake f -c …` builds a software-only plug-in variant (or simply remove
-  `external/dictpen/librockchip_mpp.so.1` + `libdrm.so.2`); `openssl3` is pinned to `3.5.6`
+- Build inputs: the vendored subproject is **skipped unless `PENMODS_WITH_PLAYER=1`** is exported (`xmake build` then
+  builds the mod only, which is what CI does — the player's dependency chain needs ~40 min of from-source FFmpeg/OpenSSL3/
+  libass and a container with `unzip`/`perl`). `PENMODS_FFMPEG_PLAYER_SW=1` additionally builds a software-only variant
+  (or simply remove `external/dictpen/librockchip_mpp.so.1` + `libdrm.so.2`); `openssl3` is pinned to `3.5.6`
   (xmake-repo has no `3.5.7`) and `network_revision` is bumped to force ffmpeg package rebuilds. `external/dictpen/*.so`
   are **symlinks** in git (a zip download turns them into text files and breaks `-lrockchip_mpp`). On this dev machine
   the xmake-repo `python` recipe needed `--enable-optimizations` removed (PGO test flake) because `harfbuzz` builds

@@ -352,7 +352,8 @@ external/ffmpeg-player/          上游 v1.0.0（48ca849）的 vendor 副本，G
 ```sh
 xmake f --qt="$HOME/PenMods/aarch64-linux-qt-5.15.2" --arch=arm64-v8a --build-platform=YDP02X \
   --target-channel=dev --toolchain=zig -m release -vD --cross=aarch64-linux-gnu.2.27 -c
-xmake build ffmpegplayerplugin          # 产物 build/linux/arm64-v8a/release/qml/FFmpegPlayer/
+PENMODS_WITH_PLAYER=1 xmake build ffmpegplayerplugin   # 插件默认不参与工程解析，需显式开启
+                                                      # 产物 build/linux/arm64-v8a/release/qml/FFmpegPlayer/
 ./scripts/deploy_ffmpeg_player.sh
 ```
 

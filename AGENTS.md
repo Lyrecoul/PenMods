@@ -419,9 +419,10 @@ Clone `git@github.com:Lyrecoul/penmods-ota.git`. Its layout:
 | Path | Content |
 |---|---|
 | `updates.json` | Manifest served at jsDelivr `@main` (the URL the updater fetches) |
-| `template/_do_update.sh` | On-device installer: remounts `/` rw, copies `libPenMods.so` to `/userdata/PenMods/`, touches `INSTALL_SUCCESSFULLY` |
+| `template/_do_update.sh` | On-device installer: remounts `/` rw, copies `libPenMods.so` to `/userdata/PenMods/`, then `libPenModsResources.so` when the package carries it, touches `INSTALL_SUCCESSFULLY` |
 | `template/libPenMods.so` | Staging copy of the current release `.so` |
-| `update_vX.Y.Z.zip` | The published archive: `_do_update.sh` + `libPenMods.so` at the **archive root** (no top-level dir) |
+| `template/libPenModsResources.so` | Staging copy of the QML resource library (shipped since v2.4.0 — see below) |
+| `update_vX.Y.Z.zip` | The published archive: `_do_update.sh` + the two `.so` files at the **archive root** (no top-level dir) |
 
 The OTA repo tags with a **lowercase** `v` (`v2.0.0`, `v2.3.0`) — distinct from this repo's `VX.Y.Z`.
 
@@ -429,18 +430,24 @@ The OTA repo tags with a **lowercase** `v` (`v2.0.0`, `v2.3.0`) — distinct fro
 
 ```sh
 cp build/linux/arm64-v8a/release/libPenMods.so <ota>/template/libPenMods.so
+cp build/linux/arm64-v8a/release/libPenModsResources.so <ota>/template/libPenModsResources.so
 python3 - <<'PY'
 import zipfile, os, hashlib
 os.chdir('<ota>')
 zp = 'update_vX.Y.Z.zip'
 with zipfile.ZipFile(zp, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-    for name in ('_do_update.sh', 'libPenMods.so'):
+    for name in ('_do_update.sh', 'libPenMods.so', 'libPenModsResources.so'):
         zi = zipfile.ZipInfo(name)
         zi.external_attr = (0o755 if name.endswith('.sh') else 0o644) << 16
         z.writestr(zi, open(os.path.join('template', name), 'rb').read())
 print(os.path.getsize(zp), hashlib.md5(open(zp, 'rb').read()).hexdigest())
 PY
 ```
+
+Since v2.4.0 the package also carries `libPenModsResources.so`: a device that already has that file in
+`/userdata/PenMods/` keeps using it in preference to the copy compiled into `libPenMods.so` (`Engine.cpp`), so updating
+only the main library would pair new C++ with stale QML. `_do_update.sh` copies it when present, which also turns a
+device that never had it into one that loads resources externally — same content either way.
 
 Then add an entry to `updates.json` (`size`/`md5` are those of the **zip**, not the `.so`):
 

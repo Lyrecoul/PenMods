@@ -640,7 +640,7 @@ static bool normalizeHistoryMessages(QVector<MessageData>& messages, int* droppe
 
         result.append(assistant);
         result += resolved;
-        index = next - 1;
+        index   = next - 1;
     }
 
     messages = result;
@@ -675,7 +675,7 @@ void ChatBot::saveSessions() {
 
     QFile file(sessionsFilePath());
     if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        const std::string payload = root.dump();
+        const std::string payload = root.dump(4);
         file.write(payload.c_str(), static_cast<qint64>(payload.size()));
         file.close();
     } else {
@@ -741,8 +741,8 @@ void ChatBot::initSessions() {
                     );
                     historySanitized |= session.messages.size() != oldSize;
                     // 修复历史里损坏的工具调用组
-                    int droppedOrphans = 0;
-                    historySanitized |= normalizeHistoryMessages(session.messages, &droppedOrphans);
+                    int droppedOrphans  = 0;
+                    historySanitized   |= normalizeHistoryMessages(session.messages, &droppedOrphans);
                     if (droppedOrphans > 0)
                         warn("会话 {} 丢弃了 {} 条找不到宿主的工具结果", session.id.toStdString(), droppedOrphans);
                     if (!session.id.isEmpty()) m_sessions.insert(session.id, session);
@@ -1546,12 +1546,12 @@ struct ThinkTag {
 };
 
 const ThinkTag kThinkTags[] = {
-    { "<thinking>",  "</thinking>" },
-    { "<think>",     "</think>"    },
-    { "<reasoning>", "</reasoning>"},
-    { "<reasoning_scratchpad>", "</reasoning_scratchpad>" },
-    { "<thought>",   "</thought>"  },
-    { "<analysis>",  "</analysis>" },
+    {"<thinking>",             "</thinking>"            },
+    {"<think>",                "</think>"               },
+    {"<reasoning>",            "</reasoning>"           },
+    {"<reasoning_scratchpad>", "</reasoning_scratchpad>"},
+    {"<thought>",              "</thought>"             },
+    {"<analysis>",             "</analysis>"            },
 };
 
 struct ThinkAlias {
@@ -1560,21 +1560,20 @@ struct ThinkAlias {
 };
 
 const ThinkAlias kThinkAliases[] = {
-    { "<|thinking|>",  "<thinking>"  },
-    { "<|/thinking|>", "</thinking>" },
-    { "<|think|>",     "<think>"     },
-    { "<|/think|>",    "</think>"    },
-    { "<think >",      "<think>"     },
-    { "<thinking >",   "<thinking>"  },
-    { "\xe2\x97\x81think\xe2\x96\xb7",   "<think>"  },
-    { "\xe2\x97\x81/think\xe2\x96\xb7",  "</think>" },
-    { "\xef\xbd\x9cthink\xef\xbd\x9c",   "<think>"  },
-    { "\xef\xbd\x9c/think\xef\xbd\x9c",  "</think>" },
+    {"<|thinking|>",                   "<thinking>" },
+    {"<|/thinking|>",                  "</thinking>"},
+    {"<|think|>",                      "<think>"    },
+    {"<|/think|>",                     "</think>"   },
+    {"<think >",                       "<think>"    },
+    {"<thinking >",                    "<thinking>" },
+    {"\xe2\x97\x81think\xe2\x96\xb7",  "<think>"    },
+    {"\xe2\x97\x81/think\xe2\x96\xb7", "</think>"   },
+    {"\xef\xbd\x9cthink\xef\xbd\x9c",  "<think>"    },
+    {"\xef\xbd\x9c/think\xef\xbd\x9c", "</think>"   },
 };
 
 QString normalizeThinkTags(const QString& text) {
-    if (!text.contains(QLatin1Char('<')) && !text.contains(QChar(0x25C1)) && !text.contains(QChar(0xFF5C)))
-        return text;
+    if (!text.contains(QLatin1Char('<')) && !text.contains(QChar(0x25C1)) && !text.contains(QChar(0xFF5C))) return text;
 
     QString normalized = text;
     for (const auto& alias : kThinkAliases) {
@@ -1616,8 +1615,7 @@ int retainForPossibleTag(const QString& buffer) {
     const int keep = qMin(buffer.size(), kTagRetainChars);
     if (keep <= 0) return 0;
     const QString tail = buffer.right(keep);
-    if (!tail.contains(QLatin1Char('<')) && !tail.contains(QChar(0x25C1)) && !tail.contains(QChar(0xFF5C)))
-        return 0;
+    if (!tail.contains(QLatin1Char('<')) && !tail.contains(QChar(0x25C1)) && !tail.contains(QChar(0xFF5C))) return 0;
     return keep;
 }
 
@@ -1658,11 +1656,11 @@ QString extractReasoningField(const QJsonObject& obj) {
     }
 
     // reasoning 为对象时取其中的 text/content
-    for (const char* key : { "reasoning", "thinking" }) {
+    for (const char* key : {"reasoning", "thinking"}) {
         const QJsonValue value = obj.value(QLatin1String(key));
         if (!value.isObject()) continue;
         const QJsonObject nested = value.toObject();
-        for (const char* textKey : { "text", "content", "summary", "thinking" }) {
+        for (const char* textKey : {"text", "content", "summary", "thinking"}) {
             const QJsonValue textValue = nested.value(QLatin1String(textKey));
             if (textValue.isString() && !textValue.toString().isEmpty()) return textValue.toString();
         }
@@ -1685,8 +1683,8 @@ QString extractReasoningField(const QJsonObject& obj) {
 
 EmbeddedContent splitEmbeddedContent(const QString& rawContent) {
     EmbeddedContent result;
-    const QString content = normalizeThinkTags(rawContent);
-    result.answer         = content;
+    const QString   content = normalizeThinkTags(rawContent);
+    result.answer           = content;
 
     const TagMatch open = findEarliestThinkTag(content, false);
     if (open.pos < 0) {
@@ -1699,7 +1697,7 @@ EmbeddedContent splitEmbeddedContent(const QString& rawContent) {
         return result;
     }
 
-    const TagMatch close = findEarliestThinkTag(content.mid(open.pos + open.length), true);
+    const TagMatch close          = findEarliestThinkTag(content.mid(open.pos + open.length), true);
     const int      reasoningStart = open.pos + open.length;
     if (close.pos < 0) {
         // 没有结束标签：整段都算思维链
@@ -1730,9 +1728,9 @@ void normalizeToolMessageSequence(QJsonArray& messages) {
         const QJsonValue toolCallsValue = message.value(QLatin1String("tool_calls"));
         if (!toolCallsValue.isArray()) continue;
 
-        QStringList    pendingIds;
-        QSet<QString>  seenIds;
-        QJsonArray     validCalls;
+        QStringList   pendingIds;
+        QSet<QString> seenIds;
+        QJsonArray    validCalls;
         for (const QJsonValue& callValue : toolCallsValue.toArray()) {
             const QJsonObject call = callValue.toObject();
             const QString     id   = call.value(QLatin1String("id")).toString().trimmed();
@@ -1750,7 +1748,7 @@ void normalizeToolMessageSequence(QJsonArray& messages) {
             continue;
         }
         if (validCalls.size() != toolCallsValue.toArray().size()) {
-            QJsonObject cleaned = normalized.last().toObject();
+            QJsonObject cleaned   = normalized.last().toObject();
             cleaned["tool_calls"] = validCalls;
             normalized.replace(normalized.size() - 1, cleaned);
         }
@@ -1769,8 +1767,7 @@ void normalizeToolMessageSequence(QJsonArray& messages) {
             QJsonObject toolMessage;
             toolMessage["role"]         = QStringLiteral("tool");
             toolMessage["tool_call_id"] = id;
-            toolMessage["content"] =
-                results.contains(id) ? results.value(id) : pendingToolResultText();
+            toolMessage["content"]      = results.contains(id) ? results.value(id) : pendingToolResultText();
             normalized.append(toolMessage);
         }
     }
@@ -1972,7 +1969,9 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
     m_serverToolCallActive = false;
     m_serverToolCallName.clear();
 
-    // 流式与非流式都要发 streamStart
+    // 流式与非流式都要发 streamStart：QML 用它复位 streamThrottle（endProcessed 等），
+    // 否则一次流式回复之后再发非流式请求时 messageReceived 会被 endProcessed 挡住，
+    // 回复不显示。注意非流式路径不发 streamEnd，只有 finishStream() 会发。
     emit streamStart();
 
     connect(reply, &QNetworkReply::finished, this, [this, reply, seq]() {
@@ -2088,8 +2087,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                     ) {
                         // 服务端只推 done 时用最终文本兜底
                         const QString content = obj["text"].toString();
-                        if (m_currentReasoningBuffer.isEmpty() && !content.isEmpty())
-                            appendReasoningChunk(content);
+                        if (m_currentReasoningBuffer.isEmpty() && !content.isEmpty()) appendReasoningChunk(content);
                     } else if (eventType == "response.function_call_arguments.delta") {
                         const QString callId  = obj["item_id"].toString(obj["call_id"].toString());
                         const QString content = obj["delta"].toString();

@@ -138,6 +138,11 @@ Package `com.github.penuniverse` (1.0). Context properties registered in Engine.
 - Edit the source QML files under `resource/models/YDP02X/`. The whole `qml/` tree is listed in
   `.git/info/exclude`, so it is untracked/ignored by git — only the regenerated `qrc_qml.h` is committed. Stage
   that generated header together with the C++ changes.
+- A clone therefore has no editable sources: `scripts/unpack_qt_res.sh [YDP02X]` parses the committed header and writes the
+  tree back out (in place, or to `-o DIR`), so a fresh checkout can be worked on. It restores each file's mtime from the
+  header too, because `rcc` embeds mtimes; `--check` compares the tree against the header (exit 1 when out of sync) and
+  `-f` overwrites files whose contents differ. Note that it cannot reproduce directory entry order, which `rcc` follows,
+  so a regenerated header may order entries differently even when every file matches.
 - `resource/models/YDP02X/qrc_qml.h` is generated output. Never edit or format it manually, including whitespace-only fixes; any manual change will be overwritten by the next resource generation.
 - After any QML or bundled resource change, regenerate, build, and deploy with:
   ```sh

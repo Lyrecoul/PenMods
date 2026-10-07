@@ -210,6 +210,31 @@ so it never learns about left/right hand mode; the mod passes `--video-rotate=18
 rotates the video frame only — subtitles/OSD are composited by the VO afterwards and stay unrotated (add `--vf=sub` to
 render them into the frame before the autorotate post-filter if that ever needs to change).
 
+### Touch Calibration (udev rule)
+
+`mod::TouchCalibration` (`src/tweaker/TouchCalibration.*`, context property `touchCalibration`, switch in
+更多设置 → 系统微调 → 实验性功能) writes `/etc/udev/rules.d/99-penmods-touch-calibration.rules`:
+
+```
+ATTRS{name}=="hyn_ts|ft3427_ts", ENV{LIBINPUT_CALIBRATION_MATRIX}="1 0 0 0 1 0.003125"
+```
+
+The device runs udevd (220) and Weston 8.0.0 on libinput 10.13, which reads `LIBINPUT_CALIBRATION_MATRIX` when it opens
+the touchscreen — this is the mechanism Weston's own `weston-touch-calibrator` (also installed) prints for persistence.
+`udevd` only parses rules at boot and libinput only reads the property when the device is opened, hence the switch
+reboots the machine; the app is on the rootfs (`/dev/root / ext4 rw`, and `Mod::onUiCompleted()` remounts it rw anyway),
+so the rule itself survives reboots but not a firmware reflash.
+
+- The touch IC is **not** the same on every unit: the tested YDP02X reports `hyn_ts` (i2c-1 @0x1a, `/dev/input/event2`),
+  while another YDP02X uses `ft3427_ts`; YDPG3/YDP03X names are unknown. Add names to the alternation in
+  `RULE_DEVICES` — a rule whose `ATTRS{name}` matches nothing is silently inert.
+- The matrix compensates one pixel: `ABS_MT_POSITION_X/Y` is `0..170`/`0..320` on a 170x320 panel, so the outermost
+  row normalizes onto the pixel just outside the window and QML never sees the press; +1/320 pulls it back in.
+  Verify one toggle with `udevadm test /sys/class/input/event2 | grep LIBINPUT_CALIBRATION_MATRIX=` (no reboot needed)
+  and the applied value afterwards with `libinput-list-devices` (the `Calibration:` line).
+- `weston-touch-calibrator` needs Weston started with `--debug` (`/etc/init.d/S50launcher` ~line 96, restore when done),
+  which also re-enables `weston-screenshooter`.
+
 ## Experimental OCR Backend (PP-OCRv5)
 
 `tools/ppocr-backend/` holds an **opt-in, off-by-default** replacement for the pen's line

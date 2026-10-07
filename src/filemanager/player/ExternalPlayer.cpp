@@ -27,8 +27,6 @@ namespace {
 // 不再拉起独立的 mpv（进程内播放能跟随左右手旋转、支持画面内控件与字幕）。
 const char* EmbeddedPlayerModule = "/userdata/PenMods/qml/FFmpegPlayer/libffmpegplayerplugin.so";
 
-bool hasEmbeddedPlayer() { return QFile::exists(EmbeddedPlayerModule); }
-
 // 左右手模式只在主程序的 QML 层做 180° 旋转, mpv 作为独立进程拿不到这个信息.
 bool isLeftHandMode() {
     auto* settingManager = YPointer<YSettingManager>::getInstance();
@@ -49,6 +47,8 @@ ExternalPlayer::ExternalPlayer() {
         context->setContextProperty("externalPlayer", this);
     });
 } // namespace mod::filemanager
+
+bool ExternalPlayer::hasEmbeddedPlayer() const { return QFile::exists(EmbeddedPlayerModule); }
 
 void ExternalPlayer::open(const QString& path) {
     mOpeningFileName = path;

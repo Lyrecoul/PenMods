@@ -13,8 +13,11 @@ namespace mod {
 /**
  * @brief 触摸校准开关
  *
- * 向 /etc/udev/rules.d 写入校准矩阵，补偿屏幕边缘一个像素的死区。
- * 矩阵只在开机时被读取，因此切换后需要重启系统才生效。
+ * 往 /etc/udev/rules.d 写一条 LIBINPUT_CALIBRATION_MATRIX 规则，补偿触摸 IC 量程比面板
+ * 多一个像素造成的边缘死区（矩阵怎么来的见 .cpp 里的注释）。
+ *
+ * udevd 只在开机时解析规则、libinput 只在设备打开时读取该属性，因此切换后需要重启整机。
+ * 写入失败时会弹出提示并让开关回到磁盘上的真实状态。
  */
 class TouchCalibration : public QObject, public Singleton<TouchCalibration>, private Logger {
     Q_OBJECT
@@ -35,6 +38,8 @@ private:
     friend Singleton<TouchCalibration>;
     explicit TouchCalibration();
 
+    bool installRule();
+    void fail(const QString& message);
     void rebootSystem();
 };
 

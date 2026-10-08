@@ -20,6 +20,12 @@ public:
     bool setScreenOff(uint32 sec);
     bool setSystemSuspend(uint32 sec);
 
+    // Runtime-only override: while enabled the {system_suspend} idle action is
+    // disabled, without touching the user's persisted value, so the configured
+    // duration is restored as soon as the override is cleared. Used by the audio
+    // lock to keep a playing device from suspending (which would drop Bluetooth).
+    void setSystemSuspendOverride(bool enabled);
+
     // Reset input daemon from cfg.
     void reset();
 
@@ -40,6 +46,8 @@ private:
     uint32 mBackLightDown = 30;
     uint32 mScreenOff     = 60;
     uint32 mSystemSuspend = 600;
+
+    bool mSystemSuspendOverride = false;
 
     bool _resetConfig();
 

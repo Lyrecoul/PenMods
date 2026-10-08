@@ -164,6 +164,13 @@ void ScreenManager::resetInactivityTimer() {
 }
 
 void ScreenManager::requestPowerOff() {
+    // The audio lock keeps the whole device awake while something is playing,
+    // so a pending auto-shutdown must not cut the audio output either.
+    if (mAudioLockActive) {
+        qInfo() << "inactivity shutdown timer expired but audio lock is active; deferring";
+        resetInactivityTimer();
+        return;
+    }
     qInfo() << "inactivity shutdown timer expired";
     if (mSystemBase == nullptr) {
         qWarning() << "cannot power off: YSystemBase is not captured";
@@ -235,12 +242,23 @@ void ScreenManager::setIntelSleepAudioLock(bool val) {
 
 void ScreenManager::onAudioDaemonStateChanged() {
     bool audioActive = AudioDaemon::getInstance().state() == AudioDaemonState::PLAYING;
-    if (mIntelSleepAudioLock && audioActive && !mAudioLockActive) {
+    // The same switch guards every idle action that would cut audio output:
+    // screen off (host stop_auto_screen_off) and system suspend (the
+    // system_suspend idle action of input-event-daemon). Suspend powers down
+    // the radio, so Bluetooth playback would not resume after a wake-up.
+    bool shouldLock = mIntelSleepAudioLock && audioActive;
+    if (shouldLock && !mAudioLockActive) {
         mAudioLockActive = true;
+        // setSystemSuspendOverride() rewrites the daemon config and restarts
+        // input-event-daemon. The host pause is delivered with SIGUSR1 to the
+        // running process (plus a /tmp marker), and a freshly started daemon
+        // starts unpaused, so re-apply the screen pause after the restart.
+        InputDaemon::getInstance().setSystemSuspendOverride(true);
         rtSetAutoScreenOff(false);
-    } else if (mAudioLockActive && (!audioActive || !mIntelSleepAudioLock)) {
+    } else if (mAudioLockActive && !shouldLock) {
         mAudioLockActive = false;
         rtSetAutoScreenOff(true);
+        InputDaemon::getInstance().setSystemSuspendOverride(false);
     }
 }
 

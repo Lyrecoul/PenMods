@@ -40,6 +40,14 @@ bool InputDaemon::setSystemSuspend(uint32 sec) {
     return true;
 }
 
+void InputDaemon::setSystemSuspendOverride(bool enabled) {
+    if (mSystemSuspendOverride == enabled) {
+        return;
+    }
+    mSystemSuspendOverride = enabled;
+    _resetConfig();
+}
+
 void InputDaemon::reset() {
     setScreenOff(ScreenManager::getInstance().getAutoSleepDuration());
     setSystemSuspend(BatteryInfo::getInstance().getAutoSuspendDuration());
@@ -50,14 +58,17 @@ void InputDaemon::pause() { PEN_CALL(void*, "stop_auto_screen_off")(); }
 void InputDaemon::resume() { PEN_CALL(void*, "start_auto_screen_off")(); }
 
 bool InputDaemon::_resetConfig() {
-    auto          cfg = _getConfig();
+    auto cfg = _getConfig();
+    // The audio lock suppresses suspend at runtime without discarding the
+    // user's configured duration.
+    auto          suspend = mSystemSuspendOverride ? 0 : mSystemSuspend;
     std::ofstream ofile(cfg.mPath);
     if (ofile.good()) {
         exec("killall input-event-daemon");
         ofile << QString::fromStdString(cfg.mContent)
                      .replace("{backlight_down}", mBackLightDown ? QString::number(mBackLightDown) : "#")
                      .replace("{screen_off}", mScreenOff ? QString::number(mScreenOff) : "#")
-                     .replace("{system_suspend}", mSystemSuspend ? QString::number(mSystemSuspend) : "#")
+                     .replace("{system_suspend}", suspend ? QString::number(suspend) : "#")
                      .toStdString();
     } else {
         return false;

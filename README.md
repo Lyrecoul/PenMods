@@ -40,6 +40,13 @@ xmake build QrcExporter # 编译 Qrc 资源导出模块（需要手动 patch 有
 xmake clean # 清理编译产物
 ```
 
+### CI
+
+`.github/workflows/build.yaml` 只在**构建输入**变化时运行：`xmake.lua`、`src/`、`resource/`、`external/`、
+`scripts/`、随仓库提供的 `binary/xmake-git-*.pkg.tar.zst`，以及 workflow 自身。只改文档（`README.md`、
+`AGENTS.md`、`doc/`）或改 `mathjax-server/`、`tools/` 不会触发它。需要时可以在 Actions 页面手动
+`workflow_dispatch` 触发；新增构建输入时记得把它加进 workflow 顶部的两个 `paths:` 列表，否则该改动会静默跳过 CI。
+
 ### Supported
  - 设备支持情况
  - 对于同代（按屏幕大小区分代）但不同发行版本较多的笔，不一一适配，仅适配功能最多的型号

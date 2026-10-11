@@ -123,6 +123,8 @@ PEN_HOOK(uint64, _ZN11YSystemBase8ocrStartEv, uint64 self, uint64 a2, uint64 a3,
 }
 
 PEN_HOOK(uint64, _ZN11YSystemBase7ocrStopEi, uint64 self, int a2, uint64 a3, uint64 a4, uint64 a5) {
+    // 先发事件再判拦截：被 shouldBlockScan 拦下的扫描也必须关窗，否则扫描保护会一直占着 MUSIC 引用。
+    emit mod::Event::getInstance().ocrStopped();
     if (shouldBlockScan()) {
         return false;
     }
@@ -141,5 +143,6 @@ PEN_HOOK(
     if (shouldBlockScan()) {
         return false;
     }
-    return origin(self, a5, a2, a3, a4);
+    // origin 的实参按 ABI 顺序 a2,a3,a4,a5 传，调换会让宿主读到别的字段。
+    return origin(self, a2, a3, a4, a5);
 }

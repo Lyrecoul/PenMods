@@ -123,6 +123,9 @@ public:
     Q_INVOKABLE void    cancelMarkdownParse(const QString& requestId);
     Q_INVOKABLE void    truncateHistory(int index);
     Q_INVOKABLE void    editMessage(int index, const QString& newContent);
+    // 带媒体的编辑：mediaParts 是编辑后仍在的图片（[{type,url,localPath,name,mimeType}]，
+    // url 可为空、只给 localPath）。独立函数而非默认参数：QML 按实参个数分派会解析失败。
+    Q_INVOKABLE void    editMessageWithMedia(int index, const QString& newContent, const QString& mediaParts);
     Q_INVOKABLE void    deleteMessage(int index);
     Q_INVOKABLE void    regenerateMessage(int index);
     Q_INVOKABLE void    cancelRequest();
@@ -374,6 +377,8 @@ private:
     void                 initTavily();
     void                 injectToolDefinitions(QJsonObject& requestBody);
     QVector<MessagePart> persistGeneratedImages(const QJsonArray& output);
+    // 视觉代理路径专用：原图落盘成会话附件（仅本地查看，不发给主模型）
+    QVector<MessagePart> persistUserImages(const QVector<MessagePart>& parts, const QString& sessionId);
     QVariantList         attachmentVariants(const QVector<MessagePart>& parts) const;
     void                 dispatchToolCalls(const QString& toolCallsJson);
     void                 executeTavilySearch(const QString& toolCallId, const QString& query);
@@ -438,7 +443,9 @@ private:
         const QString&              message,
         const QVector<MessagePart>& parts,
         const QString&              effectiveMessage,
-        const QString&              sessionId
+        const QString&              sessionId,
+        // 仅本地查看的附件（视觉代理路径下的用户原图）：落盘后进历史，但不进这一轮的请求
+        const QVector<MessagePart>& localOnlyParts = {}
     );
 };
 

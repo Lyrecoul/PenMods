@@ -18,7 +18,7 @@
 
 namespace mod {
 
-class ScreenManager : public QObject, public Singleton<ScreenManager> {
+class ScreenManager : public QObject, public Singleton<ScreenManager>, private Logger {
     Q_OBJECT
 
     Q_PROPERTY(QString autoSleepDuration READ getAutoSleepDurationStr WRITE setAutoSleepDurationStr NOTIFY
@@ -88,6 +88,11 @@ private:
     explicit ScreenManager();
 
     std::string mClassName = "screen";
+
+    // mResumePending：灭屏期间被推迟的 start_auto_screen_off（灭屏时调用会把屏幕点亮），
+    // 等 onScreenOn 补做；mScreenOn 只用于这个判断。
+    bool mScreenOn{true};
+    bool mResumePending{false};
     json        mCfg;
 
     int  mAutoSleepDuration;

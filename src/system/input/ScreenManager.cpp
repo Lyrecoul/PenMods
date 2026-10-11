@@ -21,7 +21,7 @@
 
 namespace mod {
 
-ScreenManager::ScreenManager() {
+ScreenManager::ScreenManager() : Logger("ScreenManager") {
 
     mCfg = Config::getInstance().read(mClassName);
 
@@ -149,12 +149,20 @@ bool ScreenManager::eventFilter(QObject* watched, QEvent* event) {
 }
 
 void ScreenManager::onScreenOn() {
-    qInfo() << "screen on: reset inactivity shutdown timer";
+    info("screen on: reset inactivity shutdown timer");
+    mScreenOn = true;
+    if (mResumePending) {
+        // 补做 rtSetAutoScreenOff 延迟的那次 resume（灭屏时调厂商接口会立刻把屏幕点亮）。
+        mResumePending = false;
+        info("屏幕已亮，补做延迟的 start_auto_screen_off");
+        InputDaemon::getInstance().resume();
+    }
     resetInactivityTimer();
 }
 
 void ScreenManager::onScreenOff() {
-    qInfo() << "screen off: reset inactivity shutdown timer";
+    info("screen off: reset inactivity shutdown timer");
+    mScreenOn = false;
     resetInactivityTimer();
 }
 
@@ -263,7 +271,20 @@ void ScreenManager::onAudioDaemonStateChanged() {
 }
 
 void ScreenManager::rtSetAutoScreenOff(bool val) {
-    val ? InputDaemon::getInstance().resume() : InputDaemon::getInstance().pause();
+    if (!val) {
+        mResumePending = false;
+        InputDaemon::getInstance().pause();
+        return;
+    }
+    if (!mScreenOn) {
+        // 屏幕灭着时调厂商的 start_auto_screen_off() 正是实测"按电源键熄屏后马上又亮"的位置，
+        // 所以先记一笔，等 onScreenOn 再补做。
+        mResumePending = true;
+        info("屏幕未亮，延迟 start_auto_screen_off");
+        return;
+    }
+    mResumePending = false;
+    InputDaemon::getInstance().resume();
 }
 
 } // namespace mod
@@ -309,5 +330,6 @@ PEN_HOOK(
     mod::ScreenManager::getInstance().onPlayStateChanged(
         PEN_CALL(PlayState, "_ZNK19YMediaPlayerManager9playStateEv", uint64)(self)
     );
-    return origin(self, a5, a2, a3, a4);
+    // origin 的实参按 ABI 顺序 a2,a3,a4,a5 传，调换会让回读到的 playState 变成别的字段。
+    return origin(self, a2, a3, a4, a5);
 }

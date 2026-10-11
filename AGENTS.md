@@ -136,6 +136,15 @@ in the OTA package** — the binary has to be shipped to users separately (the c
 - Verify with: `echo '{"latex":"\\boxed{\\text{中文}}","display":true,"screenWidth":320}' | curl -s -X POST
   http://127.0.0.1:3000/render -H 'Content-Type: application/json' -d @-`, then save the returned base64 as a
   PNG and check it by eye (the dimensions alone do not tell you whether the Chinese glyphs are missing).
+- Smoke-testing on the dev host needs the x86_64 binding, which this repo does not ship. Install it **without
+  touching the arm64 one**, e.g. `npm install --prefix /tmp/resvgx64 @resvg/resvg-js-linux-x64-gnu@2.6.2` and run
+  with `NODE_PATH=/tmp/resvgx64/node_modules node index.js`. Do **not** run a bare
+  `npm install @resvg/resvg-js-linux-x64-gnu` in `mathjax-server/`: npm treats the arm64 package as
+  platform-incompatible and prunes it, and `build.sh` then produces a ~5 MB smaller binary that dies on the device
+  with `Cannot find module '@resvg/resvg-js-linux-arm64-gnu'`. Restore it with
+  `npm pack @resvg/resvg-js-linux-arm64-gnu@2.6.2` + `tar -xzf … --strip-components=1 -C
+  node_modules/@resvg/resvg-js-linux-arm64-gnu`, and always start the freshly built binary once before pushing it
+  to a device.
 
 ### Host Objects Used from PenMods QML
 

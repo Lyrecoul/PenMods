@@ -125,11 +125,11 @@ public:
     Q_INVOKABLE void    editMessage(int index, const QString& newContent);
     // 带媒体的编辑：mediaParts 是编辑后仍在的图片（[{type,url,localPath,name,mimeType}]，
     // url 可为空、只给 localPath）。独立函数而非默认参数：QML 按实参个数分派会解析失败。
-    Q_INVOKABLE void    editMessageWithMedia(int index, const QString& newContent, const QString& mediaParts);
-    Q_INVOKABLE void    deleteMessage(int index);
-    Q_INVOKABLE void    regenerateMessage(int index);
-    Q_INVOKABLE void    cancelRequest();
-    Q_INVOKABLE void    resetApiCacheStats();
+    Q_INVOKABLE void editMessageWithMedia(int index, const QString& newContent, const QString& mediaParts);
+    Q_INVOKABLE void deleteMessage(int index);
+    Q_INVOKABLE void regenerateMessage(int index);
+    Q_INVOKABLE void cancelRequest();
+    Q_INVOKABLE void resetApiCacheStats();
 
     // Tool Call 接口
     Q_INVOKABLE void submitToolResult(const QString& toolCallId, const QString& toolName, const QString& result);

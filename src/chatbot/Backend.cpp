@@ -19,7 +19,6 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
-#include <QSaveFile>
 #include <QHttpMultiPart>
 #include <QHttpPart>
 #include <QJsonArray>
@@ -32,6 +31,7 @@
 #include <QQmlContext>
 #include <QRegularExpression>
 #include <QRunnable>
+#include <QSaveFile>
 #include <QTextDocument>
 #include <QTextStream>
 #include <QTimer>

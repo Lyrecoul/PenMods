@@ -352,7 +352,7 @@ bool Config::_load() {
         }
         info("Saving configuration...");
     }
-    mData = std::move(tmp);
+    mData                       = std::move(tmp);
     const bool legacyAiUpgraded = _upgrade_legacy_ai_defaults(mData);
     if (_fill_missing_defaults(mData, mDefaults) || legacyAiUpgraded) {
         info("Filling missing default keys, saving...");

@@ -61,12 +61,13 @@ bool InputDaemon::_resetConfig() {
     auto cfg = _getConfig();
     // The audio lock suppresses suspend at runtime without discarding the
     // user's configured duration.
-    auto              suspend  = mSystemSuspendOverride ? 0 : mSystemSuspend;
-    const std::string rendered = QString::fromStdString(cfg.mContent)
-                                     .replace("{backlight_down}", mBackLightDown ? QString::number(mBackLightDown) : "#")
-                                     .replace("{screen_off}", mScreenOff ? QString::number(mScreenOff) : "#")
-                                     .replace("{system_suspend}", suspend ? QString::number(suspend) : "#")
-                                     .toStdString();
+    auto              suspend = mSystemSuspendOverride ? 0 : mSystemSuspend;
+    const std::string rendered =
+        QString::fromStdString(cfg.mContent)
+            .replace("{backlight_down}", mBackLightDown ? QString::number(mBackLightDown) : "#")
+            .replace("{screen_off}", mScreenOff ? QString::number(mScreenOff) : "#")
+            .replace("{system_suspend}", suspend ? QString::number(suspend) : "#")
+            .toStdString();
     // 配置没变就别重启：重启会丢厂商的暂停状态（SIGUSR1 + /tmp 标记）并清掉空闲状态，下次输入
     // 走 [Idle] reset 会把刚熄的屏幕点亮。但仍要确认进程活着，否则被 kill/OOM 后永久不再重启。
     if (readFile(cfg.mPath.c_str()) == rendered && !exec("pidof input-event-daemon").empty()) {

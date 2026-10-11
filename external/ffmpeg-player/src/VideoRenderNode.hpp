@@ -35,6 +35,7 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <string>
 #include <vector>
 
 extern "C" {
@@ -367,6 +368,26 @@ private:
 // ─── 材质与着色器 ────────────────────────────────────
 enum class GlVideoMode { I420 = 0, NV12 = 1, External = 2 };
 
+// ── PENMODS PATCH: 缩小采样 ─────────────────────────────────────────────
+// 上游只做一次 GL_LINEAR 采样（无 mipmap），视频分辨率高于屏幕时每输出像素只
+// 采 2×2 纹素，高频折叠成摩尔纹（1080p→302×170 实测高频能量是正确缩放的 13 倍，
+// 观感像被"锐化"）。这里在缩小时按 footprint 做 N×N 抽样。
+//   - 抽样次数上限按纹理数分配：External（硬解零拷贝，单纹理）8，
+//     NV12 6，I420 5，保证每像素纹理采样数都在 ~75 以内。
+//   - 放大（taps<1.5）时着色器直接走原单次采样，行为与上游一致。
+// 详见 external/ffmpeg-player/UPSTREAM.md 与 doc/FFMPEG_PLAYER_ANALYSIS.md。
+inline int MaxTapsForMode(GlVideoMode mode) {
+  switch (mode) {
+  case GlVideoMode::External:
+    return 8;
+  case GlVideoMode::NV12:
+    return 6;
+  default:
+    return 5;
+  }
+}
+// ── PENMODS PATCH end ──────────────────────────────────────────────────
+
 class GlVideoMaterial : public QSGMaterial {
 public:
   explicit GlVideoMaterial(GlVideoMode mode) : mode_(mode) {}
@@ -382,6 +403,9 @@ public:
   GLuint textures[3] = {0, 0, 0};
   QVector2D crop[3] = {QVector2D(1, 1), QVector2D(1, 1), QVector2D(1, 1)};
   QMatrix4x4 color_matrix;
+  // PENMODS PATCH: 缩小时的多点抽样参数（taps=1 表示不缩小，行为同上游）
+  QVector2D tap_step = QVector2D(0, 0);
+  float taps = 1.0f;
 
 private:
   GlVideoMode mode_;
@@ -418,6 +442,9 @@ public:
     }
     if (mode_ != GlVideoMode::External)
       p->setUniformValue(color_loc_, m->color_matrix);
+    // PENMODS PATCH: 缩小时的抽样参数
+    p->setUniformValue(tap_step_loc_, m->tap_step);
+    p->setUniformValue(taps_loc_, m->taps);
   }
 
 protected:
@@ -432,61 +459,88 @@ protected:
            "}\n";
   }
 
+  // PENMODS PATCH: 片元着色器在首次使用时拼接（原先每种模式是一段固定字符串，
+  // 这里因为要按模式插入 MAXTAPS 与抽样函数改为动态生成，正文逻辑保持不变）
   const char *fragmentShader() const override {
+    static std::string cache[3];
+    std::string &src = cache[static_cast<int>(mode_)];
+    if (src.empty())
+      src = BuildFragmentShader();
+    return src.c_str();
+  }
+
+  // PENMODS PATCH: 单次采样 vs 缩小时的 N×N 平均
+  static std::string PlaneTapFunction(const char *ret, const char *name,
+                                      const char *sampler, const char *swizzle,
+                                      const char *zero) {
+    std::string s;
+    s += ret;
+    s += " ";
+    s += name;
+    s += "(";
+    s += sampler;
+    s += " t, highp vec2 uv, highp vec2 cs) {\n";
+    s += std::string("  if (taps < 1.5) return texture2D(t, uv * cs)") + swizzle + ";\n";
+    s += std::string("  ") + ret + " acc = " + zero + ";\n";
+    s += "  highp float cnt = 0.0;\n";
+    s += "  for (int y = 0; y < MAXTAPS; ++y) {\n";
+    s += "    if (float(y) >= taps) break;\n";
+    s += "    for (int x = 0; x < MAXTAPS; ++x) {\n";
+    s += "      if (float(x) >= taps) break;\n";
+    s += "      highp vec2 off = (vec2(float(x), float(y)) - (taps - 1.0) * 0.5) * tap_step;\n";
+    s += std::string("      acc += texture2D(t, (uv + off) * cs)") + swizzle + ";\n";
+    s += "      cnt += 1.0;\n";
+    s += "    }\n";
+    s += "  }\n";
+    s += "  return acc / cnt;\n";
+    s += "}\n";
+    return s;
+  }
+
+  std::string BuildFragmentShader() const {
+    const bool external = (mode_ == GlVideoMode::External);
+    const char *sampler = external ? "samplerExternalOES" : "sampler2D";
+    std::string s;
+    if (external)
+      s += "#extension GL_OES_EGL_image_external : require\n";
+    s += "#ifdef GL_ES\nprecision highp float;\n#endif\n";
+    s += "varying highp vec2 v_texcoord;\n";
+    s += "uniform lowp float opacity;\n";
+    s += "uniform highp vec2 tap_step;\n";
+    s += "uniform highp float taps;\n";
+    s += "#define MAXTAPS " + std::to_string(MaxTapsForMode(mode_)) + "\n";
+    for (int i = 0; i < PlaneCount(); ++i)
+      s += std::string("uniform ") + sampler + " tex" + std::to_string(i) + ";\n";
+    for (int i = 0; i < PlaneCount(); ++i)
+      s += "uniform highp vec2 crop" + std::to_string(i) + ";\n";
+    if (!external)
+      s += "uniform highp mat4 color_matrix;\n";
+    s += PlaneTapFunction("highp float", "planeTap1", "sampler2D", ".r", "0.0");
+    if (mode_ == GlVideoMode::NV12)
+      s += PlaneTapFunction("highp vec2", "planeTap2", "sampler2D", ".ra", "vec2(0.0)");
+    if (external)
+      s += PlaneTapFunction("highp vec3", "planeTap3", sampler, ".rgb", "vec3(0.0)");
+    s += "void main() {\n";
     switch (mode_) {
     case GlVideoMode::I420:
-      return "#ifdef GL_ES\n"
-             "precision highp float;\n"
-             "#endif\n"
-             "varying highp vec2 v_texcoord;\n"
-             "uniform sampler2D tex0;\n"
-             "uniform sampler2D tex1;\n"
-             "uniform sampler2D tex2;\n"
-             "uniform highp vec2 crop0;\n"
-             "uniform highp vec2 crop1;\n"
-             "uniform highp vec2 crop2;\n"
-             "uniform highp mat4 color_matrix;\n"
-             "uniform lowp float opacity;\n"
-             "void main() {\n"
-             "  highp vec4 yuv = vec4(texture2D(tex0, v_texcoord * crop0).r,\n"
-             "                        texture2D(tex1, v_texcoord * crop1).r,\n"
-             "                        texture2D(tex2, v_texcoord * crop2).r,\n"
-             "                        1.0);\n"
-             "  gl_FragColor = vec4((color_matrix * yuv).rgb, 1.0) * opacity;\n"
-             "}\n";
+      s += "  highp vec4 yuv = vec4(planeTap1(tex0, v_texcoord, crop0),\n"
+           "                        planeTap1(tex1, v_texcoord, crop1),\n"
+           "                        planeTap1(tex2, v_texcoord, crop2),\n"
+           "                        1.0);\n";
+      break;
     case GlVideoMode::NV12:
-      return "#ifdef GL_ES\n"
-             "precision highp float;\n"
-             "#endif\n"
-             "varying highp vec2 v_texcoord;\n"
-             "uniform sampler2D tex0;\n"
-             "uniform sampler2D tex1;\n"
-             "uniform highp vec2 crop0;\n"
-             "uniform highp vec2 crop1;\n"
-             "uniform highp mat4 color_matrix;\n"
-             "uniform lowp float opacity;\n"
-             "void main() {\n"
-             "  highp vec4 yuv = vec4(texture2D(tex0, v_texcoord * crop0).r,\n"
-             "                        texture2D(tex1, v_texcoord * crop1).ra,\n"
-             "                        1.0);\n"
-             "  gl_FragColor = vec4((color_matrix * yuv).rgb, 1.0) * opacity;\n"
-             "}\n";
+      s += "  highp vec4 yuv = vec4(planeTap1(tex0, v_texcoord, crop0),\n"
+           "                        planeTap2(tex1, v_texcoord, crop1),\n"
+           "                        1.0);\n";
+      break;
     case GlVideoMode::External:
-      return "#extension GL_OES_EGL_image_external : require\n"
-             "#ifdef GL_ES\n"
-             "precision highp float;\n"
-             "#endif\n"
-             "varying highp vec2 v_texcoord;\n"
-             "uniform samplerExternalOES tex0;\n"
-             "uniform highp vec2 crop0;\n"
-             "uniform lowp float opacity;\n"
-             "void main() {\n"
-             "  gl_FragColor =\n"
-             "      vec4(texture2D(tex0, v_texcoord * crop0).rgb, 1.0) * "
-             "opacity;\n"
-             "}\n";
+      s += "  gl_FragColor = vec4(planeTap3(tex0, v_texcoord, crop0), 1.0) * opacity;\n";
+      break;
     }
-    return nullptr;
+    if (!external)
+      s += "  gl_FragColor = vec4((color_matrix * yuv).rgb, 1.0) * opacity;\n";
+    s += "}\n";
+    return s;
   }
 
   void initialize() override {
@@ -496,6 +550,8 @@ protected:
     matrix_loc_ = p->uniformLocation("qt_Matrix");
     opacity_loc_ = p->uniformLocation("opacity");
     color_loc_ = p->uniformLocation("color_matrix");
+    tap_step_loc_ = p->uniformLocation("tap_step");
+    taps_loc_ = p->uniformLocation("taps");
     for (int i = 0; i < PlaneCount(); ++i) {
       tex_loc_[i] = p->uniformLocation(tex_names[i]);
       crop_loc_[i] = p->uniformLocation(crop_names[i]);
@@ -513,6 +569,9 @@ private:
   int color_loc_ = -1;
   int tex_loc_[3] = {-1, -1, -1};
   int crop_loc_[3] = {-1, -1, -1};
+  // PENMODS PATCH
+  int tap_step_loc_ = -1;
+  int taps_loc_ = -1;
 };
 
 inline QSGMaterialShader *GlVideoMaterial::createShader() const {
@@ -547,6 +606,32 @@ public:
 
   // 接管 frame 所有权；返回是否成功更新了画面
   bool SetFrame(AVFrame *frame) {
+    // PENMODS PATCH: 记录纹理尺寸并按当前 rect 更新抽样参数
+    const int tw = frame->width, th = frame->height;
+    const bool ok = UploadFrame(frame);
+    if (ok) {
+      tex_w_ = tw;
+      tex_h_ = th;
+      UpdateTapParams();
+    }
+    return ok;
+  }
+
+  // PENMODS PATCH: rect / dpr 变化时重算抽样参数（devicePixel 下的显示尺寸）
+  void SetRect(const QRectF &rect, qreal dpr) {
+    if (rect == rect_ && dpr == dpr_) {
+      return;
+    }
+    rect_ = rect;
+    dpr_ = dpr;
+    UpdateTapParams();
+    QSGGeometry::updateTexturedRectGeometry(&geometry_, rect,
+                                            QRectF(0, 0, 1, 1));
+    markDirty(QSGNode::DirtyGeometry);
+  }
+
+private:
+  bool UploadFrame(AVFrame *frame) {
     QOpenGLContext *ctx = QOpenGLContext::currentContext();
     if (!ctx) {
       av_frame_free(&frame);
@@ -592,13 +677,38 @@ public:
     return ok;
   }
 
-  void SetRect(const QRectF &rect) {
-    if (rect == rect_)
+  // PENMODS PATCH: 由纹理尺寸 / 显示尺寸（devicePixel）算出缩小的 N×N 抽样参数。
+  // tap_step 是相邻抽样在 UV 上的间距：每输出像素覆盖 1/w 的 UV，N 个抽样铺满它。
+  void UpdateTapParams() {
+    if (!material_)
       return;
-    rect_ = rect;
-    QSGGeometry::updateTexturedRectGeometry(&geometry_, rect,
-                                            QRectF(0, 0, 1, 1));
-    markDirty(QSGNode::DirtyGeometry);
+    const qreal w = std::max<qreal>(1.0, rect_.width() * dpr_);
+    const qreal h = std::max<qreal>(1.0, rect_.height() * dpr_);
+    float taps = 1.0f;
+    if (tex_w_ > 0 && tex_h_ > 0) {
+      const double minify =
+          std::max(static_cast<double>(tex_w_) / w, static_cast<double>(tex_h_) / h);
+      if (minify > 1.02) {
+        taps = static_cast<float>(std::min<double>(
+            MaxTapsForMode(material_->mode()), std::ceil(minify)));
+      }
+    }
+    material_->taps = taps;
+    material_->tap_step =
+        QVector2D(static_cast<float>(1.0 / (w * taps)),
+                  static_cast<float>(1.0 / (h * taps)));
+    // PENMODS PATCH: 参数变化时打一行日志，便于在设备上确认自适应抽样
+    const int dw = static_cast<int>(std::lround(w));
+    const int dh = static_cast<int>(std::lround(h));
+    if (taps != logged_taps_ || tex_w_ != logged_src_w_ || dw != logged_dst_w_) {
+      logged_taps_ = taps;
+      logged_src_w_ = tex_w_;
+      logged_dst_w_ = dw;
+      LOG(INFO) << "Video downsample: taps=" << taps << "x" << taps
+                << " source=" << tex_w_ << "x" << tex_h_ << " display=" << dw
+                << "x" << dh;
+    }
+    markDirty(QSGNode::DirtyMaterial);
   }
 
 private:
@@ -757,6 +867,13 @@ private:
   QSGGeometry geometry_;
   QRectF rect_;
   GlVideoMaterial *material_ = nullptr;
+  // PENMODS PATCH: 抽样参数所需的状态
+  qreal dpr_ = 1.0;
+  int tex_w_ = 0;
+  int tex_h_ = 0;
+  float logged_taps_ = -1.0f;
+  int logged_src_w_ = -1;
+  int logged_dst_w_ = -1;
   Plane planes_[3];
   GLuint oes_texture_ = 0;
   EglDmaBufImporter importer_;
@@ -790,6 +907,7 @@ public:
   void SetFrame(AVFrame *frame, const QRectF &rect, int rotation, qreal dpr) {
 #if FFPLAYER_GL_RENDER
     if (gl_node_) {
+      dpr_ = dpr; // PENMODS PATCH: UpdateLayout 需要它来算抽样参数
       if (gl_node_->SetFrame(frame))
         has_content_ = true;
       return;
@@ -817,7 +935,7 @@ public:
     const Placement p = ComputePlacement(rect, rotation);
 #if FFPLAYER_GL_RENDER
     if (gl_node_)
-      gl_node_->SetRect(p.tex_rect);
+      gl_node_->SetRect(p.tex_rect, dpr_); // PENMODS PATCH: 多带一个 dpr
 #endif
     if (tex_node_)
       tex_node_->setRect(p.tex_rect);
@@ -841,6 +959,7 @@ private:
   }
 
   GlVideoNode *gl_node_ = nullptr;
+  qreal dpr_ = 1.0; // PENMODS PATCH: 供 GL 节点的抽样参数使用
 #endif
   QQuickWindow *window_;
   QSGSimpleTextureNode *tex_node_ = nullptr;

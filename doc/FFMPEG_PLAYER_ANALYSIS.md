@@ -4,7 +4,7 @@
 >
 > 分析日期: 2026-10-07
 >
-> 上游: <https://github.com/Haikure/ffmpeg-player>（v1.0.0，GPL-3.0，C++17 + xmake）
+> 上游: <https://github.com/Haikure/ffmpeg-player>（v1.0.1，GPL-3.0，C++17 + xmake）
 >
 > 目标文件: `binary/YoudaoDictPen`、`/usr/lib/libQt5*`、设备实测（YDP02X, SN 2D90500000818624, RK3326）
 
@@ -40,8 +40,9 @@ ffmpeg-player/
 ├── external/alsa-lib-1.1.5/  ALSA 头文件
 ├── external/rkmpp/           MPP/libdrm 头文件 + pkg-config（标称 MPP 1.3.10 / libdrm 2.4.121）
 ├── external/dictpen/         从设备拉取的 libasound/libdrm/librockchip_mpp（**与设备 md5 一致**）
-└── xmake.lua                 静态 FFmpeg 3.4.8 + OpenSSL 3.5.7 + libxml2 + libass 0.17.4
-                              + freetype/harfbuzz/fribidi，产物 qml/FFmpegPlayer/{libffmpegplayerplugin.so,qmldir}
+└── xmake.lua                 静态 FFmpeg 3.4.8 + OpenSSL 3.5.7（v1.0.1 起为自带的 ffplayer-openssl3
+                              包，本仓库钉在 3.5.6）+ libxml2 + libass 0.17.4 + freetype/harfbuzz/fribidi，
+                              产物 qml/FFmpegPlayer/{libffmpegplayerplugin.so,qmldir}
 ```
 
 - QML 接口：`open(video,audio,headers)`、`play/pause/stop`、`seek/seekForward/seekBackward`、
@@ -206,7 +207,7 @@ DTB: vpu_combo.status = "okay"（+ 子节点 allocator = <1>）
 
 ## 7. 参考
 
-- 上游 README / `xmake.lua` / `examples/Player.qml`（本仓库未内置，分析时取自 v1.0.0）
+- 上游 README / `xmake.lua` / `examples/Player.qml`（已 vendor 到 `external/ffmpeg-player/`；本分析取自 v1.0.0）
 - 本仓库：`tools/mpp-probe/`（本文 §2.4 的可复现探针与实测输出）、
   `src/mod/Engine.cpp`（QML 注入点）、`src/filemanager/player/ExternalPlayer.cpp`（mpv 路径）、
   `resource/models/YDP02X/qml/audiopages/VideoPlayer.qml`（现有 QtMultimedia 页）、
@@ -233,6 +234,7 @@ DTB: vpu_combo.status = "okay"（+ 子节点 allocator = <1>）
 构建过程踩到的三个坑（本机环境问题，非上游 bug）：
 
 1. `add_deps("openssl3 3.5.7")`：本地 xmake-repo 没有该版本（最新 3.6.x / 有 3.5.6），临时降到 `3.5.6`。
+   （上游 v1.0.1 把这个依赖换成自带的 `ffplayer-openssl3`，版本仍钉在 `3.5.6`。）
 2. xmake-repo 的 `python` 包默认 `--enable-optimizations`（PGO），在本机会因为 CPython 自带用例
    `test_generators.SignalAndYieldFromTest` 偶发失败而中断；本机已把该参数去掉
    （`~/.xmake/repositories/xmake-repo/packages/p/python/xmake.lua`，可 `git checkout` 还原）。
@@ -328,7 +330,7 @@ mpp_rt: NOT found ion allocator / found drm allocator
 ## 9. 仓库集成（已落地）
 
 ```
-external/ffmpeg-player/          上游 v1.0.0（48ca849）的 vendor 副本，GPL-3.0
+external/ffmpeg-player/          上游 v1.0.1（62905fb）的 vendor 副本，GPL-3.0
 ├── xmake.lua                    已适配为 PenMods 根工程的子工程（见 UPSTREAM.md 的差异表）
 ├── UPSTREAM.md                  来源、改动、同步方式、硬解门控说明
 ├── src/ patches/ examples/      上游原样
@@ -369,6 +371,77 @@ PENMODS_WITH_PLAYER=1 xmake build ffmpegplayerplugin   # 插件默认不参与�
    本身会按工程配置装依赖。
 2. `qt.moc` 生成的 moc 单元在 `-r` 重建时可能丢掉 `add_packages` 的 include 目录，
    子工程里已在 `on_load` 显式补上 ffmpeg/libass 的 include。
+
+### 9.1 上游 v1.0.1 同步（2026-10-11）
+
+从 v1.0.0（`48ca849`）同步到 v1.0.1（`62905fb`），`src/` 只动了 5 个文件（另有 `examples/Player.qml`
+与 README 的示例改动）。核心的一件事：**变速不再 `seek()` 重定位**——新增 `AudioTimeline.hpp`
+（按倍速分段的待播 PCM），`Clock` 由 `pts_drift` 改为 `last_pts + last_updated` 并新增 `SetAudioClock()`，
+音频线程在 PCM 输出边界用 `avfilter_process_command("tempo")` 在原滤镜实例上换速（`AudioTempo::SetRate()`），
+纯视频才立即换速；`AudioDevice` 用 `fed_frames_`/`released_frames_` 精确报告延迟。
+
+- **QML API 未变**：`Q_PROPERTY`、`Q_INVOKABLE`、`public slots`、`signals` 逐条比对一致
+  （`playbackRate`/`boostRate`/`beginBoost()`/`endBoost()` 都在），`ExternalPlayerEmbedded.qml` 无需改动。
+  行为差别只有：切倍速不再跳转、`endBoost()` 总是回到 1.0x。
+- `xmake.lua` 侧上游新增自带的 `ffplayer-openssl3` 包（`set_base("openssl3")` + 自定义 `on_install`，
+  显式把 `buildenvs` 的 CFLAGS/ASFLAGS 传给 make，不再跟着 xmake-repo 的 openssl3 配方漂移），
+  并给 ffmpeg 包加 `set_policy("package.librarydeps.strict_compatibility", true)`；
+  本仓库只把版本钉在本地仓库有的 `3.5.6`。
+- **本机验证**（2026-10-11，YDP02X 配置 / zig 交叉）：
+  `PENMODS_WITH_PLAYER=1 xmake f … -c -y` 重建了 OpenSSL 3.5.6 与 FFmpeg 3.4.8（本机本次约 3 min）；
+  `PENMODS_WITH_PLAYER=1 xmake build ffmpegplayerplugin` 14.6 s 通过，产物
+  `qml/FFmpegPlayer/libffmpegplayerplugin.so` **12.56 MB**，`NEEDED` 与上一版一致
+  （`libasound.so.2` + `librockchip_mpp.so.1` + `libdrm.so.2` + Qt5，无 libstdc++），
+  动态导出仍只有 `qt_plugin_instance`/`qt_plugin_query_metadata`；`strings -el` 能查到新增的
+  `Cannot change audio tempo: `，确认新代码确实编进产物。
+  不带 `PENMODS_WITH_PLAYER` 时仍只打印跳过提示并正常配置（CI 的默认路径未受影响）。
+- **设备实测**（2026-10-11，YDP02X 2D90500000818624，已刷 VPU 补丁 → `/dev/vpu_service` 存在、
+  `vpu_combo=okay`，宿主不设 `FFPLAYER_HWDEC`）：`scripts/deploy_ffmpeg_player.sh` 推上去后设备与本地
+  sha256 完全一致；播放 `/userdisk/Music/PenModsTest/clip.mp4` 的日志为
+  `Using hardware decoder: h264_rkmpp` → `Video renderer: OpenGL YUV` → `dma-buf zero-copy rendering enabled`，
+  ASS 外挂字幕正常，位置推进。
+- 用触摸注入逐项验证**这次的变速改动**（播放页 `qml/audiopages/ExternalPlayerEmbedded.qml`）：
+  `1.0x → 1.5x → 2.0x → 0.5x → 1.0x` 每次点击都立刻生效（画面内 chip/提示与实际播放速度一致），
+  **切换过程中位置只前进、不重定位**；长按出现「长按 2.0x」浮层，松手后回到 `1.0x`
+  （v1.0.1 的 `endBoost()` 语义）；3 次「重启宿主 → 打开视频」全部存活，日志里没有
+  `libc++abi: terminating` / `Aborted`。
+- **踩到的坑（已写进 `UPSTREAM.md`）**：第一次部署的 `.so` 是 **v1.0.0/v1.0.1 混编**产物——
+  `moc_FFmpegPlayerPlugin.cpp.o` 没有跟着被改动的 `FFmpegVideoPlayerQml.hpp` 重编，两个编译单元里
+  `VideoPlayer`/`Clock` 的布局不一致，结果是宿主一创建 `VideoPlayer` 就 `libc++abi: terminating` +
+  `Aborted`（进程重启）。删掉 `build/.objs/ffmpegplayerplugin`、`.gens/ffmpegplayerplugin` 等产物
+  全量重编后，产物哈希稳定（`41e37412…`）且播放正常；混编态可稳定复现（重建出的 `.so` 哈希与出事的
+  那个完全一致：`ddb9960d…`）。注意 `xmake f -c` 只清配置缓存，不清对象文件。
+
+### 9.2 高于屏幕分辨率的画面「看起来被锐化」= 缩小采样混叠（2026-10-11 修复）
+
+用户反馈：播放分辨率高于屏幕（320×170，16:9 时画面区 302×170）的视频时，画面像是被过度锐化。
+用受控测试图（zone plate + 细棋盘 + 细线栅 + 小字号文字，`pattern{W}x{H}.png` → H.264）
+在设备上复现并量化，指标用拉普拉斯方差（高频能量，越大越"硬"）：
+
+| 源分辨率（→302×170） | 修复前 | 修复后（设备日志的 taps） | 单次 GL_LINEAR 模型 | 面积平均（正确） | mpv（同机同文件） |
+|---|---|---|---|---|---|
+| 256×144（放大） | — | 27 918（taps=1×1） | 28 028 | — | — |
+| 640×360 | 62 851 | 14 772（taps=3×3） | 63 553 | 31 131 | — |
+| 1280×720 | 67 429 | 6 627（taps=5×5） | 68 378 | 7 764 | — |
+| 1920×1080 | 88 620 | 5 877（taps=7×7） | 89 134 | 6 739 | 4 719 |
+
+- 设备实测与「单次双线性采样」模型误差 <1%，确认是采样问题而不是编码/解码/面板问题
+  （1280×720 那行截图时 OSD 还在，UI 边缘会让高频指标略偏高；640×360 与 1920×1080 是干净画面）；
+- 缩小倍数越大越严重（360p 2.1× → 2.0 倍多余高频；1080p 6.4× → 13.2 倍），
+  所以只有"高于屏幕分辨率"的视频才明显；
+- `src/VideoRenderNode.hpp` 的 GL 路径只设 `GL_TEXTURE_MIN_FILTER=GL_LINEAR`（无 mipmap），
+  片元着色器一次采样；hw 路径的 `GL_TEXTURE_EXTERNAL_OES` 纹理同样如此，且外部纹理无法生成 mipmap。
+  插件的 CPU 回退路径（`SwsConverter` 先 swscale 到显示尺寸）与 mpv 都正常——问题只在 GL 路径。
+  这与本次 v1.0.1 同步无关（该文件当时未被改动）。
+
+**修复**：`VideoRenderNode.hpp` 里加了 `// PENMODS PATCH` 段落，缩小时沿 footprint 做 N×N 抽样
+（N = 缩小倍数，External/NV12/I420 上限 8/6/5；放大时 `taps=1`，行为同上游）。
+同类素材修复后：1080p **88 620 → 5 877**（`taps=7×7`；理想 6 739、mpv 4 719），720p **67 429 → 6 627**
+（`taps=5×5`），360p **62 851 → 14 772**（`taps=3×3`），即从"明显混叠"降到与 mpv/swscale 同一档
+（略锐于后者、略软于面积平均）；256×144 这种低于屏幕分辨率的输入仍走单次采样（`taps=1×1`，
+与单次双线性模型相关性 0.992），零拷贝与硬解保持不变。设备日志会打印
+`Video downsample: taps=NxN source=WxH display=WxH` 便于现场确认。
+细节与同步注意事项见 [`external/ffmpeg-player/UPSTREAM.md`](../external/ffmpeg-player/UPSTREAM.md)。
 
 ### 8.6 硬解实测（已刷入 VPU 补丁的 boot）
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "FFmpegCore.hpp"
+#include <cmath>
 #include <functional>
 #include <sstream>
 
@@ -16,6 +17,7 @@ namespace ffmpeg_player {
 class AudioTempo {
   AVFilterGraph *graph_ = nullptr;
   AVFilterContext *source_ = nullptr;
+  AVFilterContext *tempo_ = nullptr;
   AVFilterContext *sink_ = nullptr;
 
 public:
@@ -25,7 +27,7 @@ public:
   ~AudioTempo() { Reset(); }
   void Reset() {
     avfilter_graph_free(&graph_);
-    source_ = sink_ = nullptr;
+    source_ = tempo_ = sink_ = nullptr;
   }
 
   bool Init(const AVFrame *frame, int sample_rate, int channels, double rate) {
@@ -43,22 +45,30 @@ public:
     std::ostringstream input;
     input << "time_base=1/" << frame->sample_rate << ":sample_rate=" << frame->sample_rate
           << ":sample_fmt=" << format << ":channel_layout=" << layout;
-    AVFilterContext *tempo = nullptr, *convert = nullptr;
+    AVFilterContext *convert = nullptr;
     const std::string tempo_args = "tempo=" + std::to_string(rate);
     const std::string output = "sample_fmts=s16:sample_rates=" + std::to_string(sample_rate)
         + ":channel_layouts=" + std::to_string(av_get_default_channel_layout(channels));
     if (avfilter_graph_create_filter(&source_, avfilter_get_by_name("abuffer"), "input",
                                     input.str().c_str(), nullptr, graph_) < 0 ||
-        avfilter_graph_create_filter(&tempo, avfilter_get_by_name("atempo"), "tempo",
+        avfilter_graph_create_filter(&tempo_, avfilter_get_by_name("atempo"), "tempo",
                                     tempo_args.c_str(), nullptr, graph_) < 0 ||
         avfilter_graph_create_filter(&convert, avfilter_get_by_name("aformat"), "format",
                                     output.c_str(), nullptr, graph_) < 0 ||
         avfilter_graph_create_filter(&sink_, avfilter_get_by_name("abuffersink"), "output",
                                     nullptr, nullptr, graph_) < 0)
       return false;
-    return avfilter_link(source_, 0, tempo, 0) >= 0 &&
-           avfilter_link(tempo, 0, convert, 0) >= 0 &&
+    return avfilter_link(source_, 0, tempo_, 0) >= 0 &&
+           avfilter_link(tempo_, 0, convert, 0) >= 0 &&
            avfilter_link(convert, 0, sink_, 0) >= 0 && avfilter_graph_config(graph_, nullptr) >= 0;
+  }
+
+  // 与 Process 在同一音频线程调用，保留 atempo 的重叠窗口和已缓存的样本。
+  int SetRate(double rate) {
+    if (!tempo_ || !std::isfinite(rate) || rate < 0.5 || rate > 2.0)
+      return AVERROR(EINVAL);
+    return avfilter_process_command(tempo_, "tempo", std::to_string(rate).c_str(),
+                                    nullptr, 0, 0);
   }
 
   int Process(AVFrame *frame, const std::function<bool(AVFrame *)> &consume) {

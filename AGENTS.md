@@ -273,7 +273,7 @@ render them into the frame before the autorotate post-filter if that ever needs 
 
 ### Embedded FFmpeg Player (QML plugin)
 
-`external/ffmpeg-player/` vendors [`Haikure/ffmpeg-player`](https://github.com/Haikure/ffmpeg-player) v1.0.0
+`external/ffmpeg-player/` vendors [`Haikure/ffmpeg-player`](https://github.com/Haikure/ffmpeg-player) v1.0.1
 (GPL-3.0) — a Qt 5 QML video player that renders **into the host scene graph** (custom `QSGNode`, static FFmpeg
 3.4.8 + libass + OpenSSL 3 + libxml2), so the picture follows `YMainWindow.rotation` and PenMods controls can sit on
 top of it. `xmake build ffmpegplayerplugin` produces `build/<plat>/<arch>/<mode>/qml/FFmpegPlayer/`;
@@ -303,11 +303,18 @@ device measurements: `doc/FFMPEG_PLAYER_ANALYSIS.md`.
 - Build inputs: the vendored subproject is **skipped unless `PENMODS_WITH_PLAYER=1`** is exported (`xmake build` then
   builds the mod only, which is what CI does — the player's dependency chain needs ~40 min of from-source FFmpeg/OpenSSL3/
   libass and a container with `unzip`/`perl`). `PENMODS_FFMPEG_PLAYER_SW=1` additionally builds a software-only variant
-  (or simply remove `external/dictpen/librockchip_mpp.so.1` + `libdrm.so.2`); `openssl3` is pinned to `3.5.6`
-  (xmake-repo has no `3.5.7`) and `network_revision` is bumped to force ffmpeg package rebuilds. `external/dictpen/*.so`
+  (or simply remove `external/dictpen/librockchip_mpp.so.1` + `libdrm.so.2`); the upstream-supplied
+  `ffplayer-openssl3` package is pinned to `3.5.6` (xmake-repo has no `3.5.7`) and `network_revision` is bumped
+  to force ffmpeg package rebuilds. `external/dictpen/*.so`
   are **symlinks** in git (a zip download turns them into text files and breaks `-lrockchip_mpp`). On this dev machine
   the xmake-repo `python` recipe needed `--enable-optimizations` removed (PGO test flake) because `harfbuzz` builds
   through `meson`.
+- The vendored `src/` is **not** pristine: `src/VideoRenderNode.hpp` carries a `// PENMODS PATCH` section that replaces
+  the single `GL_LINEAR` fetch with an adaptive N×N downsample when the video is larger than its display rect (upstream
+  minified without mipmaps, so >screen-resolution video aliased into a "sharpened" look; measured 13× excess
+  high-frequency energy at 1080p→302×170, now within the range of mpv/swscale). Keep the patch, and re-apply it when
+  syncing upstream. After any `src/` change, do a **full** plugin rebuild — an incremental build can mix v-old/v-new
+  objects and abort the host at `VideoPlayer` construction (see `external/ffmpeg-player/UPSTREAM.md`).
 
 ### Touch Calibration (udev rule)
 

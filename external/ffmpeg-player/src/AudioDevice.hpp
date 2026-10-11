@@ -58,7 +58,8 @@ public:
     return written;
   }
 
-  size_t Read(uint8_t *data, size_t len) {
+  size_t Read(uint8_t *data, size_t len, uint64_t &generation,
+              const std::atomic<uint64_t> &current_generation) {
     std::unique_lock<std::mutex> lock(mutex_);
     cond_not_empty_.wait(
         lock, [this]() { return data_size_ > 0 || stop_ || flushing_; });
@@ -68,6 +69,8 @@ public:
     if (flushing_)
       return 0;
 
+    // 等待数据期间可能已经 Flush；代次必须与实际读出的 PCM 一起取得。
+    generation = current_generation.load(std::memory_order_acquire);
     size_t chunk = std::min(len, data_size_);
     size_t first_chunk = std::min(chunk, size_ - read_pos_);
     memcpy(data, buffer_.data() + read_pos_, first_chunk);
@@ -183,6 +186,8 @@ private:
   std::atomic<bool> is_flushing_{false};
   std::mutex pcm_mutex_;
   std::atomic<uint64_t> generation_{0};
+  std::atomic<uint64_t> fed_frames_{0};
+  uint64_t released_frames_ = 0; // 已写入 ALSA 或因错误丢弃；pcm_mutex_ 保护
 
   // 64 KiB 可缓冲约 0.34 秒的 48 kHz 立体声 S16 音频。
   const size_t RING_BUFFER_SIZE = 64 * 1024;
@@ -315,7 +320,9 @@ public:
   bool Feed(uint8_t *data, int len, const std::function<bool()> &cancel = {}) {
     if (!ring_buffer_ || is_flushing_ || !running_ || len < 0)
       return false;
-    return ring_buffer_->Write(data, static_cast<size_t>(len), cancel) == static_cast<size_t>(len);
+    const size_t fed = ring_buffer_->Write(data, static_cast<size_t>(len), cancel);
+    fed_frames_.fetch_add(fed / bytes_per_frame, std::memory_order_relaxed);
+    return fed == static_cast<size_t>(len);
   }
 
   void Pause(bool pause) {
@@ -352,6 +359,8 @@ public:
     snd_pcm_drop(pcm_handle);
 
     ring_buffer_->Reset();
+    fed_frames_.store(0, std::memory_order_relaxed);
+    released_frames_ = 0;
     snd_pcm_prepare(pcm_handle);
 
     ring_buffer_->SetFlushing(false);
@@ -362,7 +371,7 @@ public:
   int GetActualChannels() const { return actual_channels; }
   int GetBytesPerFrame() const { return bytes_per_frame; }
 
-  // 获取当前实时延迟（秒）= ALSA 硬件延迟 + RingBuffer 延迟
+  // 获取实时延迟，包括已从 RingBuffer 取出、尚未写入 ALSA 的一个 period。
   double GetCurrentLatencySeconds() {
     if (!pcm_handle)
       return 0;
@@ -374,14 +383,10 @@ public:
       delay_frames = 0;
     }
 
-    // 加上 RingBuffer 里的数据量
-    size_t ring_buffer_bytes = ring_buffer_->GetDataSize();
-    double ring_buffer_delay =
-        (double)ring_buffer_bytes / bytes_per_frame / actual_sample_rate;
-
-    double alsa_delay = (double)delay_frames / actual_sample_rate;
-
-    return std::max(0.0, alsa_delay) + ring_buffer_delay;
+    const uint64_t fed = fed_frames_.load(std::memory_order_relaxed);
+    const uint64_t pending = fed > released_frames_ ? fed - released_frames_ : 0;
+    return (std::max<snd_pcm_sframes_t>(0, delay_frames) + static_cast<double>(pending)) /
+           actual_sample_rate;
   }
 
 private:
@@ -428,8 +433,8 @@ private:
       }
 
       // 核心改动：Read 应该是阻塞的（由 RingBuffer 保证），一旦有数据就处理
-      const uint64_t generation = generation_.load();
-      size_t bytes_read = ring_buffer_->Read(read_buf.data(), chunk_bytes);
+      uint64_t generation = 0;
+      size_t bytes_read = ring_buffer_->Read(read_buf.data(), chunk_bytes, generation, generation_);
       if (bytes_read == 0)
         continue;
 
@@ -461,12 +466,15 @@ private:
           }
           if (Recover((int)written))
             continue;
+          // 丢弃的样本也要从待播计数中移除，避免 EOF 永远等待这段延迟。
+          released_frames_ += static_cast<uint64_t>(frames_to_write);
           break;
         }
         if (written == 0) {
           snd_pcm_wait(pcm_handle, 5);
           continue;
         }
+        released_frames_ += static_cast<uint64_t>(written);
         ptr += written * bytes_per_frame;
         frames_to_write -= written;
       }

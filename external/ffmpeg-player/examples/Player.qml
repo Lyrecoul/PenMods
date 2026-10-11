@@ -415,7 +415,7 @@ Window {
             }
             background: Rectangle {
                 radius: 5
-                color: "transparent"
+                color: resetZoomButton.pressed ? "#dc263548" : "#a6101620"
             }
         }
 
@@ -434,7 +434,7 @@ Window {
             }
             background: Rectangle {
                 radius: 5
-                color: "transparent"
+                color: zoomInButton.pressed ? "#dc263548" : "#a6101620"
             }
         }
 
@@ -454,7 +454,7 @@ Window {
             }
             background: Rectangle {
                 radius: 5
-                color: "transparent"
+                color: zoomOutButton.pressed ? "#dc263548" : "#a6101620"
             }
         }
     }
@@ -482,7 +482,7 @@ Window {
         }
         background: Rectangle {
             radius: 5
-            color: "transparent"
+            color: closeButton.pressed ? "#dc263548" : "#a6101620"
         }
     }
 
@@ -492,7 +492,6 @@ Window {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
-        anchors.bottomMargin: app.edgeProgressEnabled && !app.zoomMode ? app.edgeProgressHeight : 0
         height: app.height < 250 ? 92 : 108
         gradient: Gradient {
             GradientStop { position: 0.0; color: "#00151c26" }

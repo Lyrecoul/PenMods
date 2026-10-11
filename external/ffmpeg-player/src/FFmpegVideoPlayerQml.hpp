@@ -449,13 +449,11 @@ public slots:
     }
     if (rate == playbackRate())
       return;
-    const double pos = position();
     playback_rate_.store(rate);
-    audio_clock_.SetRate(rate);
+    // 有音频时由音频线程在 PCM 输出边界切换时钟；纯视频可以立即变速。
+    if (!has_audio_)
+      audio_clock_.SetRate(rate);
     emit playbackRateChanged();
-    // 丢弃旧倍速的已缓存 PCM，重新从当前媒体位置开始。
-    if (state_ == PlayingState || state_ == PausedState)
-      seek(pos);
   }
 
   void setBoostRate(qreal rate) {
@@ -477,7 +475,7 @@ public slots:
     emit boostedChanged();
   }
 
-  void endBoost() { finishBoost(true); }
+  void endBoost() { finishBoost(); }
 
   void setAudioSource(const QUrl &url) {
     if (audio_source_ == url)
@@ -743,17 +741,10 @@ private:
         barHeight > 0 && (state_ == PlayingState || state_ == PausedState));
   }
 
-  void finishBoost(bool reposition) {
+  void finishBoost() {
     if (!boosted_) return;
     boosted_ = false;
-    // EOF 已由呈现线程确认但 GUI 回调尚未执行时，松手同样不能重发跳转。
-    if (reposition && !eof_signaled_.load(std::memory_order_acquire)) {
-      setPlaybackRate(1.0);
-    } else if (playbackRate() != 1.0) {
-      playback_rate_.store(1.0);
-      audio_clock_.SetRate(1.0);
-      emit playbackRateChanged();
-    }
+    setPlaybackRate(1.0);
     emit boostedChanged();
   }
 
@@ -904,7 +895,7 @@ private:
     playback_controller_.SetPaused(true);
 
     // 先取消长按，状态/位置的 QML 回调即使调用 endBoost 也不会在 EOF 发起跳转。
-    finishBoost(false);
+    finishBoost();
 
     // EOF 后固定在片尾，避免最后一帧的 PTS 留在 duration 之前。
     if (duration_ > 0)
@@ -1475,13 +1466,14 @@ private:
       const int bytes = frame->nb_samples * audio_out.GetBytesPerFrame();
       if (!audio_out.Feed(frame->data[0], bytes, cancelled))
         return false;
-      output_pts += static_cast<double>(frame->nb_samples) / frame->sample_rate * rate;
+      const double output_duration = static_cast<double>(frame->nb_samples) / frame->sample_rate;
+      output_pts += output_duration * rate;
       {
         std::lock_guard<std::mutex> lock(clock_update_mutex_);
         if (cancelled())
           return false;
-        if (!playback_controller_.IsPaused())
-          audio_clock_.SetClock(output_pts, audio_out.GetCurrentLatencySeconds());
+        audio_clock_.SetAudioClock(output_pts, output_duration, rate,
+                                   audio_out.GetCurrentLatencySeconds());
       }
       return true;
     };
@@ -1516,8 +1508,9 @@ private:
       // 滤镜以样本时间为基准，输出时钟由原始媒体 PTS 锚定。
       trimmed->pts = av_rescale_q(raw_pts == AV_NOPTS_VALUE ? 0 : raw_pts,
                                   a_time_base_, AVRational{1, frame->sample_rate}) + skip;
+      const double requested_rate = playbackRate();
       if (!tempo_ready) {
-        rate = playbackRate();
+        rate = requested_rate;
         tempo_ready = tempo.Init(trimmed, audio_out.GetActualSampleRate(),
                                  audio_out.GetActualChannels(), rate);
         output_pts = pts + static_cast<double>(skip) / frame->sample_rate;
@@ -1526,6 +1519,15 @@ private:
           postPlaybackError(QStringLiteral("Cannot initialize audio tempo filters"));
           return false;
         }
+      } else if (requested_rate != rate) {
+        const int ret = tempo.SetRate(requested_rate);
+        if (ret < 0) {
+          av_frame_free(&trimmed);
+          postPlaybackError(QStringLiteral("Cannot change audio tempo: ") +
+                            QString::fromStdString(FFmpegCore::ErrorToString(ret)));
+          return false;
+        }
+        rate = requested_rate;
       }
       if (!has_video_)
         completeSeek(last_seek_serial);

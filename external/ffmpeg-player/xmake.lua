@@ -1,6 +1,6 @@
 -- ============================================================================
 -- Haikure/ffmpeg-player —— Qt5 QML 视频播放器插件（已 vendor 进 PenMods）
---   上游   : https://github.com/Haikure/ffmpeg-player  (v1.0.0 / 48ca849, GPL-3.0)
+--   上游   : https://github.com/Haikure/ffmpeg-player  (v1.0.1 / 62905fb, GPL-3.0)
 --   改动   : external/ffmpeg-player/UPSTREAM.md
 --   分析与实测: doc/FFMPEG_PLAYER_ANALYSIS.md
 --   构建   : xmake build ffmpegplayerplugin
@@ -96,10 +96,35 @@ package_end()
 add_requires("libass 0.17.4", {configs = {shared = false, pic = true,
     cxflags = {"-Os", "-fno-sanitize=all", "-ffunction-sections", "-fdata-sections"}}})
 
+-- 上游 v1.0.1 起自带一份 OpenSSL 3 的安装配方（基于 xmake-repo 的 openssl3）。
+-- 目的：把 OpenSSL 的交叉编译参数（buildenvs 的 CFLAGS/ASFLAGS）显式传给 make，
+-- 不随 xmake-repo 的 openssl3 配方漂移而变；PenMods 侧只把版本钉在本地仓库有的 3.5.6。
+package("ffplayer-openssl3")
+    set_base("openssl3")
+    on_install("linux", function (package)
+        import("package.tools.autoconf")
+        import("package.tools.make")
+        local envs = autoconf.buildenvs(package)
+        local arches = {arm64 = "aarch64", ["arm64-v8a"] = "aarch64", aarch64 = "aarch64",
+            x86_64 = "x86_64", x86 = "x86", i386 = "x86"}
+        local arch = assert(arches[package:arch()], "Unsupported OpenSSL architecture: " .. package:arch())
+        local configs = {"linux-" .. arch, "no-tests", "--libdir=lib",
+            "--openssldir=" .. package:installdir(), "--prefix=" .. package:installdir(),
+            package:config("shared") and "shared" or "no-shared",
+            package:config("multi-threading") and "threads" or "no-threads"}
+        if package:config("md2") then table.insert(configs, "enable-md2") end
+        os.vrunv("./Configure", configs, {envs = envs})
+        make.build(package, {CFLAGS = envs.CFLAGS, ASFLAGS = envs.ASFLAGS})
+        make.make(package, {"install_sw"})
+    end)
+package_end()
+
 package("ffmpeg")
     set_homepage("https://www.ffmpeg.org")
     set_description("FFmpeg 3.4.8")
     set_license("GPL-3.0")
+    -- 依赖名称或配置变化后不能复用旧安装记录，否则会遗漏 OpenSSL 等静态链接依赖。
+    set_policy("package.librarydeps.strict_compatibility", true)
 
     add_urls("https://ffmpeg.org/releases/ffmpeg-$(version).tar.bz2", {alias = "home"})
 
@@ -108,7 +133,7 @@ package("ffmpeg")
     -- OpenSSL 配方通过 make CFLAGS 覆盖上游优化参数，必须显式指定发布优化。
     -- Zig 未优化构建会默认插入 UBSan 检查，静态链接后产生大量代码和重定位数据。
     local release_cflags = {"-Os", "-fno-sanitize=all", "-ffunction-sections", "-fdata-sections"}
-    add_deps("openssl3 3.5.6", {configs = {shared = false, pic = true, cxflags = release_cflags}})
+    add_deps("ffplayer-openssl3 3.5.6", {configs = {shared = false, pic = true, cxflags = release_cflags}})
     add_deps("libxml2 v2.13.4", {configs = {shared = false, pic = true, cxflags = release_cflags}})
 
     add_links("avfilter", "avdevice", "avformat", "avcodec", "swscale", "swresample", "avutil","postproc")
@@ -233,7 +258,7 @@ package("ffmpeg")
         local cflags = "-Wno-incompatible-function-pointer-types -fno-sanitize=all -ffunction-sections -fdata-sections"
         local ldflags = "-Wl,--undefined-version -Wl,-z,defs"
         local dependency_pcdirs = {}
-        for _, name in ipairs({"openssl3", "libxml2"}) do
+        for _, name in ipairs({"ffplayer-openssl3", "libxml2"}) do
             local dep = package:dep(name)
             table.insert(dependency_pcdirs, dep:installdir("lib/pkgconfig"))
             cflags = cflags .. " -I" .. dep:installdir("include")

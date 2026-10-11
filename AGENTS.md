@@ -107,23 +107,28 @@ in the OTA package** — the binary has to be shipped to users separately (the c
   at the cut. The break tables are `BREAK_BEFORE_COMMANDS` / `BREAK_AFTER_COMMANDS` and the per-formula line
   budget is `MAX_WRAP_LINES`. If every break attempt fails, rasterization shrinks the single whole formula to
   the width cap — that is a last resort, not the normal path.
-- **CJK depends on a font being reachable.** MathJax emits `<text font-family="serif">` for characters its own
-  fonts lack (Chinese and friends); with no CJK-capable face reachable, resvg draws nothing for those runs and
-  the remaining glyphs collapse together. The tested YDP02X *does* ship CJK system fonts — `/usr/share/fonts`
-  is a symlink to `/usr/lib/fonts` and holds `NotoSansSC-*.otf` and `HYQiHei-*.ttf` — and resvg-js 2.6.2 finds
-  them through fontdb's pure-Rust fontconfig support (it parses `/etc/fonts/fonts.conf` itself, follows the
-  symlink, and does not need a fontconfig cache; verified on-device by rendering `\text{中文}` through a server
-  build that does no font work at all). The service nevertheless bundles `wqy-microhei.ttc` (Apache-2.0, from
-  Android Droid Sans Fallback) and, once that font loads, sets `loadSystemFonts: false`, so a unit without CJK
-  system fonts still renders and the face is identical across units. It extracts the font to a writable
-  directory and rewrites only the `<text>` font-family, falling back through `MATHJAX_FONT_DIR` → temp dir →
-  `/userdata/PenMods` → `/userdisk/PenMods`; if extraction fails, only Chinese is lost and everything else
-  still renders. Note that in resvg-js 2.6.2 the `serifFamily` / `sansSerifFamily` / `cursiveFamily` /
+- **CJK depends on a reachable font; system fonts are the default.** MathJax emits
+  `<text font-family="serif">` for characters its own fonts lack (Chinese and friends); with no CJK-capable face
+  reachable, resvg draws nothing for those runs and the remaining glyphs collapse together. The tested YDP02X
+  ships CJK system fonts — `/usr/share/fonts` is a symlink to `/usr/lib/fonts` and holds `NotoSansSC-*.otf` and
+  `HYQiHei-*.ttf` — and resvg-js 2.6.2 reaches them through fontdb's pure-Rust fontconfig support (it parses
+  `/etc/fonts/fonts.conf` itself, follows the symlink, and needs no fontconfig cache; verified on-device by
+  rendering `\text{中文}` through a server build that did no font work at all). The service therefore renders
+  with `loadSystemFonts: true` and `defaultFontFamily: "Noto Sans SC"` and ships **no** font file. An explicit
+  font is used only when one is actually supplied — `MATHJAX_FONT=<path>`, or a file named `wqy-microhei.ttc` in
+  `/userdata/PenMods` or `/userdisk/PenMods` — for units that genuinely lack CJK fonts; that mode copies the file
+  atomically into a writable dir (`MATHJAX_FONT_DIR` → temp dir → `/userdata/PenMods` → `/userdisk/PenMods`),
+  reads the real family from its name table, rewrites only the `<text>` font-family and sets
+  `loadSystemFonts: false`. Both paths are checked by a startup probe that renders `汉` and counts ink, so
+  `cjkFont` reports a *measured* result instead of an assumption; if neither path inks, only Chinese is lost and
+  every other formula still renders. The probe only counts ink, so a font that lacks CJK but defines `.notdef`
+  renders tofu boxes and still passes. In resvg-js 2.6.2 the `serifFamily` / `sansSerifFamily` / `cursiveFamily` /
   `fantasyFamily` / `monospaceFamily` options are parsed but never read — only `defaultFontFamily` matters.
-- `/health` returns `renderer` (currently 2), `cjkFont`, `cjkFontPath` and `cjkFontFamily`; `/render` returns
-  only `renderer`, `cjkFont` and `cjkFontFamily` (no path). The client probes `/health` and warns once each
-  when the renderer is too old or the CJK font is missing. **Bump `RENDERER_VERSION`** whenever renderer
-  behaviour changes.
+- `/health` returns `renderer` (currently 3), `cjkFont`, `cjkFontPath` (only in explicit-font mode, otherwise
+  null), `cjkFontFamily`, `cjkFontSource` (`system` | `file` | `none`) and `cjkFontError`; `/render` returns only
+  `renderer`, `cjkFont` and `cjkFontFamily`. The client probes `/health`, treats `renderer >= 2` as modern, and
+  warns once each when the renderer is too old or `cjkFont === false`. **Bump `RENDERER_VERSION`** whenever
+  renderer behaviour changes (3 = system fonts by default, no bundled font).
 - The client paces itself at roughly 8 requests/second and de-duplicates concurrent requests for the same
   formula (`MathCache.js`, which also owns the 1200-entry cache); the 429 exponential backoff lives in
   `MathBubble.qml`. An old server lets through only 10 requests/second per IP, which used to reject the second

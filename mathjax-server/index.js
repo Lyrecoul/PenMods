@@ -36,48 +36,56 @@ const SCRIPT_SCALE = '0.55';     // 上标/下标尺寸缩放倍数（默认 0.7
 const MAX_RENDER_WIDTH = 300;    // 单张公式图的最大宽度
 const MAX_WRAP_LINES = 8;        // 单个公式最多拆成几行
 const LINE_GAP = 4;              // 换行后行与行的间距（客户端用同一个值）
-const RENDERER_VERSION = 2;      // 2 = 统一基准字号 + 长公式换行（客户端据此提示旧服务）
+const RENDERER_VERSION = 3;      // 3 = 默认改用设备上的系统字体渲染中文（不再随包分发字体）
+                                 // 2 = 统一基准字号 + 长公式换行（客户端据此提示旧服务）
 const RATE_LIMIT_PER_SECOND = 100; // 一条长回答可能带几十个公式，限流只用来兜住失控客户端
 const SVG_EX_RE = /(?:width|height)="([0-9.]+)ex"/g;
 
 // --- 公式里的中文字体 ---
 // 背景：MathJax 只为自己字体里没有的字（中文等）输出 <text font-family="serif">，数学符号/字母
-// 一律是 <path>。设备上没有任何中文字体，resvg 找不到字形就把这些 <text> 整段丢掉——实测
-// \boxed{D.\ Y\text{ 的转化率为 }60\%} 在设备上只剩 "D. Y" 和 "60%"，中文全没了。
-// 修法：把 wqy-microhei.ttc 随服务端打包，解压成真实文件后交给 resvg，并把 <text> 的
-// font-family 指到这份字体的真实 family 名上。
+// 一律是 <path>。resvg 找不到字形就把这些 <text> 整段丢掉——真机上
+// \boxed{D.\ Y\text{ 的转化率为 }60\%} 会只剩 "D. Y" 和 "60%"，中文全没了。
 //
-// 这条链路上设备上可能失败的环节，逐一钉住：
-//   1. pkg 快照里的路径不是真实路径（pkg 只补丁了 Node 的 fs，resvg 是原生库、直接走 syscall）
-//      → 必须落盘成真实文件；
-//   2. os.tmpdir() 在设备上可能是 /tmp（空间小、甚至只读）→ 依次尝试 MATHJAX_FONT_DIR、
-//      os.tmpdir()、/userdata/PenMods、/userdisk/PenMods，成功为止；最终路径进日志和 /health；
+// 设备**自带**中文字体：/usr/share/fonts 是指向 /usr/lib/fonts 的符号链接，里面有
+// NotoSansSC-*.otf 与 HYQiHei-*.ttf（fc-list 也能列出 "Noto Sans SC"、"汉仪旗黑"）。
+// resvg-js 2.6.2 打开了 fontdb 的 fontconfig feature：它自己解析 /etc/fonts/fonts.conf、
+// 跟随符号链接、递归扫描，不需要 fontconfig cache，因此默认就直接用系统字体
+// （loadSystemFonts: true），服务端不再随包分发任何字体文件。
+// 实测：一个完全不做字体处理的旧版服务端在真机上渲染 \text{中文测试} 正常（118×28，
+// 1018 个墨迹点），说明这条路本来就走得通。
+//
+// 系统字体是默认值；只有明确给了字体文件（MATHJAX_FONT，或设备目录里放好的同名文件）时才
+// 改用它，留给那些确实没有中文字体的设备（换了固件/精简系统）：这时才把 SVG 里 <text> 的
+// font-family 指到该字体的真实 family 上。这条链路上可能失败的环节：
+//   1. 显式字体只认真实文件路径：MATHJAX_FONT、/userdata/PenMods、/userdisk/PenMods，以及可写
+//      目录里已经落盘好的副本；pkg 快照里的路径不再是候选（已经不打包装字体了）；
+//   2. 找到的字体先原子复制进一个可写目录（MATHJAX_FONT_DIR → os.tmpdir() → /userdata/PenMods
+//      → /userdisk/PenMods，成功为止；os.tmpdir() 在设备上可能是 /tmp，空间小甚至只读）；
+//      已存在且大小一致就直接复用，最终路径进日志与 /health；
 //   3. 落盘必须原子（先写 .tmp 校验大小再 rename），否则重启时可能读到半截文件；
-//   4. 解压只做一次：成功缓存路径，失败也记状态（failed），不会每个请求重试；
-//   5. 解压或加载失败只意味着"没有中文"，绝不因此让渲染失败，其它公式照常出图；
+//   4. 字体判定只做一次：成功/失败都定下来，不会每个请求重试；
+//   5. 字体不可用只意味着"没有中文"，绝不因此让渲染失败，其它公式照常出图；
 //   6. family 名不靠硬编码猜：直接解析字体 name 表拿真实 family，再用 resvg 真渲染一个"汉"字
 //      看有没有墨迹来确认（probeCjkInk），确认通过的名字才写进 SVG 与 /health。
-//
-// wqy-microhei.ttc 实测结论（本机用 Node 解析 name 表 + 用 resvg 实际渲染验证）：
-//   集合里 2 个字体，family 分别是 "WenQuanYi Micro Hei" 与 "WenQuanYi Micro Hei Mono"；
-//   font#0 的 name 表里有（platform 1/Mac）"WenQuanYi Micro Hei"，以及
-//   （platform 3/Windows，lang 0x0804 / 0x0404）"文泉驿微米黑" / "文泉驛微米黑"。
-//   resvg（fontdb 按 name 表的 family 名匹配）对这三种写法都能命中同一份字体并画出汉字，
-//   所以取 font#0 的英文名即可（Mono 那份不要，且不需要重写 font-family 之外的任何东西）。
-const BUNDLED_FONT_FILE = 'wqy-microhei.ttc';
-const BUNDLED_FONT_FAMILY_FALLBACK = 'WenQuanYi Micro Hei';
+const SYSTEM_FONT_FAMILY = 'Noto Sans SC';   // 设备自带的中文字体族，作为 resvg 的 defaultFontFamily
+const CJK_FONT_FILE = 'wqy-microhei.ttc';    // 用户自己放字体文件时沿用的文件名（不再随包分发）
+const CJK_FONT_FAMILY_FALLBACK = 'WenQuanYi Micro Hei';   // name 表读不出来时的兜底名，仍要过探针
 
 const server = { instance: null, port: 0 };
 
-// 中文字体状态机：pending → ok / failed。任何一步定下来就不会再重来。
+// 中文字体状态机：pending → file / system / failed。任何一步定下来就不会再重来。
+//   file   —— 用了显式指定的字体文件，path/family 可用，SVG 里的 <text> 会改写成 family
+//   system —— 用了设备自带的系统字体（默认路径），SVG 保持 MathJax 原样，交给 fontconfig 兜住
+//   failed —— 两条路都不通，中文会是空白（reason 说明原因）
 const fontState = {
-    status: 'pending',   // pending | ok | failed
-    path: null,          // 解压后的真实文件路径（给 resvg 的 fontFiles）
+    status: 'pending',   // pending | file | system | failed
+    path: null,          // 显式字体落盘后的真实文件路径（给 resvg 的 fontFiles）
     family: null,        // 实测能画出汉字的 family 名（写进 SVG 的 <text> 与 resvg 缺省族）
-    dir: null,           // 最终选中的可写目录
-    source: null,        // 字体数据从哪读到的
-    cached: false,       // 是否复用了上一次解压出来的副本
-    reason: null,        // 失败原因（cjkFont=false 时进 /health）
+    dir: null,           // 最终选中的可写目录（仅 file 模式）
+    source: null,        // 显式字体数据从哪读到的（仅 file 模式）
+    cached: false,       // 是否复用了上一次落盘出来的副本
+    fileReason: null,    // 显式字体没用上的原因（仅日志；完全没给字体文件时为 null）
+    reason: null,        // 中文整体不可用的原因（cjkFont=false 时进 /health）
     verdict: null        // 判定依据（探针渲染结果，便于排查）
 };
 
@@ -94,21 +102,16 @@ function fontDirCandidates() {
     return dirs;
 }
 
-// 字体数据来源候选（按可靠性排序）。包含几处设备/开发机常见位置，
-// 以及上一次解压出来的副本（临时目录被保留时可省一次 5MB 读）。
+// 显式字体文件的候选来源（按可靠性排序）：MATHJAX_FONT 指定的路径优先，其次是设备上放好的同名
+// 文件，最后是可写目录里上一次落盘出来的副本（临时目录还在时能省一次读）。
+// 不再包含 __dirname / process.cwd() 下的打包字体：服务端已经不随包分发字体了。
 function fontSourceCandidates() {
     const list = [
         process.env.MATHJAX_FONT,
-        path.join(__dirname, BUNDLED_FONT_FILE),        // 开发机直接 node index.js
-        path.join(__dirname, 'fonts', BUNDLED_FONT_FILE),
-        path.join(process.cwd(), BUNDLED_FONT_FILE),
-        path.join(process.cwd(), 'mathjax-server', BUNDLED_FONT_FILE),
-        '/userdata/PenMods/' + BUNDLED_FONT_FILE,
-        '/userdisk/PenMods/' + BUNDLED_FONT_FILE,
-        '/usr/share/fonts/wenquanyi/wqy-microhei/' + BUNDLED_FONT_FILE,
-        '/usr/share/fonts/truetype/wqy/' + BUNDLED_FONT_FILE
+        '/userdata/PenMods/' + CJK_FONT_FILE,
+        '/userdisk/PenMods/' + CJK_FONT_FILE
     ];
-    for (const dir of fontDirCandidates()) list.push(path.join(dir, BUNDLED_FONT_FILE));
+    for (const dir of fontDirCandidates()) list.push(path.join(dir, CJK_FONT_FILE));
     return list.filter((item) => typeof item === 'string' && item !== '');
 }
 
@@ -166,14 +169,17 @@ function xmlAttr(value) {
 }
 
 // 真渲染一个"汉"字数墨迹点。只判断"文件存在/加载没报错"是不够的：
-// 设备上真正的故障是文件在、但 resvg 拿不到字形，输出一片空白。
-function probeCjkInk(fontPath, family) {
+// 真正的故障是字体在、但 resvg 拿不到字形，输出一片空白（系统字体与指定字体都会这样）。
+// fontOptions 是 resvg 的 font 配置：指定字体时喂 fontFiles，系统字体时为 fontFiles: []。
+// 已知盲区：只数墨迹点认不出字体里的 .notdef 方框——字体完全没有汉字、但带 .notdef 时，
+// "汉"会画成方框、同样有墨迹，探针会通过（实测 MATHJAX_FONT 指到 DejaVu Sans 就是 4 个方框）。
+function probeCjkInk(family, fontOptions) {
     const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48">'
         + '<rect width="48" height="48" fill="#000000"/>'
         + '<g fill="#ffffff"><text x="4" y="34" font-size="28" font-family="' + xmlAttr(family) + '">汉</text></g>'
         + '</svg>';
     const image = new Resvg(svg, {
-        font: { fontFiles: [fontPath], loadSystemFonts: false, defaultFontFamily: family }
+        font: Object.assign({}, fontOptions, { defaultFontFamily: family })
     }).render();
     const pixels = image.pixels;
     let ink = 0;
@@ -184,9 +190,9 @@ function probeCjkInk(fontPath, family) {
 }
 
 // 原子落盘：已存在且大小一致就直接复用，否则写 .tmp → 校验大小 → rename。
-// 任何一步失败都清掉 .tmp：设备上 /tmp 可能很小，失败还留下半个 5MB 文件会雪上加霜。
+// 任何一步失败都清掉 .tmp：设备上 /tmp 可能很小，失败还留下半个大文件会雪上加霜。
 function dropFontFile(dir, data) {
-    const target = path.join(dir, BUNDLED_FONT_FILE);
+    const target = path.join(dir, CJK_FONT_FILE);
     try {
         if (fs.statSync(target).size === data.length) return { path: target, cached: true };
     } catch (err) { /* 不存在或不完整，往下走重写 */ }
@@ -204,90 +210,119 @@ function dropFontFile(dir, data) {
 }
 
 /**
- * 取出打包的中文字体并确认它真的能渲染中文。整条流程只跑一次（含失败）。
- * 返回 fontState；status==='ok' 时 path/family 才是可用的。
+ * 找一份显式指定的中文字体文件并确认它真的能画出中文：读候选来源 → 原子落盘到可写目录 →
+ * 解析 name 表拿真实 family → 用 resvg 真渲染一个"汉"字验证。
+ * 没有文件、或验证不过都返回 false（原因记在 fontState.fileReason），由调用方退回系统字体。
+ * 成功时 status='file'，path/family 可用。
+ */
+function useExplicitFont() {
+    // 一、读字体数据（MATHJAX_FONT / 设备目录里放好的同名文件 / 上次落盘的副本）
+    let data = null;
+    const readErrors = [];
+    for (const candidate of fontSourceCandidates()) {
+        try {
+            const buf = fs.readFileSync(candidate);
+            if (buf.length < 1024) { readErrors.push(`${candidate}(内容过小)`); continue; }
+            data = buf;
+            fontState.source = candidate;
+            break;
+        } catch (err) {
+            readErrors.push(`${candidate}(${err.code || err.message})`);
+        }
+    }
+    if (!data) {
+        log(`没有显式中文字体文件，使用系统字体（已试 ${readErrors.slice(0, 3).join('、')}${readErrors.length > 3 ? ' 等' : ''}）`);
+        return false;
+    }
+
+    // 二、落盘到第一个写得进去的目录（只做一次）
+    const writeErrors = [];
+    let extracted = null;
+    for (const dir of fontDirCandidates()) {
+        try {
+            extracted = dropFontFile(dir, data);
+            fontState.dir = dir;
+            break;
+        } catch (err) {
+            writeErrors.push(`${dir}(${err.code || err.message})`);
+        }
+    }
+    if (!extracted) {
+        fontState.fileReason = `字体落盘失败，目录都不可写：${writeErrors.join('、')}`;
+        return false;
+    }
+    fontState.path = extracted.path;
+    fontState.cached = extracted.cached;
+
+    // 三、确定 family：先用 name 表里读到的真名，再兜底硬编码名，逐个真渲染验证
+    const candidates = readFontFamilyNames(data);
+    if (candidates.indexOf(CJK_FONT_FAMILY_FALLBACK) < 0) candidates.push(CJK_FONT_FAMILY_FALLBACK);
+    const probeErrors = [];
+    for (const family of candidates) {
+        try {
+            const ink = probeCjkInk(family, { fontFiles: [extracted.path], loadSystemFonts: false });
+            if (ink > 0) {
+                fontState.family = family;
+                fontState.status = 'file';
+                fontState.verdict = `指定字体探针渲染 "汉" 得到 ${ink} 个墨迹点`;
+                return true;
+            }
+            probeErrors.push(`${family}(无墨迹)`);
+        } catch (err) {
+            probeErrors.push(`${family}(${err.message})`);
+        }
+    }
+    fontState.fileReason = `字体已落盘到 ${extracted.path}，但 resvg 没能用它渲染出中文：${probeErrors.join('、')}`;
+    return false;
+}
+
+/**
+ * 决定用哪种字体：优先显式指定的字体文件，没有或不可用就用设备上的系统字体（默认路径）。
+ * 整条流程只跑一次（含失败），返回 fontState：
+ *   status==='file'   指定字体可用，path/family 是实测结果；
+ *   status==='system' 系统字体可用，family 是缺省族名；
+ *   status==='failed' 两条路都不通，中文会空白，reason 说明原因。
  */
 function ensureCjkFont() {
     if (fontState.status !== 'pending') return fontState;
     fontState.status = 'failed';   // 先钉成 failed：任何异常路径都不会变成每次请求重试
 
     try {
-        // 一、读字体数据
-        let data = null;
-        const readErrors = [];
-        for (const candidate of fontSourceCandidates()) {
-            try {
-                const buf = fs.readFileSync(candidate);
-                if (buf.length < 1024) { readErrors.push(`${candidate}(内容过小)`); continue; }
-                data = buf;
-                fontState.source = candidate;
-                break;
-            } catch (err) {
-                readErrors.push(`${candidate}(${err.code || err.message})`);
+        // 一、显式指定的字体文件优先（留给确实没有中文字体的设备）
+        if (!useExplicitFont()) {
+            // 二、默认路径：设备自带的系统字体（/usr/lib/fonts 里的 Noto Sans SC / HYQiHei）。
+            //     同一个探针：连系统字体都画不出汉字的机器要如实报出来，客户端才会提示换字体。
+            if (fontState.fileReason)
+                console.warn(`警告：指定的中文字体不可用（${fontState.fileReason}），改用系统字体。`);
+            const ink = probeCjkInk(SYSTEM_FONT_FAMILY, systemFontOptions());
+            if (ink > 0) {
+                fontState.status = 'system';
+                fontState.family = SYSTEM_FONT_FAMILY;
+                fontState.verdict = `系统字体探针渲染 "汉" 得到 ${ink} 个墨迹点`;
+            } else {
+                fontState.reason = '系统字体渲染不出中文（探针 0 个墨迹点）'
+                    + (process.env.MATHJAX_NO_SYS_FONTS === '1' ? '，且 MATHJAX_NO_SYS_FONTS=1 关掉了系统字体' : '')
+                    + (fontState.fileReason ? `；显式字体也不可用：${fontState.fileReason}` : '');
             }
-        }
-        if (!data) {
-            fontState.reason = `没找到 ${BUNDLED_FONT_FILE}；试过 ${readErrors.slice(0, 4).join('、')}${readErrors.length > 4 ? ' 等' : ''}`;
-            finishFont();
-            return fontState;
-        }
-
-        // 二、落盘到第一个写得进去的目录（只做一次）
-        const writeErrors = [];
-        let extracted = null;
-        for (const dir of fontDirCandidates()) {
-            try {
-                extracted = dropFontFile(dir, data);
-                fontState.dir = dir;
-                break;
-            } catch (err) {
-                writeErrors.push(`${dir}(${err.code || err.message})`);
-            }
-        }
-        if (!extracted) {
-            fontState.reason = `字体解压失败，目录都不可写：${writeErrors.join('、')}`;
-            finishFont();
-            return fontState;
-        }
-        fontState.path = extracted.path;
-        fontState.cached = extracted.cached;
-
-        // 三、确定 family：先用 name 表里读到的真名，再兜底硬编码名，逐个真渲染验证
-        const candidates = readFontFamilyNames(data);
-        if (candidates.indexOf(BUNDLED_FONT_FAMILY_FALLBACK) < 0) candidates.push(BUNDLED_FONT_FAMILY_FALLBACK);
-        const probeErrors = [];
-        for (const family of candidates) {
-            try {
-                const ink = probeCjkInk(extracted.path, family);
-                if (ink > 0) {
-                    fontState.family = family;
-                    fontState.status = 'ok';
-                    fontState.verdict = `探针渲染 "汉" 得到 ${ink} 个墨迹点`;
-                    break;
-                }
-                probeErrors.push(`${family}(无墨迹)`);
-            } catch (err) {
-                probeErrors.push(`${family}(${err.message})`);
-            }
-        }
-        if (fontState.status !== 'ok') {
-            fontState.reason = `字体已解压到 ${extracted.path}，但 resvg 没能用它渲染出中文：${probeErrors.join('、')}`;
         }
     } catch (err) {
-        fontState.reason = `取出中文字体时异常：${err.message}`;
+        fontState.reason = `确定中文字体时异常：${err.message}`;
     }
     finishFont();
     return fontState;
 }
 
 function finishFont() {
-    if (fontState.status === 'ok') {
-        console.log(`中文字体：已启用。family="${fontState.family}" 路径=${fontState.path}`
-            + `${fontState.cached ? '（复用上次解压出的副本）' : '（本次解压）'}`
+    if (fontState.status === 'file') {
+        console.log(`中文字体：使用指定字体文件。family="${fontState.family}" 路径=${fontState.path}`
+            + `${fontState.cached ? '（复用上次落盘出的副本）' : '（本次写入）'}`
             + `，来源 ${fontState.source}，${fontState.verdict}`);
+    } else if (fontState.status === 'system') {
+        console.log(`中文字体：使用系统字体（缺省族 "${fontState.family}"，设备自带 Noto Sans SC / HYQiHei），${fontState.verdict}`);
     } else {
         console.warn(`警告：中文字体不可用，公式里的中文会显示为空白。原因：${fontState.reason}`);
-        console.warn('  可用 MATHJAX_FONT 指定字体文件、MATHJAX_FONT_DIR 指定解压目录后重试。');
+        console.warn(`  可用 MATHJAX_FONT=<字体文件路径> 指定字体，或把字体文件放到 /userdata/PenMods、`
+            + `/userdisk/PenMods（文件名 ${CJK_FONT_FILE}）后重试。`);
     }
 }
 
@@ -304,37 +339,45 @@ function applyCjkFamily(svg, family) {
     });
 }
 
-// resvg 的字体选项：确认可用时只喂打包字体（设备上有哪些系统字体不再影响结果），
-// 不可用时退回旧行为（用系统字体，中文多半还是空白，但其它公式照常）。
-function resvgFontOptions() {
-    if (fontState.status === 'ok') {
-        return {
-            fontFiles: [fontState.path],
-            loadSystemFonts: process.env.MATHJAX_KEEP_SYS_FONTS === '1',
-            defaultFontFamily: fontState.family,
-            serifFamily: fontState.family,
-            sansSerifFamily: fontState.family,
-            monospaceFamily: fontState.family,
-            cursiveFamily: fontState.family,
-            fantasyFamily: fontState.family
-        };
-    }
+// 默认（系统字体）的 resvg 字体选项。设备自带 Noto Sans SC / HYQiHei，resvg 经 fontdb 的
+// fontconfig 支持自己找到它们；MATHJAX_NO_SYS_FONTS=1 是关掉系统字体的逃生开关
+// （此时只有显式指定的字体文件能用，中文多半会空白）。
+function systemFontOptions() {
     return {
         fontFiles: [],
         loadSystemFonts: process.env.MATHJAX_NO_SYS_FONTS !== '1',
-        defaultFontFamily: 'sans-serif'
+        defaultFontFamily: SYSTEM_FONT_FAMILY
     };
+}
+
+// resvg 的字体选项。
+// 注意：resvg-js 2.6.2 会把 serifFamily / sansSerifFamily / cursiveFamily / fantasyFamily /
+// monospaceFamily 解析进结构体，但渲染时从不读它们，只有 fontFiles / loadSystemFonts /
+// defaultFontFamily 起作用，所以这里不再传那五个字段。
+function resvgFontOptions() {
+    // 显式指定了字体文件：只喂这一份，设备上有哪些系统字体不再影响结果
+    if (fontState.status === 'file') {
+        return {
+            fontFiles: [fontState.path],
+            loadSystemFonts: false,
+            defaultFontFamily: fontState.family
+        };
+    }
+    // 默认路径：系统字体
+    return systemFontOptions();
 }
 
 // /health 与 /render 里如实报告字体状态
 function cjkReport() {
-    const ok = fontState.status === 'ok';
+    const available = fontState.status === 'file' || fontState.status === 'system';
     return {
-        cjkFont: ok,
-        cjkFontPath: fontState.path,
+        cjkFont: available,
+        // 只有显式字体文件才有路径；系统字体模式没有单一路径
+        cjkFontPath: fontState.status === 'file' ? fontState.path : null,
         cjkFontFamily: fontState.family,
-        cjkFontSource: fontState.source,
-        cjkFontError: ok ? null : fontState.reason
+        cjkFontSource: fontState.status === 'file' ? 'file'
+            : (fontState.status === 'system' ? 'system' : 'none'),
+        cjkFontError: available ? null : fontState.reason
     };
 }
 
@@ -1038,15 +1081,15 @@ async function main() {
 
     log('MathJax 初始化完成');
 
-    // 中文字体在启动时就取出并验证（不是等第一个请求）：日志里能看到最终路径与 family，
-    // /health 一上来就能如实报告；失败也只是没有中文，服务照常。
+    // 中文字体在启动时就定下来并验证（不是等第一个请求）：日志里能看到最终用的是系统字体还是
+    // 指定字体文件（含路径与 family），/health 一上来就能如实报告；失败也只是没有中文，服务照常。
     const cjk = ensureCjkFont();
 
     const app = express();
     app.use(express.json({ limit: '64kb' }));
 
     app.get('/health', (_req, res) => {
-        // 幂等：解压/验证只做一次，这里只是把状态读出来
+        // 幂等：选择/探针验证只做一次，这里只是把状态读出来
         ensureCjkFont();
         res.json({
             status: 'ok',
@@ -1101,9 +1144,10 @@ async function main() {
                 // 减小上标/下标字号，在小屏幕上提升可读性
                 svg = svg.replace(/scale\(0\.707\)/g, 'scale(' + SCRIPT_SCALE + ')')
                     .replaceAll('currentColor', color);
-                // 只在字体确实可用的前提下改写 <text> 的 font-family：
-                // 字体不可用时保持原样，免得把一个本来能靠系统字体兜住的名字也改坏。
-                return fontState.status === 'ok' ? applyCjkFamily(svg, fontState.family) : svg;
+                // 只有显式字体文件才改写 <text> 的 font-family（指到该字体的真实 family）。
+                // 系统字体模式下保持 MathJax 原样：font-family="serif" 由 fontconfig 解析，
+                // 缺字时 resvg 还会逐字回退到装得下的中文字体（真机上实测正常）。
+                return fontState.status === 'file' ? applyCjkFamily(svg, fontState.family) : svg;
             };
             const svgSize = (svg) => {
                 const size = getSvgExSize(svg);
@@ -1127,7 +1171,11 @@ async function main() {
             const naturalHeight = wrapped.size ? Math.round(wrapped.size.h) : null;
 
             // 每个响应都带上字体状态，客户端/日志能直接看出这一屏的中文是不是真能显示
-            const cjkFields = { cjkFont: fontState.status === 'ok', cjkFontFamily: fontState.family };
+            // （客户端只读 cjkFont/cjkFontFamily，来源只在 /health 里报）
+            const cjkFields = {
+                cjkFont: fontState.status === 'file' || fontState.status === 'system',
+                cjkFontFamily: fontState.family
+            };
 
             if (!wrapped.lines) {
                 const png = rasterize(wrapped.single, wrapped.size);
@@ -1183,9 +1231,11 @@ async function main() {
         // calcFitTo 的高度分支只在拿不到 ex 尺寸的兜底路径里生效。
         console.log(`  尺寸策略: 统一基准字号，只缩不放 [宽 ≤ ${MAX_RENDER_WIDTH}px；高度不设上限，超出的由客户端滚动]`);
         console.log(`  长公式处理: 顶层运算符/箭头处换行（最多 ${MAX_WRAP_LINES} 行），行间距 ${LINE_GAP}px`);
-        console.log(`  中文字体: ${cjk.status === 'ok'
-            ? `已启用 family="${cjk.family}" dir=${cjk.dir} (${cjk.verdict})`
-            : `不可用（${cjk.reason}），中文会显示为空白`}`);
+        console.log(`  中文字体: ${cjk.status === 'file'
+            ? `指定字体 family="${cjk.family}" dir=${cjk.dir} (${cjk.verdict})`
+            : (cjk.status === 'system'
+                ? `系统字体 family="${cjk.family}" (${cjk.verdict})`
+                : `不可用（${cjk.reason}），中文会显示为空白`)}`);
         console.log(`  并发保护: 已启用 (单队列串行)`);
         console.log(`  频率限制: ${RATE_LIMIT_PER_SECOND} req/s per IP`);
         console.log(`  调试日志: ${DEBUG ? '开启' : '关闭'} (设置 DEBUG=1 开启)`);

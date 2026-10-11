@@ -30,13 +30,16 @@ class MusicPlayer : public QObject, public Singleton<MusicPlayer>, private Logge
     Q_PROPERTY(bool shutdownAfterPlaylist READ shutdownAfterPlaylist WRITE setShutdownAfterPlaylist NOTIFY shutdownTimerChanged);
 
 public:
-    void play(size_t idx);
+    /// 播放列表中的第 idx 首。
+    /// @param showPlayerUi 是否把宿主播放页（YGlobal::showAudioPlayer）调到前台：只有用户显式
+    ///        选曲才为 true；曲末自动切曲/单曲循环必须为 false，否则每首放完都会弹回播放页。
+    void play(size_t idx, bool showPlayerUi = true);
 
-    void clickNext();
+    void clickNext(bool showPlayerUi = true);
 
-    void clickPrev();
+    void clickPrev(bool showPlayerUi = true);
 
-    void clickRand();
+    void clickRand(bool showPlayerUi = true);
 
     void onSoundEnd();
 
@@ -112,7 +115,7 @@ private:
     /// @return 返回 .mp3 软链接路径，若原文件已是 .mp3 则返回原路径
     QString createTempSymlinks(const PlayFile& file, QString& outLrcPath);
 
-    void _play(const PlayFile& file);
+    void _play(const PlayFile& file, bool showPlayerUi);
 
     // 临时软链接路径，用于清理
     QString mTempAudioLink;
@@ -128,7 +131,21 @@ private:
     bool    mScanResultClosed{false};
     int64_t mScanPausePosition{0};
 
+    /// 开关关闭时的"扫描播放保护"：厂商 QML 的扫描流程会关播放器并暂停（main.qml onOcrStart →
+    /// closeAudioPlayer()），且释放 MUSIC 引用会让 AudioDaemon 关掉 ALSA 设备；窗口内只救 PAUSED 那一次。
+    bool    mScanInProgress{false};
+    bool    mResumeAfterScan{false};
+    bool    mScanLockHeld{false};
+    int64_t mScanResumePosition{0};
+    QTimer  mScanGuardTimer;
+
     void onOcrStarted();
+    void onOcrStopped();
+    /// 宿主播放器此刻是否在播（扫描窗口结束时据此决定要不要补一次释放）。
+    bool isHostPlaying() const;
+    void resumeAfterScan();
+    void acquireScanLock();
+    void releaseScanLock();
     void restoreScanPausePosition();
 };
 } // namespace mod::filemanager

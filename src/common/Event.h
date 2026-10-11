@@ -27,6 +27,9 @@ signals:
 
     void ocrStarted();
 
+    // 扫描结束（YSystemBase::ocrStop）：扫描保护靠它知道窗口何时关闭（ocrStarted 只知开始）。
+    void ocrStopped();
+
     void currentPageIndexChanged(int pageIndex);
 
 

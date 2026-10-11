@@ -91,6 +91,31 @@ regenerate it; do not patch the wrapper by hand.
 - `src/media/MediaSession` — `mediaSession` context property; a plugin that plays its own audio claims it to
   drive the quick settings panel, otherwise the panel reads the host `mediaPlayerManager`. See `### Plugin System`.
 
+### MathJax 公式渲染服务
+
+`mathjax-server/` 是 AI 助手把 LaTeX 渲染成 PNG 的本地服务（Node + MathJax 3 + resvg-js），
+`build.sh` 用 esbuild + pkg 打成单文件 aarch64 可执行程序；它**不在 OTA 包里**，更新时要把
+二进制单独推给用户（客户端按 `chatbot.mathServerPath` 启动它，进入 AI 助手页且没检测到进程时拉起）。
+
+- 出图尺寸：一律按 `REF_EM` 基准字号出图、只缩不放（上限 `MAX_RENDER_WIDTH`，高度不设上限，
+  超出的由客户端滚动）。把过小的公式"放大到最小可读高度"会让同一段回答里字号差好几倍。
+- 换行：一条式子放不下时不再整体缩小，而是断行后每行按同一字号出图 —— 优先在 `\boxed{…}`
+  内部竖排（`\begin{array}{l}`），其次在顶层运算符/箭头/全角标点处断成多张图，都没有断点
+  时按字数硬切 `\text{…}`（切口重新闭合宏）。断点表见 `BREAK_COMMANDS`/`BREAK_BEFORE_COMMANDS`，
+  行数上限 `MAX_WRAP_LINES`。
+- **公式里的中文依赖随包字体**：MathJax 对 `\text{中文}` 输出 `<text font-family="serif">`，设备上没有
+  中文字体就画不出字形（中文位置留空、后面的字挤在一起）。`wqy-microhei.ttc`（Apache-2.0，源自
+  Android Droid Sans Fallback）随服务端打包，启动时解压到可写目录交给 resvg，并只改写 `<text>` 的
+  字体；字体可用时关闭系统字体，避免设备字体影响结果。解压目录按 `MATHJAX_FONT_DIR` → 临时目录 →
+  `/userdata/PenMods` → `/userdisk/PenMods` 回退，失败只丢中文、渲染照常。
+- `/health` 与 `/render` 会返回 `renderer`（当前 2）、`cjkFont`、`cjkFontPath`、`cjkFontFamily`；
+  客户端探测 `/health`，版本过旧或缺少字体会各弹一次提示。改动渲染器行为时**递增 `RENDERER_VERSION`**。
+- 客户端按约 8 请求/秒发送并对 429 指数退避（见 `MathCache.js`）：旧版服务端每个 IP 每秒只放行
+  10 次，一条长回答里后半截公式会被拒；服务端限流见 `RATE_LIMIT_PER_SECOND`。
+- 验证：`echo '{"latex":"\\boxed{\\text{中文}}","display":true,"screenWidth":320}' | curl -s -X POST
+  http://127.0.0.1:3000/render -H 'Content-Type: application/json' -d @-`，把返回的 base64 存成 png
+  肉眼确认（只看尺寸看不出中文是否缺失）。
+
 ### Host Objects Used from PenMods QML
 
 | QML name | Host class | Notes |

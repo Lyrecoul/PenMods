@@ -19,6 +19,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QSaveFile>
 #include <QHttpMultiPart>
 #include <QHttpPart>
 #include <QJsonArray>
@@ -204,7 +205,7 @@ ChatBot::ChatBot()
   m_networkManager(new QNetworkAccessManager(this)),
   m_apiKey(""),
   m_apiEndpoint("https://api.deepseek.com/v1/chat/completions"),
-  m_model("deepseek-v4-flash"),
+  m_model("deepseek-flash"),
   m_temperature(0.7),
   m_defaultPrompt("你是一个有用的助手，使用中文回复用户的问题。"),
   m_isStreaming(true),
@@ -348,13 +349,18 @@ QJsonObject ChatBot::messageToJson(const MessageData& msg) const {
         QJsonArray contentArr;
         for (const auto& part : msg.parts) {
             if (part.type == "file") continue;
+            // 活动模型不支持视觉时不发历史里的图（视觉代理下原图仅本地查看，发给文字模型会被拒）。
+            if (part.type == "image_url" && !m_capVision) continue;
             QJsonObject p;
             p["type"] = part.type;
             if (part.type == "text") {
                 p["text"] = part.text;
             } else if (part.type == "image_url") {
+                const QString url = AttachmentManager::requestUrl(part);
+                // 附件被删/搬走后 requestUrl 返回空串，发空 url 会让本会话后续每条请求都 400，宁可少发。
+                if (url.isEmpty()) continue;
                 QJsonObject imgUrl;
-                imgUrl["url"]  = AttachmentManager::requestUrl(part);
+                imgUrl["url"]  = url;
                 p["image_url"] = imgUrl;
             } else if (part.type == "input_audio") {
                 QJsonObject audio;
@@ -673,11 +679,15 @@ void ChatBot::saveSessions() {
     }
     root["sessions"] = sessionsArr;
 
-    QFile file(sessionsFilePath());
-    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+    // QSaveFile 先写临时文件再改名，否则写盘期间掉电/被杀会把 sessions.json 截断成半个文件，
+    // 下次启动解析失败 → 全部会话丢失。
+    QSaveFile file(sessionsFilePath());
+    if (file.open(QIODevice::WriteOnly)) {
         const std::string payload = root.dump(4);
         file.write(payload.c_str(), static_cast<qint64>(payload.size()));
-        file.close();
+        if (!file.commit()) {
+            error("提交 sessions.json 失败: {}", sessionsFilePath().toStdString());
+        }
     } else {
         error("无法写入 sessions.json: {}", sessionsFilePath().toStdString());
     }
@@ -964,7 +974,8 @@ void ChatBot::finishMediaMessage(
     const QString&              message,
     const QVector<MessagePart>& parts,
     const QString&              effectiveMessage,
-    const QString&              sessionId
+    const QString&              sessionId,
+    const QVector<MessagePart>& localOnlyParts
 ) {
     if (m_cancelled || sessionId != m_currentSessionId || !m_sessions.contains(sessionId)) {
         warn("多模态消息已失效，会话已切换或请求已取消");
@@ -1001,6 +1012,10 @@ void ChatBot::finishMediaMessage(
         ),
         historyParts.end()
     );
+
+    // 视觉代理路径：原图不进这一轮请求，但必须落盘进历史，否则气泡里的图在轮末按历史重建时
+    // 会消失（发给模型时由 messageToJson 按"活动模型不支持视觉"跳过）。
+    for (const auto& part : persistUserImages(localOnlyParts, sessionId)) historyParts.append(part);
 
     MessageData userMsg;
     userMsg.role    = "user";
@@ -1063,7 +1078,8 @@ void ChatBot::callVisionProxy(
         );
         showToast("视觉代理模型配置无效，已仅发送文字");
         emit proxyVisionCompleted(QString());
-        finishMediaMessage(message, fallbackParts, "[图片分析失败]\n" + message, sessionId);
+        // 末参数 = 仅本地查看的原图：代理失败也要让用户能点开自己发的图
+        finishMediaMessage(message, fallbackParts, "[图片分析失败]\n" + message, sessionId, parts);
         return;
     }
 
@@ -1234,7 +1250,8 @@ void ChatBot::callVisionProxy(
         }
 
         reply->deleteLater();
-        finishMediaMessage(message, nextParts, effectiveMessage, sessionId);
+        // 末参数 = 仍带 data URL 的原图，落盘后进历史（见 persistUserImages）。
+        finishMediaMessage(message, nextParts, effectiveMessage, sessionId, parts);
     });
 }
 
@@ -1500,6 +1517,32 @@ QVector<MessagePart> ChatBot::persistGeneratedImages(const QJsonArray& output) {
         parts.append(part);
     }
     return parts;
+}
+
+// 视觉代理路径专用：原图落盘成会话附件供本地查看。落盘规则与 finishMediaMessage 一致
+// （同目录、sha256 命名，幂等）。验证：sessions.json 该条 user 消息 parts 有 localPath、url 空、无 data:image。
+QVector<MessagePart> ChatBot::persistUserImages(const QVector<MessagePart>& parts, const QString& sessionId) {
+    QVector<MessagePart> persisted;
+    if (parts.isEmpty()) return persisted;
+
+    const QString attachmentRoot = QFileInfo(sessionsFilePath()).absolutePath();
+    for (const auto& source : parts) {
+        if (source.type != "image_url") continue;
+
+        MessagePart part = source;
+        if (part.url.startsWith("data:", Qt::CaseInsensitive)) {
+            QString attachmentError;
+            if (!AttachmentManager::persistImage(attachmentRoot, sessionId, part, &attachmentError)) {
+                warn("保存图片附件失败: {}", attachmentError.toStdString());
+                continue;
+            }
+            part.url.clear();
+        }
+        // HTTP 图片没有本地路径，查看器只认本地文件（ImageManager::openAbsolute），给了也必然失败。
+        if (part.localPath.isEmpty()) continue;
+        persisted.append(part);
+    }
+    return persisted;
 }
 
 QVariantList ChatBot::attachmentVariants(const QVector<MessagePart>& parts) const {
@@ -2506,6 +2549,13 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
 // -----------------------------------------------------------------------
 
 void ChatBot::editMessage(int index, const QString& newContent) {
+    // 转调带媒体的版本；传空数组时图片仍会被移除，与本接口原有语义一致。
+    editMessageWithMedia(index, newContent, QStringLiteral("[]"));
+}
+
+// 带媒体的编辑：只按编辑后的图片集合重建图片，文件/音频 part 原样保留（编辑界面只回填图片，
+// 整体清空会把附件永久删掉）。验证：sessions.json 里该条 user 消息仍有 localPath、不含 data:image。
+void ChatBot::editMessageWithMedia(int index, const QString& newContent, const QString& mediaParts) {
     auto& msgs = currentMessages();
     if (index < 0 || index >= msgs.size()) return;
 
@@ -2514,24 +2564,101 @@ void ChatBot::editMessage(int index, const QString& newContent) {
         return;
     }
 
-    QString currentRole = msgs[index].role;
-    msgs[index].content = newContent;
-    msgs[index].parts.clear();
+    static constexpr int MAX_MEDIA_JSON_SIZE = 12 * 1024 * 1024;
+    if (mediaParts.size() > MAX_MEDIA_JSON_SIZE) {
+        emit errorOccurred("图片数据过大，请裁剪或减少拼接范围后重试");
+        return;
+    }
+
+    // user 消息的 parts 形如 [text(用户正文), text(附件内容上下文), file/input_audio…, image…]：
+    // 只换用户正文那一条，其余必须留着，否则"改几个字"会把附件内容从模型视野里删掉。
+    QVector<MessagePart> parts;
+    bool                 droppedUserText = false;
+    for (const auto& part : msgs[index].parts) {
+        if (part.type == "image_url") continue; // 图片由编辑界面传来的集合决定
+        if (part.type == "text" && !droppedUserText && part.text == msgs[index].content) {
+            droppedUserText = true;
+            continue;
+        }
+        parts.append(part);
+    }
+
+    QJsonDocument doc = QJsonDocument::fromJson(mediaParts.toUtf8());
+    if (doc.isArray()) {
+        for (const auto& val : doc.array()) {
+            const QJsonObject obj = val.toObject();
+            if (obj["type"].toString() != "image_url") continue;
+
+            MessagePart part;
+            part.type      = "image_url";
+            part.url       = obj["url"].toString();
+            part.localPath = obj["localPath"].toString();
+            part.name      = obj["name"].toString();
+            part.mimeType  = obj["mimeType"].toString();
+            // url 与 localPath 都空 = 图已不可用（文件被删/格式不支持），丢弃而不是发空图。
+            if (part.url.isEmpty() && part.localPath.isEmpty()) continue;
+            parts.append(part);
+        }
+    }
+
+    const bool hadImage =
+        std::any_of(parts.cbegin(), parts.cend(), [](const MessagePart& part) { return part.type == "image_url"; });
+    // 兜底校验（QML 侧已保证"文字和图片至少留一个"）：不能用 parts.isEmpty() 判断 —— 保留的
+    // file 部分会让 parts 非空，文字为空时仍会发出 content 为空的消息。
+    if (newContent.trimmed().isEmpty() && !hadImage) {
+        emit errorOccurred("没有可发送的文字或媒体内容");
+        return;
+    }
+
+    // 内嵌 base64 不落库（messageDataToJson 跳过 data: 图片），所以落盘后必须清掉 url。
+    QVector<MessagePart> historyParts   = parts;
+    const QString        attachmentRoot = QFileInfo(sessionsFilePath()).absolutePath();
+    for (auto& part : historyParts) {
+        if (part.type != "image_url" || !part.url.startsWith("data:", Qt::CaseInsensitive)) continue;
+        QString attachmentError;
+        if (!AttachmentManager::persistImage(attachmentRoot, m_currentSessionId, part, &attachmentError)) {
+            warn("保存图片附件失败: {}", attachmentError.toStdString());
+            part.localPath.clear();
+        }
+        part.url.clear();
+    }
+    historyParts.erase(
+        std::remove_if(
+            historyParts.begin(),
+            historyParts.end(),
+            [](const MessagePart& part) {
+                return part.type == "image_url" && part.url.isEmpty() && part.localPath.isEmpty();
+            }
+        ),
+        historyParts.end()
+    );
+
+    auto& target = msgs[index];
+    // 文字为空但图片还在：落库成 "[图片]"，与 finishMediaMessage 的取值保持一致。
+    target.content = newContent.isEmpty() && hadImage ? QStringLiteral("[图片]") : newContent;
+    target.parts   = historyParts;
+    if (!newContent.isEmpty() && !target.parts.isEmpty()) {
+        MessagePart textPart;
+        textPart.type = "text";
+        textPart.text = newContent;
+        target.parts.prepend(textPart);
+    }
     msgs.resize(index + 1);
 
     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
     saveSessions();
     emit messagesChanged();
 
-    if (currentRole == "user" && index == msgs.size() - 1) {
-        QJsonArray  apiMessages;
-        QJsonObject sysMsg;
-        sysMsg["role"]    = "system";
-        sysMsg["content"] = m_defaultPrompt;
-        apiMessages.append(sysMsg);
-        for (const auto& msg : msgs) apiMessages.append(messageToJson(msg));
-        makeApiRequest(apiMessages);
-    }
+    // 只在编辑用户消息时重新请求（不依赖上面那条校验；历史最后一条是 assistant 时接口会报错）。
+    if (msgs[index].role != "user") return;
+
+    QJsonArray  apiMessages;
+    QJsonObject sysMsg;
+    sysMsg["role"]    = "system";
+    sysMsg["content"] = m_defaultPrompt;
+    apiMessages.append(sysMsg);
+    for (const auto& msg : msgs) apiMessages.append(messageToJson(msg));
+    makeApiRequest(apiMessages);
 }
 
 void ChatBot::truncateHistory(int index) {
@@ -2790,7 +2917,7 @@ void ChatBot::initModels() {
         info("创建默认模型配置");
         json defaultModel;
         defaultModel["id"]                 = m_model.toStdString();
-        defaultModel["name"]               = "DeepSeek Chat";
+        defaultModel["name"]               = "DeepSeek V4.1 Flash";
         defaultModel["provider"]           = "DeepSeek";
         defaultModel["endpoint"]           = m_apiEndpoint.toStdString();
         defaultModel["apiKey"]             = m_apiKey.toStdString();

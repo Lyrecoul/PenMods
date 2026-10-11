@@ -149,11 +149,11 @@ Config::Config() : Logger("Config") {
             {"bubble_render_mode", "full"},
             {"models", json::array({
                 json{
-                    {"id",          "deepseek-v4-flash"},
-                    {"name",        "DeepSeek Chat"},
+                    {"id",          "deepseek-flash"},
+                    {"name",        "DeepSeek V4.1 Flash"},
                     {"provider",    "DeepSeek"},
                     {"endpoint",    "https://api.deepseek.com/v1/chat/completions"},
-                    {"modelId",     "deepseek-v4-flash"},
+                    {"modelId",     "deepseek-flash"},
                     {"apiProtocol", "chat_completions"},
                     {"apiKey",      ""},
                     {"temperature", 0.7},
@@ -174,7 +174,7 @@ Config::Config() : Logger("Config") {
                     {"proxyVisionPrompt", "请详细描述这张图片的内容。如果图片中有文字，请完整转录。"}
                 }
             })},
-            {"activeModelId", "deepseek-v4-flash"},
+            {"activeModelId", "deepseek-flash"},
             {"prompts", json::array({
                 json{
                     {"id",      "default"},
@@ -288,7 +288,10 @@ bool Config::_update(json& data) {
         if (data["version"] < 131) {
             if (data.contains("ai")) {
                 if (!data["ai"].contains("models") || !data["ai"]["models"].is_array()) {
-                    auto& cb                    = data["ai"]["chatbot"];
+                    // `ai.chatbot` 可能不存在：对 null 调 value() 会抛 type_error，被 _load() 的
+                    // catch(...) 吞掉后整个配置被当损坏重置（用户数据静默丢失），所以退回空对象。
+                    const bool hasLegacyChatbot = data["ai"].contains("chatbot") && data["ai"]["chatbot"].is_object();
+                    const json cb               = hasLegacyChatbot ? data["ai"]["chatbot"] : json::object();
                     data["ai"]["models"]        = json::array({
                         json{
                              {"id", cb.value("model", "deepseek-chat")},
@@ -350,11 +353,47 @@ bool Config::_load() {
         info("Saving configuration...");
     }
     mData = std::move(tmp);
-    if (_fill_missing_defaults(mData, mDefaults)) {
+    const bool legacyAiUpgraded = _upgrade_legacy_ai_defaults(mData);
+    if (_fill_missing_defaults(mData, mDefaults) || legacyAiUpgraded) {
         info("Filling missing default keys, saving...");
         _save();
     }
     info("Successfully loaded configuration.");
+    return true;
+}
+
+// 出厂默认模型改名 deepseek-v4-flash → deepseek-flash：`ai.models` 是数组（叶子节点），
+// `_fill_missing_defaults` 碰不到它，只能加载时判一次（改默认值不该动 VERSION_CONFIG，换过后即不再命中）。
+bool Config::_upgrade_legacy_ai_defaults(json& data) {
+    if (!data.contains("ai") || !data["ai"].is_object()) return false;
+    auto& ai = data["ai"];
+    if (!ai.contains("models") || !ai["models"].is_array() || ai["models"].size() != 1) return false;
+
+    auto& model = ai["models"][0];
+    if (!model.is_object()) return false;
+
+    // 只升级"出厂预设一字未动"的配置：自建过模型、填过 key、改过名字/端点（例如换成中转地址，
+    // 那个端点未必有 deepseek-flash）时保持原样。`deepseek-chat` 是 v130→131 迁移补的出厂 id。
+    const std::string legacyIds[] = {"deepseek-v4-flash", "deepseek-chat"};
+    std::string       legacyId;
+    for (const auto& candidate : legacyIds) {
+        if (model.value("id", "") == candidate && model.value("modelId", "") == candidate) {
+            legacyId = candidate;
+            break;
+        }
+    }
+    if (legacyId.empty()) return false;
+    if (model.value("name", "") != "DeepSeek Chat") return false;
+    if (model.value("endpoint", "") != "https://api.deepseek.com/v1/chat/completions") return false;
+    if (!model.value("apiKey", "").empty()) return false;
+
+    model["id"]      = "deepseek-flash";
+    model["modelId"] = "deepseek-flash";
+    model["name"]    = "DeepSeek V4.1 Flash";
+    if (ai.value("activeModelId", "") == legacyId) {
+        ai["activeModelId"] = "deepseek-flash";
+    }
+    info("出厂默认模型已升级为 deepseek-flash");
     return true;
 }
 

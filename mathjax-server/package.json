@@ -12,7 +12,8 @@
   "pkg": {
     "assets": [
       "node_modules/@resvg/resvg-js/**/*",
-      "node_modules/@resvg/resvg-js-linux-arm64-gnu/**/*"
+      "node_modules/@resvg/resvg-js-linux-arm64-gnu/**/*",
+      "wqy-microhei.ttc"
     ]
   },
   "author": "",

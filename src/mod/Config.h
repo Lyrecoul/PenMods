@@ -39,6 +39,8 @@ private:
 
     bool _fill_missing_defaults(json& target, const json& defaults);
 
+    bool _upgrade_legacy_ai_defaults(json& data);
+
     void _strip_unknown_keys(json& target, const json& reference);
 };
 

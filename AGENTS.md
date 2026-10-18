@@ -91,6 +91,97 @@ regenerate it; do not patch the wrapper by hand.
 - `src/media/MediaSession` — `mediaSession` context property; a plugin that plays its own audio claims it to
   drive the quick settings panel, otherwise the panel reads the host `mediaPlayerManager`. See `### Plugin System`.
 
+### CA Certificates (the rootfs has no trust store)
+
+The stock rootfs ships **no working CA store** — usually an empty `/etc/ssl/certs`, sometimes a "full" one built
+from materialised symlinks (see below) — so every TLS peer verification fails with the misleading
+`unable to get local issuer certificate`; `curl`, the FFmpeg player plugin (static OpenSSL 3) and Qt's network
+stack all hit it (see [issue #15](https://github.com/Lyrecoul/PenMods/issues/15); the same rootfs carries a complete
+Mozilla bundle at `/usr/share/grpc/roots.pem` that nothing reads).
+
+`src/helper/CaCertificates` (Singleton, constructed in `BeforeMain`, work deferred to `beforeUiInitialization`)
+does nothing when the device already has a *usable* store, and otherwise has two paths:
+
+1. **bind mount (preferred, fixes the whole machine).** The embedded bundle is split into one
+   `<X509 subject hash>.0` file per certificate in a staging directory (`/tmp/penmods-ca`, falling back to
+   `/userdata/PenMods/ca-staging`), which is then `mount(2)`-ed with `MS_BIND` over `/etc/ssl/certs`. Nothing is
+   written to the rootfs — the mount just shadows the empty directory and disappears on reboot. Covers this
+   process' Qt, the statically linked OpenSSL 3 inside `libffmpegplayerplugin.so`, and every `curl`/`mpv` we exec.
+2. **in-process default trust anchors (fallback).** If the mount is impossible (no `CAP_SYS_ADMIN`, private mount
+   namespace, missing target directory) the bundle is fed to `QSslConfiguration::setDefaultConfiguration()`, which
+   covers `QNetworkAccessManager`, `QSslSocket::connectToHostEncrypted(host, port)` and `QtWebSockets` — this
+   process only.
+
+`PENMODS_NO_CA_MOUNT=1` skips path 1, which is how the fallback is exercised on a device.
+
+Rules that cost a debugging session:
+
+- **CApath only honours `<hash>.0` file names.** Dropping a PEM bundle into `/etc/ssl/certs` under any other name is
+  silently ignored (verified: plain-named bundle in a CApath dir → `curl` 000, hashed dir → 200). The device has no
+  `openssl`/`c_rehash`, so the names are precomputed on the host into `resource/certs/ca-bundle.hashes` (see below).
+- **The gate is filesystem-based and must validate the *contents***, *not*
+  `QSslConfiguration::systemCaCertificates()`. Qt 5.15's enumeration disagrees with the store the handshake
+  actually uses: pointing `SSL_CERT_DIR` at a 3-certificate directory still makes `systemCaCertificates()` report all
+  242 system certificates, while the handshake honours the 3. It is also why
+  `defaultConfiguration().caCertificates()` reads 0 on a healthy host — the anchors are loaded by OpenSSL's default
+  paths at handshake time, not into the configuration.
+- **`ls -1 /etc/ssl/certs | wc -l` is not a validity check** (that is issue #15's own diagnostic, and it lies). A
+  real YDP02X was found with 438 entries where **every one of the 292 `<hash>.0` files was a 20–38 byte text file
+  containing a filename** (`GlobalSign_Root_R46.pem`) — symlinks materialised into text by a copy/zip tool — plus 146
+  `<name>.pem` files that CApath never reads. The store was 100% non-functional while looking full. The gate therefore
+  requires at least one `<hash>.<n>` entry that is ≥100 bytes and starts with `-----BEGIN CERTIFICATE-----` (or a DER
+  `SEQUENCE`, or a usable `/etc/ssl/cert.pem`), and the post-mount check re-counts through the mount.
+- **Never iterate `/proc/<pid>/mountinfo` with `atEnd()`/`readLine()`.** procfs reports `st_size == 0`, so
+  `QFile::atEnd()` is true immediately and the loop body never runs; that silently disabled "reuse the mount the
+  previous app instance made" (symptom: a second `MS_BIND` layer per restart, or the gate taking the "device is fine"
+  branch). Read `readAll()` and `split('\n')`.
+- **Don't build anything on `SSL_CERT_FILE`/`SSL_CERT_DIR`.** The host Qt 5.15 honours them at handshake time, the
+  device's Qt build (also 5.15.2 + OpenSSL 1.1.1i) ignores `SSL_CERT_DIR`: an empty directory there still yields a
+  200 while `curl` with the same variable fails. Measured end-to-end on a YDP02X, `QNetworkAccessManager` reports
+  `err=6 SSL handshake failed` against the vendor's dead store and `200 err=0` with the mount in place — the mount
+  is the lever, not an inherited environment variable.
+- **Assigning `caCertificates` replaces the system store instead of adding to it** (verified: injecting a single
+  unrelated root makes every handshake fail while the system store is intact). That is why the fallback only runs
+  when the device store is unusable.
+- Not in `BeforeMain` (or any other pre-`QCoreApplication` hook): `QSslConfiguration::defaultConfiguration()`
+  initialises QtNetwork's TLS backend, which needs the instance to resolve plugin/library paths, and caches the
+  failure.
+- The mount is **namespace-scoped**: anything we spawn inherits it, but "system-wide" only holds if the app shares
+  init's mount namespace. On the tested YDP02X every process (init, adbd, the app) is in `mnt:[4026531840]`, so an
+  unrelated `adb shell` sees the mount — `readlink /proc/$(pidof YoudaoDictPen)/ns/mnt` vs `/proc/1/ns/mnt` on a new
+  unit/model.
+- Re-running `_install()` would stack mounts (`MS_BIND` allows it), hence the `once_flag`; `isMounted()` parses
+  field 5 of `/proc/self/mountinfo` so a mount left over from the previous app instance is reused, not duplicated.
+- A staging rewrite is detected by a SHA-256 marker file (`.penmods-ca`, first 16 hex chars). Because the mount
+  points at the *directory*, a new bundle only needs the files rewritten in place — no remount. Consequently
+  `clearDirectory()` deletes the *contents* and never the directory itself: unlinking the mount source leaves the
+  mount point serving an unlinked inode (looks fine, never updates again).
+- On-device verification without any network: a tiny statically-dlopen'd probe that reads a saved chain
+  (`openssl s_client -showcerts`) and calls `X509_STORE_set_default_paths()` + `X509_verify_cert()` through the
+  device's own `libcrypto.so.1.1` reports `OK` against the mount and `error 20 unable to get local issuer
+  certificate` with `SSL_CERT_DIR` pointed at an empty directory. That is the cheapest proof the CApath is live.
+- If the OTA installer ever writes `/etc/ssl` itself, remember it would land in the shadow directory while the mount
+  is up. The installer currently does not, and does not need to: this mount is the fix.
+
+Bundle maintenance:
+
+- Sources of truth: `resource/certs/ca-bundle.pem` (Mozilla bundle with the `#` label lines stripped) and
+  `resource/certs/ca-bundle.hashes` (one `openssl x509 -subject_hash` per certificate, same order). Refresh with
+  `scripts/update_ca_bundle.sh [source.pem]` (needs host `openssl`; device sources work too:
+  `adb pull /usr/share/grpc/roots.pem` then pass it), then re-run `xmake f` — the `PenMods` target's `on_config`
+  writes `$(builddir)/config/CaBundleData.h` (`kCaBundlePem`, `kCaBundleHashes[]`, `kCaBundleCount`, ~182 KB). The
+  generator asserts `#hashes == #certificates`; it lives inside `on_config` because xmake 3.x gives the `xmake.lua`
+  main chunk neither `io` nor `import`, and target scripts run in a sandbox that cannot see main-chunk globals.
+- **Do not pre-compress it.** Raw PEM in `.rodata` costs +181,603 bytes of `libPenMods.so` (+108 KiB in the OTA zip,
+  because zip deflates the `.so` anyway — a zlib blob saves the same zip bytes but is incompressible itself) and its
+  pages stay file-backed and evictable. A zlib blob would save ~75 KiB of mapping while turning the inflated 182 KiB
+  into anonymous heap and needing unpack code — worse for this device.
+- Do not trim the bundle to "just the hosts we need": both paths are only used when the device has no trust store at
+  all, and the chatbot `baseUrl` is user-supplied, so a partial bundle breaks every unlisted endpoint with the same
+  silent failure this section exists to fix.
+- Old-style `-subject_hash_old` names are not generated: everything on this device (curl 7.58 with OpenSSL 1.1.1i,
+  the player's OpenSSL 3.5) uses the SHA-1 based hash. Add them if a 1.0.x consumer ever appears.
+
 ### MathJax Formula Rendering Service
 
 `mathjax-server/` is the local service that renders LaTeX to PNG for the AI assistant (Node + MathJax 3 +
@@ -169,7 +260,7 @@ persisted as `righthandmode` in `/userdata/DictPenData/NeteaseYoudao/YoudaoDictP
 | `src/dict/` | Custom dictionaries (`customDict`): scans `/userdisk/PenMods/dicts/`, queries user-made `.dat` containers through the vendor reader and injects the hit into the main result page as its own section (see `doc/DICT_FORMAT_ANALYSIS.md`) |
 | `src/filemanager/` | File browser, MusicPlayer, VideoPlayer, TextReader, ImageViewer |
 | `external/ffmpeg-player/` | Vendored upstream QML video player plugin (in-scene-graph rendering, ASS/LRC subtitles, MPP hard decode behind a runtime gate) |
-| `src/helper/` | AntiEmbs, NetworkSettings, DeveloperSettings, ServiceManager |
+| `src/helper/` | AntiEmbs, CaCertificates, NetworkSettings, DeveloperSettings, ServiceManager |
 | `src/system/` | BatteryInfo, InputDaemon, ScreenManager, AudioDaemon |
 | `src/plugin/` | PluginManager, PluginSDK.h (public C ABI), QmlPluginWrapper |
 | `src/media/` | MediaSession: plugin media interface for the quick settings panel |

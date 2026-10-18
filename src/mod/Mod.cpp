@@ -15,6 +15,8 @@
 #include "common/Utils.h"
 #include "common/util/System.h"
 
+#include "helper/CaCertificates.h"
+
 #include "Version.h"
 
 #include <QCryptographicHash>
@@ -268,6 +270,7 @@ __attribute__((constructor)) static void BeforeMain() {
 
     // helper
     INSTANCE(AntiEmbs);
+    INSTANCE(CaCertificates);
     INSTANCE(DeveloperSettings);
     INSTANCE(NetworkSettings);
     INSTANCE(ServiceManager);

@@ -78,6 +78,10 @@ ffmpeg-player/
 - 默认字幕字体路径 `/usr/lib/fonts/NotoSansSC-Regular.otf` **存在**（该目录共 152 个字体，含 SC/JP/KR）；
   也可用 `subtitleFontFile` 指向 `/userdisk/PenMods/plugins/*/qml/*.ttf`。
 - `/etc/ssl/certs` 有 441 个 hash 证书 → HTTPS 校验可用（插件静态链接 OpenSSL 3，与宿主 `libssl.so.1.1` 隔离）。
+  **注意**：这是本机（已按 [issue #15](https://github.com/Lyrecoul/PenMods/issues/15) 补过 CA 的机器）的测量结果；
+  出厂 rootfs 的 `/etc/ssl/certs` 是空目录，插件默认拉不起 https 流。`src/helper/CaCertificates` 会把这个空目录
+  bind mount 到内嵌 CA 包（拆分出的 `<subject_hash>.0` 目录），所以插件进程也能正常校验 —— 见 `AGENTS.md` 的
+  `### CA Certificates`；mount 失败时会退回 Qt 进程内注入，那种情况下插件仍然拉不起 https。
 
 ### 2.4 硬解：出厂固件上不可用，但可以被「patch 内核/设备树」打开
 

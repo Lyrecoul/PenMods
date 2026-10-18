@@ -8,8 +8,6 @@
 #include "system/input/InputDaemon.h"
 #include "system/sound/AudioDaemon.h"
 
-#include "filemanager/player/MusicPlayer.h"
-
 #include "base/YEnum.h"
 
 #include "common/Event.h"
@@ -309,11 +307,10 @@ PEN_HOOK(void, _ZN11YSystemBase11onScreenOffEv, void* self) {
 
 PEN_HOOK(uint64, _ZN7YGlobal27isInPlayerCenterPageChangedEv, uint64 self, uint64 a2, uint64 a3, uint64 a4, uint64 a5) {
     bool isInPage = PEN_CALL(bool, "_ZNK7YGlobal20isInPlayerCenterPageEv", uint64)(self);
-    mod::ScreenManager ::getInstance().onInPlayerPageChanged(isInPage);
-    // 离开播放器页面时，清理文件管理器创建的临时软链接
-    if (!isInPage) {
-        mod::filemanager::MusicPlayer::getInstance().cleanupTempSymlinks();
-    }
+    mod::ScreenManager::getInstance().onInPlayerPageChanged(isInPage);
+    // 离开播放器页面**不能**删临时软链接：宿主 YMediaPlayerManager 还拿着那条 localFile，
+    // onClickedPlay 会先查它是否存在，链接一没就直接 fileNotExist() + onResetPlayer()，
+    // 回到播放页按播放键再也不会有反应。链接由 MusicPlayer 自己管（进程内留存、启动时清）。
     mod::ScreenManager::getInstance().resetInactivityTimer();
     return origin(self, a2, a3, a4, a5);
 }

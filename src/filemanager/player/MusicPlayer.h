@@ -35,6 +35,10 @@ public:
     ///        选曲才为 true；曲末自动切曲/单曲循环必须为 false，否则每首放完都会弹回播放页。
     void play(size_t idx, bool showPlayerUi = true);
 
+    /// 宿主按下播放键后调用：宿主会先查 localFile 是否存在，临时软链接丢了就只发
+    /// fileNotExist + onResetPlayer（之后按多少次都没反应），这里补上链接或整首重放。
+    void recoverIfPlayFailed();
+
     void clickNext(bool showPlayerUi = true);
 
     void clickPrev(bool showPlayerUi = true);
@@ -104,21 +108,32 @@ private:
         size_t   mIndex{0};
         bool     mIsEnd{true};
 
-        void setPlaying(size_t idx) {
+        void setPlaying(size_t idx, const PlayFile& file) {
             mIsEnd = false;
             mIndex = idx;
+            mFile  = file;
         }
 
     } mCurrentPlaying;
 
-    /// 为指定文件在 /tmp 创建 .mp3 后缀的临时软链接
-    /// @return 返回 .mp3 软链接路径，若原文件已是 .mp3 则返回原路径
-    QString createTempSymlinks(const PlayFile& file, QString& outLrcPath);
+    /// 为非 mp3 文件准备 `.mp3` 后缀的临时软链接（宿主按后缀选解码路径）。
+    /// @return 交给宿主的 localFile，若原文件已是 .mp3 或建链失败则返回原路径
+    QString prepareTempAudioLink(const PlayFile& file);
+
+    /// 软链接不见了（被清掉、同名覆盖……）时重新建回去；成功返回 true。
+    bool repairTempAudioLink();
+
+    /// 建链（已存在且指向同一目标时直接复用，不做 unlink/relink）。
+    bool _createTempAudioLink(const QString& linkPath, const QString& target);
+
+    /// 启动时清掉上个进程留下的链接：新进程不可能有引用它们的会话。
+    void _purgeStaleAudioLinks();
 
     void _play(const PlayFile& file, bool showPlayerUi);
 
-    // 临时软链接路径，用于清理
+    // 当前媒体用到的临时软链接，以及它指向的原文件
     QString mTempAudioLink;
+    QString mTempAudioTarget;
     bool    mPauseOnScan{false};
     bool    mHideFloatingWindow{false};
     bool    mQuickPanelMusicView{false};

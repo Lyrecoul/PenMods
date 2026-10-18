@@ -291,6 +291,33 @@ Left/right hand mode is a 180° rotation applied to the main window in QML (`set
 the host's `YSettingManager::rotate(int)` is an empty stub, so nothing else in the system learns about it. The value is
 persisted as `righthandmode` in `/userdata/DictPenData/NeteaseYoudao/YoudaoDictPen.conf`.
 
+### Music Player Temporary `.mp3` Links
+
+`MusicPlayer::_play` gives the host a symlink named `<original base name>.mp3` (in
+`/userdata/PenMods/audiolinks/<sha1(path)[0..8]>/`) for every non-mp3 file, because the host picks its decode path from
+the suffix. The link is load bearing for the whole playback session — not just for the first `playAudio()`:
+`YMediaPlayerManager::onClickedPlay()` starts with `FileUtils::fileExists(entity->localFile())` and, when it fails,
+runs `fileNotExist()` + `onResetPlayer()` without touching the original file. The visible symptom is a player that
+ignores the play button **forever** after a pause (`playState` never leaves `PAUSED`), which is what "暂停后无法再次播放"
+means.
+
+Rules:
+
+- **Never delete the current link while the session may still use it.** Two deletions caused that bug: leaving the
+  player page used to call `MusicPlayer::cleanupTempSymlinks()` from the `isInPlayerCenterPageChanged` hook (removed),
+  and `_play` deleted the previous link before creating the new one (so a paused song plus any later `_play` — a
+  song switch, or two interleaved `_play` calls — could unlink the live path). Links are now kept for the process
+  lifetime and purged once in the `MusicPlayer` constructor.
+- `onClickedPlay` is hooked to `recoverIfPlayFailed()`: the repair path recreates the link from the recorded
+  `mTempAudioTarget` and retries the play synchronously (log: `已重建音频临时软链接` / `临时软链接丢失已修复`). Restart
+  the whole song only when the host's entity really was wiped (`hostLocalFile()` empty).
+- Link names must keep the original base name (the host derives the `.lrc` name from `QFileInfo(localFile).fileName()`
+  minus 4 chars); same-named songs in different folders are separated by the hash directory. Never switch to
+  `QTemporaryFile`-style names or hash suffixes in the file name itself.
+- `/tmp` is a tmpfs other processes can clear — the links live under the module directory for that reason.
+- `mCurrentPlaying.mFile` is now assigned (`setPlaying(idx, file)`); the "same file, don't restart" early return also
+  requires `isHostPlaying()`, so tapping a paused song still restarts it instead of becoming a no-op.
+
 ### Module Organization
 
 | Directory | Purpose |

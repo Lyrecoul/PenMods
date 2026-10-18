@@ -11,11 +11,13 @@
 #include "common/Event.h"
 #include "common/Utils.h"
 
+#include "common/util/System.h"
 #include "mod/Config.h"
 
 #include "system/sound/AudioDaemon.h"
 #include "system/input/ScreenManager.h"
 
+#include <QCryptographicHash>
 #include <QFile>
 #include <QQmlContext>
 #include <QRandomGenerator>
@@ -23,6 +25,31 @@
 #define PLAYER_FAKE_COLUMN_ID ("fake_column_hsxjsbw")
 
 namespace mod::filemanager {
+
+/// 读宿主当前媒体的 localFile（YMediaPlayerManager 的 mCurrentAudio 在 +0x20，YMediaEntity 从 +0x10 开始）。
+/// 宿主自己也是这么取的：onClickedPlay 里 `ldr x0,[x20,#32]` + `add x0,x0,#0x10` 后调 YMediaEntity::localFile。
+static QString hostLocalFile(void* manager) {
+    if (!manager) return {};
+    const auto holder = *(uintptr_t*)((uintptr_t)manager + 0x20);
+    if (!holder) return {};
+    return PEN_CALL(QString, "_ZNK12YMediaEntity9localFileEv", void*)((void*)(holder + 0x10));
+}
+
+/**
+ * 临时 `.mp3` 软链接的根目录。
+ *
+ * 宿主（YMediaPlayerManager / YSoundCenter）按后缀决定走哪条解码路径，非 mp3 文件必须先变成
+ * 一个 `.mp3` 路径。链接放在模块目录而不是 `/tmp`：`/tmp` 是 tmpfs，会被重启和其它进程清掉，
+ * 而链接一旦从 `localFile` 上消失，宿主就把这条媒体当成已删除的文件（`fileNotExist()` +
+ * `onResetPlayer()`），之后再按播放键永远没反应 —— 就是“暂停后无法再次播放”。
+ */
+static QString tempAudioLinkRoot() {
+    const auto moduleDir = util::getModuleFileInfo().absolutePath();
+    if (!moduleDir.isEmpty()) {
+        return moduleDir + "/audiolinks";
+    }
+    return QStringLiteral("/tmp/penmods-audiolinks");
+}
 
 bool MusicPlayer::mIsTakeOver{false};
 
@@ -45,6 +72,8 @@ MusicPlayer::MusicPlayer() : Logger("MusicPlayer") {
     connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView& view, QQmlContext* context) {
         context->setContextProperty("musicPlayer", this);
     });
+    // 上个进程留下的链接不会被任何会话引用，直接清掉，避免按歌曲数无限累积。
+    _purgeStaleAudioLinks();
 }
 
 enum class LrcState {
@@ -83,7 +112,7 @@ static_assert(sizeof(YColumnMediaEntity) == 0x68);
 void MusicPlayer::play(size_t idx, bool showPlayerUi) {
     if (idx > mPlayList.size() - 1) return;
     auto file = mPlayList.at(idx);
-    if (!mCurrentPlaying.mIsEnd && mCurrentPlaying.mFile == file) {
+    if (!mCurrentPlaying.mIsEnd && mCurrentPlaying.mFile == file && isHostPlaying()) {
         // 同一首还在播：这次调用只是"把播放页调出来"，不重新起播。
         if (showPlayerUi) {
             PEN_CALL(void*, "_ZN7YGlobal15showAudioPlayerEv", void*)(YPointer<YGlobal>::getInstance());
@@ -91,7 +120,7 @@ void MusicPlayer::play(size_t idx, bool showPlayerUi) {
         return;
     }
     debug("play idx={} showPlayerUi={}", idx, showPlayerUi);
-    mCurrentPlaying.setPlaying(idx);
+    mCurrentPlaying.setPlaying(idx, file);
     _play(file, showPlayerUi);
 }
 
@@ -122,36 +151,29 @@ void MusicPlayer::_play(const std::shared_ptr<QFileInfo>& file, bool showPlayerU
     entity->mIsDir         = false;
     entity->mDownloadState = DownloadState::SUCCEED;
     entity->mTitle         = file->fileName();
-    // 清理上次的临时软链接
-    cleanupTempSymlinks();
-    QString lrcPath;
-    entity->mLocalFile = createTempSymlinks(file, lrcPath);
-    if (!lrcPath.isEmpty()) {
-        entity->mLrcFile = lrcPath;
+    // 上一个链接不删：宿主可能还拿着它（暂停中、或两次 _play 交错），删了就成了死路。
+    entity->mLocalFile = prepareTempAudioLink(file);
+    // 在原目录查找配对的 .lrc 文件（先精确匹配，再模糊匹配）
+    auto       matchName = file->completeBaseName();
+    double     bestScore = 0.0;
+    QString    bestMatch;
+    const auto entries = file->absoluteDir().entryInfoList();
+    for (const auto& i : entries) {
+        if (i.suffix().toLower() != "lrc") continue;
+        if (i.completeBaseName() == matchName) {
+            bestMatch = i.absoluteFilePath();
+            bestScore = 1.0;
+            break;
+        }
+        double score = fuzzyLrcMatch(matchName, i.completeBaseName());
+        if (score > bestScore) {
+            bestScore = score;
+            bestMatch = i.absoluteFilePath();
+        }
+    }
+    if (bestScore >= 0.35 && !bestMatch.isEmpty()) {
+        entity->mLrcFile = bestMatch;
         hasLrc           = true;
-    } else {
-        // 后备：在原目录查找配对的 .lrc 文件（先精确匹配，再模糊匹配）
-        auto       matchName = file->completeBaseName();
-        double     bestScore = 0.0;
-        QString    bestMatch;
-        const auto entries = file->absoluteDir().entryInfoList();
-        for (const auto& i : entries) {
-            if (i.suffix().toLower() != "lrc") continue;
-            if (i.completeBaseName() == matchName) {
-                bestMatch = i.absoluteFilePath();
-                bestScore = 1.0;
-                break;
-            }
-            double score = fuzzyLrcMatch(matchName, i.completeBaseName());
-            if (score > bestScore) {
-                bestScore = score;
-                bestMatch = i.absoluteFilePath();
-            }
-        }
-        if (bestScore >= 0.35 && !bestMatch.isEmpty()) {
-            entity->mLrcFile = bestMatch;
-            hasLrc           = true;
-        }
     }
     PEN_CALL(void*, "_ZN13YMediaManager9playAudioERK18YColumnMediaEntityb", void*, YColumnMediaEntity*, bool)
     (YPointer<YMediaManager>::getInstance(), entity, true);
@@ -170,28 +192,78 @@ void MusicPlayer::_play(const std::shared_ptr<QFileInfo>& file, bool showPlayerU
     }
 }
 
-QString MusicPlayer::createTempSymlinks(const PlayFile& file, QString& outLrcPath) {
-    outLrcPath.clear();
-    const QString suffix = file->suffix().toLower();
-    // 如果已经是 .mp3，无需创建软链接，直接返回原路径
-    if (suffix == "mp3") {
-        return file->absoluteFilePath();
+QString MusicPlayer::prepareTempAudioLink(const PlayFile& file) {
+    mTempAudioLink.clear();
+    mTempAudioTarget.clear();
+    const QString original = file->absoluteFilePath();
+    // 已经是 .mp3：宿主本来就能识别，不用建链
+    if (file->suffix().toLower() == "mp3") {
+        return original;
     }
-    // 生成唯一的临时文件名（基于原文件绝对路径的哈希）
-    const QString baseName     = file->completeBaseName();
-    const QString tmpAudioPath = QString("/tmp/%1.mp3").arg(baseName);
-    // 创建音频文件的 .mp3 软链接
-    QFile::remove(tmpAudioPath);
-    if (QFile::link(file->absoluteFilePath(), tmpAudioPath)) {
-        mTempAudioLink = tmpAudioPath;
-        debug("Created temp audio symlink: {} -> {}",
-              tmpAudioPath.toStdString(),
-              file->absoluteFilePath().toStdString());
-    } else {
-        error("Failed to create temp audio symlink: {}", tmpAudioPath.toStdString());
-        return file->absoluteFilePath();
+    // 链接名必须保留 `<原名>.mp3`：宿主会用 QFileInfo(localFile).fileName() 去掉后缀来推导歌词
+    // 文件名。同名不同曲靠一级哈希目录区分，不会互相覆盖（旧实现在 /tmp 下只用 completeBaseName()，
+    // 两首同名歌曲会抢同一个链接）。
+    const QString hash =
+        QString::fromLatin1(QCryptographicHash::hash(original.toUtf8(), QCryptographicHash::Sha1).toHex().left(8));
+    const QString linkPath = QString("%1/%2/%3.mp3").arg(tempAudioLinkRoot(), hash, file->completeBaseName());
+    if (!_createTempAudioLink(linkPath, original)) {
+        // 建链失败：退回原路径（宿主可能仍能播，至少不是死路）
+        return original;
     }
-    return mTempAudioLink;
+    mTempAudioLink   = linkPath;
+    mTempAudioTarget = original;
+    return linkPath;
+}
+
+bool MusicPlayer::_createTempAudioLink(const QString& linkPath, const QString& target) {
+    const QFileInfo linkInfo(linkPath);
+    // 已经指向同一目标就直接复用：unlink/relink 之间有一小段时间路径不存在，宿主此时查
+    // fileExists 会把当前媒体当成已删除。
+    if (linkInfo.isSymLink() && linkInfo.symLinkTarget() == target) {
+        return true;
+    }
+    QDir().mkpath(linkInfo.absolutePath());
+    QFile::remove(linkPath);
+    if (!QFile::link(target, linkPath)) {
+        error("创建音频临时软链接失败: {} -> {}", linkPath.toStdString(), target.toStdString());
+        return false;
+    }
+    debug("Created temp audio symlink: {} -> {}", linkPath.toStdString(), target.toStdString());
+    return true;
+}
+
+bool MusicPlayer::repairTempAudioLink() {
+    if (mTempAudioLink.isEmpty() || mTempAudioTarget.isEmpty()) {
+        return false;
+    }
+    const QFileInfo linkInfo(mTempAudioLink);
+    if (linkInfo.isSymLink() && linkInfo.exists()) {
+        return true;
+    }
+    if (!QFileInfo::exists(mTempAudioTarget)) {
+        // 原文件本身没了，补链接也救不回来
+        warn("音频文件已不存在，无法修复临时软链接: {}", mTempAudioTarget.toStdString());
+        return false;
+    }
+    if (!_createTempAudioLink(mTempAudioLink, mTempAudioTarget)) {
+        return false;
+    }
+    info("已重建音频临时软链接: {} -> {}", mTempAudioLink.toStdString(), mTempAudioTarget.toStdString());
+    return true;
+}
+
+void MusicPlayer::_purgeStaleAudioLinks() {
+    QDir root(tempAudioLinkRoot());
+    if (!root.exists()) {
+        return;
+    }
+    for (const auto& sub : root.entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+        QDir dir(root.absoluteFilePath(sub));
+        for (const auto& name : dir.entryList(QDir::Files | QDir::System | QDir::Hidden | QDir::NoDotAndDotDot)) {
+            dir.remove(name);
+        }
+        dir.removeRecursively();
+    }
 }
 
 void MusicPlayer::cleanupTempSymlinks() {
@@ -199,6 +271,32 @@ void MusicPlayer::cleanupTempSymlinks() {
         QFile::remove(mTempAudioLink);
         debug("Cleaned up temp audio symlink: {}", mTempAudioLink.toStdString());
         mTempAudioLink.clear();
+        mTempAudioTarget.clear();
+    }
+}
+
+void MusicPlayer::recoverIfPlayFailed() {
+    if (!mIsTakeOver) {
+        return;
+    }
+    auto*      manager = YPointer<YMediaPlayerManager>::getInstance();
+    const auto state   = PEN_CALL(PlayState, "_ZNK19YMediaPlayerManager9playStateEv", void*)(manager);
+    if (state == PlayState::PLAYING) {
+        return;
+    }
+    // 宿主 onClickedPlay 的第一件事是 FileUtils::fileExists(localFile)：临时软链接不见了就走
+    // fileNotExist() + onResetPlayer()，连原文件都不会再试，界面上按多少次都没反应。
+    if (repairTempAudioLink()) {
+        PEN_CALL(void, "_ZN19YMediaPlayerManager13onClickedPlayEv", void*)(manager);
+        if (PEN_CALL(PlayState, "_ZNK19YMediaPlayerManager9playStateEv", void*)(manager) == PlayState::PLAYING) {
+            info("临时软链接丢失已修复，播放恢复: {}", mTempAudioTarget.toStdString());
+            return;
+        }
+    }
+    // 仍未起来：宿主可能已经把当前媒体清空（onResetPlayer），确认之后整首重新起播一次。
+    if (hostLocalFile(manager).isEmpty() && mCurrentPlaying.mFile && !mCurrentPlaying.mIsEnd) {
+        warn("宿主播放未能恢复，重新起播: {}", mCurrentPlaying.mFile->fileName().toStdString());
+        _play(mCurrentPlaying.mFile, false);
     }
 }
 
@@ -642,6 +740,7 @@ PEN_HOOK(void, _ZN19YMediaPlayerManager13onClickedPlayEv, void* self) {
     origin(self);
     if (MusicPlayer::mIsTakeOver) {
         MusicPlayer::getInstance().onPlaybackResumedAfterScan();
+        MusicPlayer::getInstance().recoverIfPlayFailed();
     }
 }
 

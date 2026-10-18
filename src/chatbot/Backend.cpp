@@ -230,7 +230,7 @@ ChatBot::ChatBot()
 
     initModels();
     initPrompts();
-    initTavily();
+    initSearch();
     initShellTool();
     initMathRender();
     initSessions();
@@ -282,7 +282,7 @@ void ChatBot::reloadConfig() {
 
     initModels();
     initPrompts();
-    initTavily();
+    initSearch();
     initShellTool();
     initMathRender();
 
@@ -311,7 +311,7 @@ void ChatBot::sanitizeConfig() {
 
     initModels();
     initPrompts();
-    initTavily();
+    initSearch();
     initShellTool();
     initMathRender();
 
@@ -1978,7 +1978,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
     }
 
     // 注入本地函数工具和 Responses API 图片生成工具。
-    if ((m_capToolCall && ((m_tavilyEnabled && !m_tavilyApiKey.isEmpty()) || m_shellToolEnabled))
+    if (searchToolAvailable() || (m_capToolCall && m_shellToolEnabled)
         || (usesResponsesApi() && (m_capImageGeneration || m_nativeWebSearchEnabled))) {
         injectToolDefinitions(requestBody);
     }
@@ -3424,40 +3424,182 @@ QVariantList ChatBot::getSessionMessages(const QString& sessionId) {
 }
 
 // -----------------------------------------------------------------------
-// Tavily 网络搜索
+// 网络搜索（Tavily / DeepSeek）
 // -----------------------------------------------------------------------
 
-void ChatBot::initTavily() {
+void ChatBot::initSearch() {
     json aiCfg = mod::Config::getInstance().read("ai");
-    if (!aiCfg.contains("tavily") || !aiCfg["tavily"].is_object()) return;
+    if (aiCfg.is_null() || !aiCfg.is_object()) return;
 
-    const auto& t       = aiCfg["tavily"];
-    m_tavilyApiKey      = QString::fromStdString(t.value("api_key", ""));
-    m_tavilySearchDepth = QString::fromStdString(t.value("search_depth", "advanced"));
-    m_tavilyMaxResults  = t.value("max_results", 5);
-    m_tavilyEnabled     = t.value("enabled", false);
+    json s = json::object();
+    if (aiCfg.contains("search") && aiCfg["search"].is_object()) s = aiCfg["search"];
+
+    const auto strOf = [](const json& o, const char* key, const std::string& def) {
+        return (o.contains(key) && o[key].is_string()) ? o[key].get<std::string>() : def;
+    };
+    const auto intOf = [](const json& o, const char* key, int def) {
+        return (o.contains(key) && o[key].is_number_integer()) ? o[key].get<int>() : def;
+    };
+    const auto boolOf = [](const json& o, const char* key, bool def) {
+        return (o.contains(key) && o[key].is_boolean()) ? o[key].get<bool>() : def;
+    };
+
+    QString provider = QString::fromStdString(strOf(s, "provider", "off"));
+    if (provider != "off" && provider != "tavily" && provider != "deepseek") provider = "off";
+
+    m_searchProvider        = provider;
+    m_searchEnabled         = boolOf(s, "enabled", false);
+    m_searchCount           = qBound(1, intOf(s, "count", 5), 50);
+    m_searchNeedContent     = boolOf(s, "need_content", false);
+    m_searchMaxChars        = qBound(500, intOf(s, "max_chars", 6000), 20000);
+    m_searchTavilyKey       = QString::fromStdString(strOf(s, "tavily_api_key", ""));
+    m_searchTavilyDepth     = QString::fromStdString(strOf(s, "tavily_search_depth", "advanced"));
+    m_searchDeepseekKey     = QString::fromStdString(strOf(s, "deepseek_api_key", ""));
+    m_searchDeepseekBaseUrl = QString::fromStdString(strOf(s, "deepseek_base_url", "https://api.deepseek.com"));
+    if (m_searchDeepseekBaseUrl.trimmed().isEmpty()) m_searchDeepseekBaseUrl = "https://api.deepseek.com";
+
+    // 迁移旧的 ai.tavily：只在新的配置还没有任何内容时执行一次
+    const json old = (aiCfg.contains("tavily") && aiCfg["tavily"].is_object()) ? aiCfg["tavily"] : json::object();
+    if (m_searchTavilyKey.isEmpty() && m_searchProvider == "off") {
+        const QString oldKey = QString::fromStdString(strOf(old, "api_key", ""));
+        if (!oldKey.isEmpty()) {
+            m_searchTavilyKey   = oldKey;
+            m_searchTavilyDepth = QString::fromStdString(strOf(old, "search_depth", "advanced"));
+            m_searchCount       = qBound(1, intOf(old, "max_results", 5), 50);
+            m_searchEnabled     = boolOf(old, "enabled", false);
+            m_searchProvider    = m_searchEnabled ? "tavily" : "off";
+            saveSearchConfig();
+            info("已迁移旧的 Tavily 配置到 ai.search");
+        }
+    }
+
+    emit searchConfigChanged();
     emit tavilyConfigChanged();
-    info("Tavily 配置已加载, enabled={}, configured={}", m_tavilyEnabled, !m_tavilyApiKey.isEmpty());
+    info(
+        "网络搜索配置已加载, provider={}, enabled={}, configured={}",
+        m_searchProvider.toStdString(),
+        m_searchEnabled,
+        searchConfigured()
+    );
 }
 
-void ChatBot::setTavilyEnabled(bool v) {
-    if (m_tavilyEnabled == v) return;
-    m_tavilyEnabled = v;
-
+void ChatBot::saveSearchConfig() {
     json aiCfg = mod::Config::getInstance().read("ai");
-    if (aiCfg.is_null()) aiCfg = json::object();
+    if (aiCfg.is_null() || !aiCfg.is_object()) aiCfg = json::object();
+    if (!aiCfg.contains("search") || !aiCfg["search"].is_object()) aiCfg["search"] = json::object();
+
+    json& s                  = aiCfg["search"];
+    s["provider"]            = m_searchProvider.toStdString();
+    s["enabled"]             = m_searchEnabled;
+    s["count"]               = m_searchCount;
+    s["need_content"]        = m_searchNeedContent;
+    s["max_chars"]           = m_searchMaxChars;
+    s["tavily_api_key"]      = m_searchTavilyKey.toStdString();
+    s["tavily_search_depth"] = m_searchTavilyDepth.toStdString();
+    s["deepseek_api_key"]    = m_searchDeepseekKey.toStdString();
+    s["deepseek_base_url"]   = m_searchDeepseekBaseUrl.toStdString();
+
+    // 旧字段同步一份，回退旧版本时仍可用
     if (!aiCfg.contains("tavily") || !aiCfg["tavily"].is_object()) aiCfg["tavily"] = json::object();
-    aiCfg["tavily"]["enabled"] = v;
+    aiCfg["tavily"]["api_key"]      = m_searchTavilyKey.toStdString();
+    aiCfg["tavily"]["search_depth"] = m_searchTavilyDepth.toStdString();
+    aiCfg["tavily"]["max_results"]  = m_searchCount;
+    aiCfg["tavily"]["enabled"]      = (m_searchProvider == "tavily" && m_searchEnabled);
+
     mod::Config::getInstance().write("ai", aiCfg, true);
+}
+
+bool ChatBot::searchConfigured() const {
+    if (m_searchProvider == "tavily") return !m_searchTavilyKey.isEmpty();
+    if (m_searchProvider == "deepseek") return !effectiveSearchKey().isEmpty();
+    return false;
+}
+
+bool ChatBot::searchToolAvailable() const { return m_capToolCall && m_searchEnabled && searchConfigured(); }
+
+QString ChatBot::effectiveSearchKey() const {
+    if (m_searchProvider == "deepseek") return m_searchDeepseekKey.isEmpty() ? m_apiKey : m_searchDeepseekKey;
+    return m_searchTavilyKey;
+}
+
+void ChatBot::setSearchProvider(const QString& provider) {
+    const QString p = (provider == "tavily" || provider == "deepseek") ? provider : "off";
+    if (m_searchProvider == p) return;
+    m_searchProvider = p;
+    saveSearchConfig();
+    emit searchConfigChanged();
     emit tavilyConfigChanged();
+}
+
+void ChatBot::setSearchEnabled(bool v) {
+    if (m_searchEnabled == v) return;
+    m_searchEnabled = v;
+    saveSearchConfig();
+    emit searchConfigChanged();
+    emit tavilyConfigChanged();
+}
+
+void ChatBot::setSearchCount(int count) {
+    count = qBound(1, count, 50);
+    if (m_searchCount == count) return;
+    m_searchCount = count;
+    saveSearchConfig();
+    emit searchConfigChanged();
+    emit tavilyConfigChanged();
+}
+
+// 旧属性：只映射 Tavily，保留给旧版资源库
+void ChatBot::setTavilyEnabled(bool v) {
+    m_searchEnabled = v;
+    if (v && m_searchProvider == "off") m_searchProvider = "tavily";
+    saveSearchConfig();
+    emit searchConfigChanged();
+    emit tavilyConfigChanged();
+}
+
+QString ChatBot::getSearchConfig() {
+    json obj;
+    obj["provider"]        = m_searchProvider.toStdString();
+    obj["enabled"]         = m_searchEnabled;
+    obj["count"]           = m_searchCount;
+    obj["needContent"]     = m_searchNeedContent;
+    obj["tavilyApiKey"]    = m_searchTavilyKey.toStdString();
+    obj["deepseekApiKey"]  = m_searchDeepseekKey.toStdString();
+    obj["deepseekBaseUrl"] = m_searchDeepseekBaseUrl.toStdString();
+    return QString::fromStdString(obj.dump(2));
+}
+
+void ChatBot::setSearchConfig(const QString& configJson) {
+    QJsonDocument doc = QJsonDocument::fromJson(configJson.toUtf8());
+    if (!doc.isObject()) return;
+
+    QJsonObject obj = doc.object();
+    if (obj.contains("provider")) {
+        const QString p = obj["provider"].toString();
+        if (p == "off" || p == "tavily" || p == "deepseek") m_searchProvider = p;
+    }
+    if (obj.contains("enabled")) m_searchEnabled = obj["enabled"].toBool();
+    if (obj.contains("count")) m_searchCount = qBound(1, obj["count"].toInt(5), 50);
+    if (obj.contains("needContent")) m_searchNeedContent = obj["needContent"].toBool();
+    if (obj.contains("tavilyApiKey")) m_searchTavilyKey = obj["tavilyApiKey"].toString();
+    if (obj.contains("deepseekApiKey")) m_searchDeepseekKey = obj["deepseekApiKey"].toString();
+    if (obj.contains("deepseekBaseUrl")) {
+        const QString url       = obj["deepseekBaseUrl"].toString().trimmed();
+        m_searchDeepseekBaseUrl = url.isEmpty() ? "https://api.deepseek.com" : url;
+    }
+
+    saveSearchConfig();
+    emit searchConfigChanged();
+    emit tavilyConfigChanged();
+    info("网络搜索配置已保存");
 }
 
 QString ChatBot::getTavilyConfig() {
     json obj;
-    obj["apiKey"]      = m_tavilyApiKey.toStdString();
-    obj["searchDepth"] = m_tavilySearchDepth.toStdString();
-    obj["maxResults"]  = m_tavilyMaxResults;
-    obj["enabled"]     = m_tavilyEnabled;
+    obj["apiKey"]      = m_searchTavilyKey.toStdString();
+    obj["searchDepth"] = m_searchTavilyDepth.toStdString();
+    obj["maxResults"]  = m_searchCount;
+    obj["enabled"]     = getTavilyEnabled();
     return QString::fromStdString(obj.dump(2));
 }
 
@@ -3466,19 +3608,16 @@ void ChatBot::setTavilyConfig(const QString& configJson) {
     if (!doc.isObject()) return;
 
     QJsonObject obj = doc.object();
-    if (obj.contains("apiKey")) m_tavilyApiKey = obj["apiKey"].toString();
-    if (obj.contains("searchDepth")) m_tavilySearchDepth = obj["searchDepth"].toString();
-    if (obj.contains("maxResults")) m_tavilyMaxResults = obj["maxResults"].toInt(5);
-    if (obj.contains("enabled")) m_tavilyEnabled = obj["enabled"].toBool();
+    if (obj.contains("apiKey")) m_searchTavilyKey = obj["apiKey"].toString();
+    if (obj.contains("searchDepth")) m_searchTavilyDepth = obj["searchDepth"].toString();
+    if (obj.contains("maxResults")) m_searchCount = qBound(1, obj["maxResults"].toInt(5), 50);
+    if (obj.contains("enabled")) {
+        m_searchEnabled = obj["enabled"].toBool();
+        if (m_searchEnabled && m_searchProvider == "off") m_searchProvider = "tavily";
+    }
 
-    json aiCfg = mod::Config::getInstance().read("ai");
-    if (aiCfg.is_null()) aiCfg = json::object();
-    if (!aiCfg.contains("tavily") || !aiCfg["tavily"].is_object()) aiCfg["tavily"] = json::object();
-    aiCfg["tavily"]["api_key"]      = m_tavilyApiKey.toStdString();
-    aiCfg["tavily"]["search_depth"] = m_tavilySearchDepth.toStdString();
-    aiCfg["tavily"]["max_results"]  = m_tavilyMaxResults;
-    aiCfg["tavily"]["enabled"]      = m_tavilyEnabled;
-    mod::Config::getInstance().write("ai", aiCfg, true);
+    saveSearchConfig();
+    emit searchConfigChanged();
     emit tavilyConfigChanged();
     info("Tavily 配置已保存");
 }
@@ -3500,13 +3639,15 @@ void ChatBot::injectToolDefinitions(QJsonObject& requestBody) {
         }
         );
 
-    if (m_capToolCall && m_tavilyEnabled && !m_tavilyApiKey.isEmpty()) {
+    if (searchToolAvailable()) {
         QJsonObject funcParam;
         funcParam["type"] = "object";
 
         QJsonObject queryProp;
-        queryProp["type"]        = "string";
-        queryProp["description"] = "The search query in the user's language";
+        queryProp["type"] = "string";
+        queryProp["description"] =
+            "The search query in the user's language. Supports site:, -site:, lang:, after:, before: and quoted "
+            "phrases.";
 
         QJsonObject properties;
         properties["query"] = queryProp;
@@ -3515,9 +3656,10 @@ void ChatBot::injectToolDefinitions(QJsonObject& requestBody) {
         funcParam["required"]   = QJsonArray({"query"});
 
         QJsonObject func;
-        func["name"]        = "tavily_search";
+        func["name"]        = "web_search";
         func["description"] = "Search the web for up-to-date information. Use when the user asks about current events, "
-                              "recent facts, or anything outside your training data.";
+                              "recent facts, anything after your training data, or when a fact needs verification. "
+                              "Returns titles, URLs, dates and summaries.";
         func["parameters"]  = funcParam;
 
         if (usesResponsesApi()) {
@@ -3580,8 +3722,12 @@ void ChatBot::dispatchToolCalls(const QString& toolCallsJson) {
     QJsonArray arr = doc.array();
     m_toolCallBatch.clear();
 
-    const bool tavilyAvailable = m_capToolCall && m_tavilyEnabled && !m_tavilyApiKey.isEmpty();
+    const bool searchAvailable = searchToolAvailable();
     const bool shellAvailable  = m_capToolCall && m_shellToolEnabled;
+    // 兼容历史会话里的旧工具名
+    const auto isSearchTool = [](const QString& name) {
+        return name == "web_search" || name == "tavily_search" || name == "deepseek_search";
+    };
 
     // 登记所有 tool_call，不可用的写占位结果
     for (const auto& val : arr) {
@@ -3589,7 +3735,7 @@ void ChatBot::dispatchToolCalls(const QString& toolCallsJson) {
         QString     id   = tc["id"].toString();
         QString     name = tc["function"].toObject()["name"].toString();
         if (id.isEmpty()) continue;
-        if (name == "tavily_search" && tavilyAvailable) {
+        if (isSearchTool(name) && searchAvailable) {
             m_toolCallBatch.append({id, name, false, ""});
         } else if (name == "shell_exec" && shellAvailable) {
             m_toolCallBatch.append({id, name, false, ""});
@@ -3618,12 +3764,12 @@ void ChatBot::dispatchToolCalls(const QString& toolCallsJson) {
         QString     id   = tc["id"].toString();
         QString     args = tc["function"].toObject()["arguments"].toString();
 
-        if (name == "tavily_search" && tavilyAvailable) {
+        if (isSearchTool(name) && searchAvailable) {
             QString       query;
             QJsonDocument argsDoc = QJsonDocument::fromJson(args.toUtf8());
             if (argsDoc.isObject()) query = argsDoc.object()["query"].toString();
             if (query.isEmpty()) query = args;
-            executeTavilySearch(id, query);
+            executeWebSearch(id, query);
         } else if (name == "shell_exec" && shellAvailable) {
             QString       command;
             QJsonDocument argsDoc = QJsonDocument::fromJson(args.toUtf8());
@@ -3651,19 +3797,76 @@ void ChatBot::dispatchToolCalls(const QString& toolCallsJson) {
     tryFlushToolBatch();
 }
 
+void ChatBot::executeWebSearch(const QString& toolCallId, const QString& query) {
+    if (m_searchProvider == "deepseek") executeDeepSeekSearch(toolCallId, query);
+    else executeTavilySearch(toolCallId, query);
+}
+
+QString ChatBot::formatSearchResults(const QString& query, const QJsonArray& results, bool includeContent) const {
+    QString   formatted           = QString("网络搜索结果（查询: \"%1\"）：\n\n").arg(query);
+    int       count               = 0;
+    const int perItemContentLimit = 1500;
+
+    for (const auto& val : results) {
+        QJsonObject r = val.toObject();
+
+        QString title = r["title"].toString();
+        QString url   = r["url"].toString();
+        // summary 是官方给模型阅读的长摘要；snippet/content 作为兼容回退
+        QString summary = r["summary"].toString();
+        if (summary.isEmpty()) summary = r["snippet"].toString();
+        if (summary.isEmpty()) summary = r["content"].toString();
+        if (summary.isEmpty() && url.isEmpty()) continue;
+
+        QStringList meta;
+        QString     date = r["date"].toString();
+        if (date.isEmpty()) date = r["published_date"].toString();
+        if (!date.isEmpty()) meta << date;
+        const QString site = r["site_name"].toString();
+        if (!site.isEmpty()) meta << site;
+
+        QString item = QString("%1. %2\n   %3\n").arg(++count).arg(title.isEmpty() ? url : title).arg(url);
+        if (!meta.isEmpty()) item += "   " + meta.join(" | ") + "\n";
+
+        if (!summary.isEmpty()) {
+            if (summary.length() > 800) summary = summary.left(800) + "…";
+            summary.replace("\n", " ");
+            item += "   " + summary + "\n";
+        }
+        item += "\n";
+
+        if (includeContent) {
+            QString content = r["content"].toString();
+            if (!content.isEmpty()) {
+                if (content.length() > perItemContentLimit) content = content.left(perItemContentLimit) + "…";
+                item += content + "\n\n";
+            }
+        }
+
+        if (formatted.length() + item.length() > m_searchMaxChars) {
+            formatted += "（结果已按长度截断）\n";
+            break;
+        }
+        formatted += item;
+    }
+
+    return count == 0 ? QString() : formatted;
+}
+
 void ChatBot::executeTavilySearch(const QString& toolCallId, const QString& query) {
     info("Tavily 搜索: {}", query.toStdString());
+    emit webSearchStarted(toolCallId, query);
     emit tavilySearchStarted(toolCallId, query);
 
     QJsonObject body;
     body["query"]        = query;
-    body["search_depth"] = m_tavilySearchDepth;
-    body["max_results"]  = m_tavilyMaxResults;
+    body["search_depth"] = m_searchTavilyDepth;
+    body["max_results"]  = m_searchCount;
 
     QNetworkRequest request;
     request.setUrl(QUrl("https://api.tavily.com/search"));
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    request.setRawHeader("Authorization", QString("Bearer %1").arg(m_tavilyApiKey).toUtf8());
+    request.setRawHeader("Authorization", QString("Bearer %1").arg(m_searchTavilyKey).toUtf8());
     request.setRawHeader("User-Agent", "PenMods ChatBot/1.0");
 
     QByteArray     data  = QJsonDocument(body).toJson(QJsonDocument::Compact);
@@ -3676,47 +3879,156 @@ void ChatBot::executeTavilySearch(const QString& toolCallId, const QString& quer
             return;
         }
         m_activeReplies.removeAll(reply);
+
+        if (m_cancelled) {
+            reply->deleteLater();
+            return;
+        }
+
+        const auto       netError = reply->error();
+        const QString    errMsg   = reply->errorString();
+        const QByteArray raw      = reply->readAll();
         reply->deleteLater();
 
-        if (m_cancelled) return;
-
-        if (reply->error() != QNetworkReply::NoError) {
-            QString errMsg = reply->errorString();
+        if (netError != QNetworkReply::NoError) {
             warn("Tavily 搜索失败: {}", errMsg.toStdString());
-            submitToolResultBatched(toolCallId, "tavily_search", "搜索失败: " + errMsg);
+            submitToolResultBatched(toolCallId, "web_search", "搜索失败: " + errMsg);
+            emit webSearchFinished(toolCallId, false, errMsg, errMsg);
             emit tavilySearchFinished(toolCallId, false, errMsg, errMsg);
             return;
         }
 
-        QByteArray    raw = reply->readAll();
         QJsonDocument doc = QJsonDocument::fromJson(raw);
         if (!doc.isObject()) {
-            submitToolResultBatched(toolCallId, "tavily_search", "搜索失败: 响应格式错误");
+            submitToolResultBatched(toolCallId, "web_search", "搜索失败: 响应格式错误");
+            emit webSearchFinished(toolCallId, false, "响应格式错误", "响应格式错误");
             emit tavilySearchFinished(toolCallId, false, "响应格式错误", "响应格式错误");
             return;
         }
 
-        QJsonArray results = doc.object()["results"].toArray();
-        if (results.isEmpty()) {
-            submitToolResultBatched(toolCallId, "tavily_search", "未找到相关结果");
+        const QJsonArray results   = doc.object()["results"].toArray();
+        const QString    formatted = formatSearchResults(query, results, true);
+        if (formatted.isEmpty()) {
+            submitToolResultBatched(toolCallId, "web_search", "未找到相关结果");
+            emit webSearchFinished(toolCallId, true, "未找到结果", "未找到相关结果");
             emit tavilySearchFinished(toolCallId, true, "未找到结果", "未找到相关结果");
             return;
         }
 
-        QString formatted = QString("网络搜索结果（查询: \"%1\"）：\n\n").arg(query);
-        int     count     = 0;
-        for (const auto& val : results) {
-            QJsonObject r  = val.toObject();
-            formatted     += QString("%1. %2 (%3)\n   %4\n\n")
-                                 .arg(++count)
-                                 .arg(r["title"].toString())
-                                 .arg(r["url"].toString())
-                                 .arg(r["content"].toString());
-        }
-
-        submitToolResultBatched(toolCallId, "tavily_search", formatted);
+        const int count = results.size();
+        submitToolResultBatched(toolCallId, "web_search", formatted);
+        emit webSearchFinished(toolCallId, true, QString("找到 %1 条结果").arg(count), formatted);
         emit tavilySearchFinished(toolCallId, true, QString("找到 %1 条结果").arg(count), formatted);
         info("Tavily 搜索完成，找到 {} 条结果", count);
+    });
+}
+
+void ChatBot::executeDeepSeekSearch(const QString& toolCallId, const QString& query) {
+    info("DeepSeek 搜索: {}", query.toStdString());
+    emit webSearchStarted(toolCallId, query);
+    emit tavilySearchStarted(toolCallId, query);
+    requestDeepSeekSearch(toolCallId, query, 0);
+}
+
+void ChatBot::requestDeepSeekSearch(const QString& toolCallId, const QString& query, int attempt) {
+    const QString key = effectiveSearchKey();
+    if (key.isEmpty()) {
+        const QString err = "未配置 DeepSeek API Key";
+        submitToolResultBatched(toolCallId, "web_search", "搜索失败: " + err);
+        emit webSearchFinished(toolCallId, false, err, err);
+        emit tavilySearchFinished(toolCallId, false, err, err);
+        return;
+    }
+
+    QJsonObject body;
+    body["query"]        = query;
+    body["count"]        = m_searchCount;
+    body["need_content"] = m_searchNeedContent;
+
+    // 允许配置 http(s)://host 或 http(s)://host/v1
+    QString base = m_searchDeepseekBaseUrl.trimmed();
+    while (base.endsWith('/')) base.chop(1);
+    if (base.endsWith("/v1")) base.chop(3);
+    const QUrl url(base + "/v1/tools/search");
+
+    QNetworkRequest request;
+    request.setUrl(url);
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    request.setRawHeader("Authorization", QString("Bearer %1").arg(key).toUtf8());
+    request.setRawHeader("User-Agent", "PenMods ChatBot/1.0");
+
+    QByteArray     data  = QJsonDocument(body).toJson(QJsonDocument::Compact);
+    QNetworkReply* reply = m_networkManager->post(request, data);
+    m_activeReplies.append(reply);
+
+    connect(reply, &QNetworkReply::finished, this, [this, reply, toolCallId, query, attempt]() {
+        if (!m_activeReplies.contains(reply)) {
+            reply->deleteLater();
+            return;
+        }
+        m_activeReplies.removeAll(reply);
+
+        if (m_cancelled) {
+            reply->deleteLater();
+            return;
+        }
+
+        const int        httpStatus  = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const auto       netError    = reply->error();
+        const QString    netErrorStr = reply->errorString();
+        const QByteArray raw         = reply->readAll();
+        reply->deleteLater();
+
+        if (netError != QNetworkReply::NoError) {
+            const bool retryable = (httpStatus == 408 || httpStatus == 429 || httpStatus >= 500);
+            if (retryable && attempt < 1) {
+                info("DeepSeek 搜索暂时失败（HTTP {}），1.5s 后重试", httpStatus);
+                QTimer::singleShot(1500, this, [this, toolCallId, query, attempt]() {
+                    if (m_cancelled) return;
+                    requestDeepSeekSearch(toolCallId, query, attempt + 1);
+                });
+                return;
+            }
+
+            QString errMsg;
+            // DeepSeek 错误格式：{"error":{"message":"...", ...}}
+            const QJsonObject errObj = QJsonDocument::fromJson(raw).object()["error"].toObject();
+            if (errObj.contains("message")) errMsg = errObj["message"].toString();
+            if (errMsg.isEmpty()) {
+                if (httpStatus == 401) errMsg = "DeepSeek API Key 无效";
+                else if (httpStatus == 402) errMsg = "DeepSeek 账户余额不足，请充值后重试";
+                else if (httpStatus == 429) errMsg = "搜索请求过于频繁，请稍后再试";
+                else errMsg = netErrorStr;
+            }
+            warn("DeepSeek 搜索失败: HTTP {}, {}", httpStatus, errMsg.toStdString());
+            submitToolResultBatched(toolCallId, "web_search", "搜索失败: " + errMsg);
+            emit webSearchFinished(toolCallId, false, errMsg, errMsg);
+            emit tavilySearchFinished(toolCallId, false, errMsg, errMsg);
+            return;
+        }
+
+        QJsonDocument doc = QJsonDocument::fromJson(raw);
+        if (!doc.isObject()) {
+            submitToolResultBatched(toolCallId, "web_search", "搜索失败: 响应格式错误");
+            emit webSearchFinished(toolCallId, false, "响应格式错误", "响应格式错误");
+            emit tavilySearchFinished(toolCallId, false, "响应格式错误", "响应格式错误");
+            return;
+        }
+
+        const QJsonArray results   = doc.object()["results"].toArray();
+        const QString    formatted = formatSearchResults(query, results, m_searchNeedContent);
+        if (formatted.isEmpty()) {
+            submitToolResultBatched(toolCallId, "web_search", "未找到相关结果");
+            emit webSearchFinished(toolCallId, true, "未找到结果", "未找到相关结果");
+            emit tavilySearchFinished(toolCallId, true, "未找到结果", "未找到相关结果");
+            return;
+        }
+
+        const int count = results.size();
+        submitToolResultBatched(toolCallId, "web_search", formatted);
+        emit webSearchFinished(toolCallId, true, QString("找到 %1 条结果").arg(count), formatted);
+        emit tavilySearchFinished(toolCallId, true, QString("找到 %1 条结果").arg(count), formatted);
+        info("DeepSeek 搜索完成，找到 {} 条结果", count);
     });
 }
 

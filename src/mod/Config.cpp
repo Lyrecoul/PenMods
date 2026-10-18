@@ -183,6 +183,17 @@ Config::Config() : Logger("Config") {
                 }
             })},
             {"activePromptId", "default"},
+            {"search", {
+                {"provider", "off"},
+                {"enabled", false},
+                {"count", 5},
+                {"need_content", false},
+                {"max_chars", 6000},
+                {"tavily_api_key", ""},
+                {"tavily_search_depth", "advanced"},
+                {"deepseek_api_key", ""},
+                {"deepseek_base_url", "https://api.deepseek.com"}
+            }},
             {"tavily", {
                 {"api_key",      ""},
                 {"search_depth", "advanced"},

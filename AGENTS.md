@@ -633,10 +633,14 @@ zp = 'update_vX.Y.Z.zip'
 with zipfile.ZipFile(zp, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
     for name in ('_do_update.sh', 'libPenMods.so', 'libPenModsResources.so'):
         zi = zipfile.ZipInfo(name)
+        # writestr(ZipInfo) 只看条目自己的 compress_type，ZipFile(..., ZIP_DEFLATED) 对它无效 ——
+        # 漏掉这一行整个包会变成 Stored：v2.4.0 与第一次 v2.5.0 的包都是 10.5 MB，正确的是 4.7 MB。
+        zi.compress_type = zipfile.ZIP_DEFLATED
         zi.external_attr = (0o755 if name.endswith('.sh') else 0o644) << 16
         z.writestr(zi, open(os.path.join('template', name), 'rb').read())
 print(os.path.getsize(zp), hashlib.md5(open(zp, 'rb').read()).hexdigest())
 PY
+unzip -v update_vX.Y.Z.zip | sed -n '3,6p'   # 每个条目都应是 Defl:N，不能是 Stored
 ```
 
 Since v2.4.0 the package also carries `libPenModsResources.so`: a device that already has that file in

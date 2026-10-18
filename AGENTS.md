@@ -193,11 +193,14 @@ any child process we spawn) hit that cost in the middle of the UI.
 
 Two steps, in this order:
 
-1. **Font directory.** `/etc/fonts/fonts.conf` lists exactly one `<dir>/usr/share/fonts</dir>`; the real fonts live in
-   `/usr/lib/fonts`, and the factory image bridges them with a symlink. If `/usr/share/fonts` is missing, dangling,
-   pointing elsewhere, or an *empty* directory, it is replaced with `-> /usr/lib/fonts`. A directory that already
-   holds files but no font is left untouched (and then the cache build is skipped) — that is somebody else's layout,
-   and scanning it would only produce a valid-looking cache containing no fonts.
+1. **Font directory.** `/etc/fonts/fonts.conf` lists exactly one `<dir>/usr/share/fonts</dir>`, but the fonts are
+   installed in `/usr/lib/fonts` and the stock image ships **no** symlink between them: on a clean unit fontconfig —
+   and resvg-js/fontdb — therefore sees no font at all, and the 40 s scan above only happens once the directory is
+   reachable (the test unit got it from a hand-made symlink, which is also why the measurements exist). If
+   `/usr/share/fonts` is missing, dangling, pointing elsewhere, or an *empty* directory, it is replaced with
+   `-> /usr/lib/fonts`. A directory that already holds files but no font is left untouched (and then the cache build
+   is skipped) — that is somebody else's layout, and scanning it would only produce a valid-looking cache containing
+   no fonts.
 2. **Cache manifest.** `fc-cache` runs only when no usable `<hash>-<machine>.cache-<n>` exists in `/var/cache/fontconfig`
    (or the fonts directory is newer than the newest cache file, i.e. fonts were added later). It runs **without `-f`**,
    so an up-to-date cache costs ~37 ms instead of a full rescan. The run is asynchronous (`QProcess` + `finished`) and
@@ -216,9 +219,9 @@ Rules that cost a debugging session:
   `EROFS`/`EACCES`/`EPERM`. `Mod::onUiCompleted()` remounts anyway, but that is later than this check.
 - `PENMODS_NO_FONT_CACHE=1` skips step 2 (the symlink repair still happens), which is how a device with a deliberately
   broken cache is exercised.
-- The MathJax service does **not** depend on this: resvg-js/fontdb parses `fonts.conf` itself and needs no cache. It
-  still benefits from the symlink step, which is what makes `/usr/share/fonts` reachable on units where the factory
-  link is absent.
+- The MathJax service does **not** depend on the cache: resvg-js/fontdb parses `fonts.conf` itself. It does depend on
+  step 1 — that symlink is the only way `/usr/share/fonts` becomes reachable on a stock unit, so without it the
+  renderer silently loses CJK.
 
 ### MathJax Formula Rendering Service
 
@@ -239,14 +242,13 @@ in the OTA package** — the binary has to be shipped to users separately (the c
 - **CJK depends on a reachable font; system fonts are the default.** MathJax emits
   `<text font-family="serif">` for characters its own fonts lack (Chinese and friends); with no CJK-capable face
   reachable, resvg draws nothing for those runs and the remaining glyphs collapse together. The tested YDP02X
-  ships CJK system fonts — `/usr/share/fonts` is a symlink to `/usr/lib/fonts` and holds `NotoSansSC-*.otf` and
-  `HYQiHei-*.ttf` — and resvg-js 2.6.2 reaches them through fontdb's pure-Rust fontconfig support (it parses
-  `/etc/fonts/fonts.conf` itself, follows the symlink, and needs no fontconfig cache; verified on-device by
-  rendering `\text{中文}` through a server build that did no font work at all). The service therefore renders
-  with `loadSystemFonts: true` and `defaultFontFamily: "Noto Sans SC"` and ships **no** font file. The startup
-  pre-check in `### Fontconfig Font Cache` keeps that symlink and the fontconfig cache in place on units where the
-  factory image lacks them. An explicit
-  font is used only when one is actually supplied — `MATHJAX_FONT=<path>`, or a file named `wqy-microhei.ttc` in
+  ships CJK system fonts in `/usr/lib/fonts` (`NotoSansSC-*.otf`, `HYQiHei-*.ttf`), but `fonts.conf` only points at
+  `/usr/share/fonts`, which the stock image does not create — without that symlink resvg renders no CJK at all.
+  `FontCache` (see `### Fontconfig Font Cache`) creates it at startup, and resvg-js 2.6.2 then reaches the fonts
+  through fontdb's pure-Rust fontconfig support (it parses `/etc/fonts/fonts.conf` itself, follows the symlink, and
+  needs no fontconfig cache; verified on-device by rendering `\text{中文}` through a server build that did no font
+  work at all). The service therefore renders with `loadSystemFonts: true` and `defaultFontFamily: "Noto Sans SC"`
+  and ships **no** font file. An explicit font is used only when one is actually supplied — `MATHJAX_FONT=<path>`, or a file named `wqy-microhei.ttc` in
   `/userdata/PenMods` or `/userdisk/PenMods` — for units that genuinely lack CJK fonts; that mode copies the file
   atomically into a writable dir (`MATHJAX_FONT_DIR` → temp dir → `/userdata/PenMods` → `/userdisk/PenMods`),
   reads the real family from its name table, rewrites only the `<text>` font-family and sets

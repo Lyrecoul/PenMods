@@ -24,8 +24,9 @@ namespace mod {
  *
  * 因此开机时做两件事，按顺序：
  *
- *   1. 字体目录。fonts.conf 里只列了 <dir>/usr/share/fonts</dir>，真正的字体在 /usr/lib/fonts。
- *      出厂机上是软链，换固件/精简系统上可能就没有 —— 缺了（或指向别处、或是空目录）就补上
+ *   1. 字体目录。fonts.conf 里只列了 <dir>/usr/share/fonts</dir>，真正的字体在 /usr/lib/fonts，
+ *      而出厂镜像**没有**这条软链（测试机上那条是手动建的）。所以干净机器上 fontconfig 和
+ *      resvg-js/fontdb 一个字体都找不到 —— 缺了（或指向别处、或是空目录）就补上
  *      /usr/share/fonts -> /usr/lib/fonts。设备自己往那个目录里放了东西就一律不碰。
  *   2. 字体清单缓存。/var/cache/fontconfig 里没有可用的 <hash>-<machine>.cache-<n> 时才跑 fc-cache
  *      （不加 -f，已是最新的缓存不会重扫）。冷启动要 40 秒，所以必须异步跑，不能挡 UI 线程。

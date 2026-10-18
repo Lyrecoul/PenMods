@@ -182,6 +182,44 @@ Bundle maintenance:
 - Old-style `-subject_hash_old` names are not generated: everything on this device (curl 7.58 with OpenSSL 1.1.1i,
   the player's OpenSSL 3.5) uses the SHA-1 based hash. Add them if a 1.0.x consumer ever appears.
 
+### Fontconfig Font Cache (startup pre-check)
+
+`src/helper/FontCache` (Singleton, constructed in `BeforeMain`, work deferred to `beforeUiInitialization` like
+`CaCertificates`) makes sure the device can actually hand out fonts, and logs its decision to
+`/userdata/applog/DictPen_*.log` (`grep FontCache` on the newest file). It exists because the stock image ships no fontconfig cache: a cold `fc-list` on
+the tested YDP02X takes **39.9 s** to scan the 144 fonts in `/usr/lib/fonts` and write `/var/cache/fontconfig`, while
+a warm one takes **40 ms** — and the things that read fonts (`mpv`'s libass subtitles, Qt's own fontconfig backend,
+any child process we spawn) hit that cost in the middle of the UI.
+
+Two steps, in this order:
+
+1. **Font directory.** `/etc/fonts/fonts.conf` lists exactly one `<dir>/usr/share/fonts</dir>`; the real fonts live in
+   `/usr/lib/fonts`, and the factory image bridges them with a symlink. If `/usr/share/fonts` is missing, dangling,
+   pointing elsewhere, or an *empty* directory, it is replaced with `-> /usr/lib/fonts`. A directory that already
+   holds files but no font is left untouched (and then the cache build is skipped) — that is somebody else's layout,
+   and scanning it would only produce a valid-looking cache containing no fonts.
+2. **Cache manifest.** `fc-cache` runs only when no usable `<hash>-<machine>.cache-<n>` exists in `/var/cache/fontconfig`
+   (or the fonts directory is newer than the newest cache file, i.e. fonts were added later). It runs **without `-f`**,
+   so an up-to-date cache costs ~37 ms instead of a full rescan. The run is asynchronous (`QProcess` + `finished`) and
+   took **43.4 s** on a real cold cache; the UI is fully usable meanwhile.
+
+Rules that cost a debugging session:
+
+- A cache entry counts only if it is >= 1 KiB **and** starts with the fontconfig magic `04 FC 02 FC`. The size gate
+  matters: a cache written while the font directory was still empty is small but otherwise perfectly valid, and
+  accepting it would report "cache ready" on a machine whose fonts fontconfig cannot see.
+- The gate is filesystem-based for the same reason as the CA store gate: pointing at an enumerating API
+  (`fc-list`) is itself the 40 s cost this check exists to avoid.
+- `/var/cache/fontconfig` is the compiled-in location (`fc-cache -v` only ever cleans that one); `$XDG_CACHE_HOME/fontconfig`
+  and `$HOME/.cache/fontconfig` are only scanned to avoid a pointless rebuild.
+- Writing the symlink may need the rootfs remounted rw; it is retried once after `mount -o remount,rw /` on
+  `EROFS`/`EACCES`/`EPERM`. `Mod::onUiCompleted()` remounts anyway, but that is later than this check.
+- `PENMODS_NO_FONT_CACHE=1` skips step 2 (the symlink repair still happens), which is how a device with a deliberately
+  broken cache is exercised.
+- The MathJax service does **not** depend on this: resvg-js/fontdb parses `fonts.conf` itself and needs no cache. It
+  still benefits from the symlink step, which is what makes `/usr/share/fonts` reachable on units where the factory
+  link is absent.
+
 ### MathJax Formula Rendering Service
 
 `mathjax-server/` is the local service that renders LaTeX to PNG for the AI assistant (Node + MathJax 3 +
@@ -205,7 +243,9 @@ in the OTA package** — the binary has to be shipped to users separately (the c
   `HYQiHei-*.ttf` — and resvg-js 2.6.2 reaches them through fontdb's pure-Rust fontconfig support (it parses
   `/etc/fonts/fonts.conf` itself, follows the symlink, and needs no fontconfig cache; verified on-device by
   rendering `\text{中文}` through a server build that did no font work at all). The service therefore renders
-  with `loadSystemFonts: true` and `defaultFontFamily: "Noto Sans SC"` and ships **no** font file. An explicit
+  with `loadSystemFonts: true` and `defaultFontFamily: "Noto Sans SC"` and ships **no** font file. The startup
+  pre-check in `### Fontconfig Font Cache` keeps that symlink and the fontconfig cache in place on units where the
+  factory image lacks them. An explicit
   font is used only when one is actually supplied — `MATHJAX_FONT=<path>`, or a file named `wqy-microhei.ttc` in
   `/userdata/PenMods` or `/userdisk/PenMods` — for units that genuinely lack CJK fonts; that mode copies the file
   atomically into a writable dir (`MATHJAX_FONT_DIR` → temp dir → `/userdata/PenMods` → `/userdisk/PenMods`),
@@ -260,7 +300,7 @@ persisted as `righthandmode` in `/userdata/DictPenData/NeteaseYoudao/YoudaoDictP
 | `src/dict/` | Custom dictionaries (`customDict`): scans `/userdisk/PenMods/dicts/`, queries user-made `.dat` containers through the vendor reader and injects the hit into the main result page as its own section (see `doc/DICT_FORMAT_ANALYSIS.md`) |
 | `src/filemanager/` | File browser, MusicPlayer, VideoPlayer, TextReader, ImageViewer |
 | `external/ffmpeg-player/` | Vendored upstream QML video player plugin (in-scene-graph rendering, ASS/LRC subtitles, MPP hard decode behind a runtime gate) |
-| `src/helper/` | AntiEmbs, CaCertificates, NetworkSettings, DeveloperSettings, ServiceManager |
+| `src/helper/` | AntiEmbs, CaCertificates, FontCache, NetworkSettings, DeveloperSettings, ServiceManager |
 | `src/system/` | BatteryInfo, InputDaemon, ScreenManager, AudioDaemon |
 | `src/plugin/` | PluginManager, PluginSDK.h (public C ABI), QmlPluginWrapper |
 | `src/media/` | MediaSession: plugin media interface for the quick settings panel |

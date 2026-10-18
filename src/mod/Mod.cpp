@@ -179,6 +179,7 @@ PEN_HOOK(bool, license_verify) { return true; }
 
 #include "helper/AntiEmbs.h"
 #include "helper/DeveloperSettings.h"
+#include "helper/FontCache.h"
 #include "helper/NetworkSettings.h"
 #include "helper/ServiceManager.h"
 
@@ -272,6 +273,7 @@ __attribute__((constructor)) static void BeforeMain() {
     INSTANCE(AntiEmbs);
     INSTANCE(CaCertificates);
     INSTANCE(DeveloperSettings);
+    INSTANCE(FontCache);
     INSTANCE(NetworkSettings);
     INSTANCE(ServiceManager);
 

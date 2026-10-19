@@ -214,6 +214,7 @@ class VideoPlayer : public QQuickItem {
   Q_PROPERTY(qreal progressBarPosition READ progressBarPosition WRITE setProgressBarPosition NOTIFY progressBarPositionChanged)
   Q_PROPERTY(int videoWidth READ videoWidth NOTIFY videoSizeChanged)
   Q_PROPERTY(int videoHeight READ videoHeight NOTIFY videoSizeChanged)
+  Q_PROPERTY(bool downsamplingEnabled READ downsamplingEnabled WRITE setDownsamplingEnabled NOTIFY downsamplingEnabledChanged)
   Q_PROPERTY(
       FillMode fillMode READ fillMode WRITE setFillMode NOTIFY fillModeChanged)
   Q_PROPERTY(
@@ -245,6 +246,7 @@ public:
       : QQuickItem(parent), video_pkt_queue_(20), audio_pkt_queue_(80),
         ready_frames_(3) {
     setFlag(ItemHasContents, true);
+    connect(this, &QQuickItem::smoothChanged, this, [this]() { update(); });
 
     FFmpegCore::Init();
 
@@ -321,6 +323,7 @@ public:
 
   int videoWidth() const { return video_width_; }
   int videoHeight() const { return video_height_; }
+  bool downsamplingEnabled() const { return downsampling_enabled_; }
   FillMode fillMode() const { return fill_mode_; }
   int rotation() const { return rotation_angle_; }
   bool hasVideo() const { return has_video_; }
@@ -338,6 +341,14 @@ public:
 
   // ─── QML 可调用方法 ──────────────────────────
 public slots:
+  void setDownsamplingEnabled(bool enabled) {
+    if (downsampling_enabled_ == enabled)
+      return;
+    downsampling_enabled_ = enabled;
+    emit downsamplingEnabledChanged();
+    update(); // Also switches the current material when playback is paused.
+  }
+
   void setProgressBarEnabled(bool enabled) {
     if (progress_bar_enabled_ == enabled) return;
     progress_bar_enabled_ = enabled;
@@ -662,6 +673,7 @@ signals:
   void progressBarHeightChanged();
   void progressBarPositionChanged();
   void videoSizeChanged();
+  void downsamplingEnabledChanged();
   void fillModeChanged();
   void rotationChanged();
   void mediaStatusChanged();
@@ -698,6 +710,7 @@ protected:
       root = new render::VideoRootNode(window());
 
     const QRectF rect = calculateRenderRect();
+    root->SetSampling(downsampling_enabled_, smooth());
     if (frame) {
       root->SetFrame(frame, rect, rotation_angle_,
                      window()->effectiveDevicePixelRatio());
@@ -706,7 +719,7 @@ protected:
       delete root;
       return nullptr;
     }
-    root->UpdateLayout(rect, rotation_angle_);
+    root->UpdateLayout(rect, rotation_angle_, window()->effectiveDevicePixelRatio());
     return root;
   }
 
@@ -1755,6 +1768,7 @@ private:
 
   // QML 属性
   QUrl source_;
+  bool downsampling_enabled_ = true;
   QUrl subtitle_source_, subtitle_font_file_;
   bool subtitles_enabled_ = true, subtitle_loading_ = false;
   qreal subtitle_delay_ = 0, subtitle_font_scale_ = 1;

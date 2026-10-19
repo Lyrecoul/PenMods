@@ -390,16 +390,19 @@ inline int MaxTapsForMode(GlVideoMode mode) {
 
 class GlVideoMaterial : public QSGMaterial {
 public:
-  explicit GlVideoMaterial(GlVideoMode mode) : mode_(mode) {}
+  explicit GlVideoMaterial(GlVideoMode mode, bool multisampling = true)
+      : mode_(mode), multisampling_(multisampling) {}
 
   QSGMaterialType *type() const override {
-    static QSGMaterialType types[3];
-    return &types[static_cast<int>(mode_)];
+    static QSGMaterialType types[3][2];
+    return &types[static_cast<int>(mode_)][multisampling_ ? 1 : 0];
   }
   QSGMaterialShader *createShader() const override;
 
   GlVideoMode mode() const { return mode_; }
+  bool multisampling() const { return multisampling_; }
 
+  bool smooth = true;
   GLuint textures[3] = {0, 0, 0};
   QVector2D crop[3] = {QVector2D(1, 1), QVector2D(1, 1), QVector2D(1, 1)};
   QMatrix4x4 color_matrix;
@@ -409,11 +412,13 @@ public:
 
 private:
   GlVideoMode mode_;
+  bool multisampling_;
 };
 
 class GlVideoShader : public QSGMaterialShader {
 public:
-  explicit GlVideoShader(GlVideoMode mode) : mode_(mode) {}
+  explicit GlVideoShader(GlVideoMode mode, bool multisampling)
+      : mode_(mode), multisampling_(multisampling), source_(BuildFragmentShader()) {}
 
   char const *const *attributeNames() const override {
     static const char *const names[] = {"a_position", "a_texcoord", nullptr};
@@ -437,14 +442,19 @@ public:
     for (int i = planes - 1; i >= 0; --i) {
       f->glActiveTexture(GL_TEXTURE0 + i);
       f->glBindTexture(target, m->textures[i]);
+      const GLint filter = m->smooth ? GL_LINEAR : GL_NEAREST;
+      f->glTexParameteri(target, GL_TEXTURE_MIN_FILTER, filter);
+      f->glTexParameteri(target, GL_TEXTURE_MAG_FILTER, filter);
       p->setUniformValue(tex_loc_[i], i);
       p->setUniformValue(crop_loc_[i], m->crop[i]);
     }
     if (mode_ != GlVideoMode::External)
       p->setUniformValue(color_loc_, m->color_matrix);
     // PENMODS PATCH: 缩小时的抽样参数
-    p->setUniformValue(tap_step_loc_, m->tap_step);
-    p->setUniformValue(taps_loc_, m->taps);
+    if (multisampling_) {
+      p->setUniformValue(tap_step_loc_, m->tap_step);
+      p->setUniformValue(taps_loc_, m->taps);
+    }
   }
 
 protected:
@@ -459,20 +469,15 @@ protected:
            "}\n";
   }
 
-  // PENMODS PATCH: 片元着色器在首次使用时拼接（原先每种模式是一段固定字符串，
-  // 这里因为要按模式插入 MAXTAPS 与抽样函数改为动态生成，正文逻辑保持不变）
+  // Qt caches these shaders by sampler layout and multi-tap/single-fetch material type.
   const char *fragmentShader() const override {
-    static std::string cache[3];
-    std::string &src = cache[static_cast<int>(mode_)];
-    if (src.empty())
-      src = BuildFragmentShader();
-    return src.c_str();
+    return source_.c_str();
   }
 
   // PENMODS PATCH: 单次采样 vs 缩小时的 N×N 平均
-  static std::string PlaneTapFunction(const char *ret, const char *name,
+  std::string PlaneTapFunction(const char *ret, const char *name,
                                       const char *sampler, const char *swizzle,
-                                      const char *zero) {
+                                      const char *zero) const {
     std::string s;
     s += ret;
     s += " ";
@@ -480,6 +485,10 @@ protected:
     s += "(";
     s += sampler;
     s += " t, highp vec2 uv, highp vec2 cs) {\n";
+    if (!multisampling_) {
+      s += std::string("  return texture2D(t, uv * cs)") + swizzle + ";\n}\n";
+      return s;
+    }
     s += std::string("  if (taps < 1.5) return texture2D(t, uv * cs)") + swizzle + ";\n";
     s += std::string("  ") + ret + " acc = " + zero + ";\n";
     s += "  highp float cnt = 0.0;\n";
@@ -506,9 +515,11 @@ protected:
     s += "#ifdef GL_ES\nprecision highp float;\n#endif\n";
     s += "varying highp vec2 v_texcoord;\n";
     s += "uniform lowp float opacity;\n";
-    s += "uniform highp vec2 tap_step;\n";
-    s += "uniform highp float taps;\n";
-    s += "#define MAXTAPS " + std::to_string(MaxTapsForMode(mode_)) + "\n";
+    if (multisampling_) {
+      s += "uniform highp vec2 tap_step;\n";
+      s += "uniform highp float taps;\n";
+      s += "#define MAXTAPS " + std::to_string(MaxTapsForMode(mode_)) + "\n";
+    }
     for (int i = 0; i < PlaneCount(); ++i)
       s += std::string("uniform ") + sampler + " tex" + std::to_string(i) + ";\n";
     for (int i = 0; i < PlaneCount(); ++i)
@@ -564,6 +575,8 @@ private:
   }
 
   GlVideoMode mode_;
+  bool multisampling_;
+  const std::string source_;
   int matrix_loc_ = -1;
   int opacity_loc_ = -1;
   int color_loc_ = -1;
@@ -575,7 +588,7 @@ private:
 };
 
 inline QSGMaterialShader *GlVideoMaterial::createShader() const {
-  return new GlVideoShader(mode_);
+  return new GlVideoShader(mode_, multisampling_);
 }
 
 // ─── GL 视频节点：纹理上传与生命周期管理 ─────────────────
@@ -615,6 +628,19 @@ public:
       UpdateTapParams();
     }
     return ok;
+  }
+
+  void SetSampling(bool downsampling, bool smooth) {
+    const bool multisampling = downsampling;
+    // Texture filtering is independent of multi-tap downsampling.
+    if (multisampling_ == multisampling && smooth_ == smooth)
+      return;
+    multisampling_ = multisampling;
+    smooth_ = smooth;
+    if (material_) {
+      EnsureMaterial(material_->mode());
+      UpdateTapParams();
+    }
   }
 
   // PENMODS PATCH: rect / dpr 变化时重算抽样参数（devicePixel 下的显示尺寸）
@@ -685,7 +711,7 @@ private:
     const qreal w = std::max<qreal>(1.0, rect_.width() * dpr_);
     const qreal h = std::max<qreal>(1.0, rect_.height() * dpr_);
     float taps = 1.0f;
-    if (tex_w_ > 0 && tex_h_ > 0) {
+    if (multisampling_ && tex_w_ > 0 && tex_h_ > 0) {
       const double minify =
           std::max(static_cast<double>(tex_w_) / w, static_cast<double>(tex_h_) / h);
       if (minify > 1.02) {
@@ -725,10 +751,18 @@ private:
   };
 
   GlVideoMaterial *EnsureMaterial(GlVideoMode mode) {
-    if (!material_ || material_->mode() != mode) {
-      material_ = new GlVideoMaterial(mode);
+    if (!material_ || material_->mode() != mode || material_->multisampling() != multisampling_) {
+      auto *replacement = new GlVideoMaterial(mode, multisampling_);
+      if (material_ && material_->mode() == mode) {
+        // A paused frame has no upload to repopulate these after a shader switch.
+        std::copy(std::begin(material_->textures), std::end(material_->textures), replacement->textures);
+        std::copy(std::begin(material_->crop), std::end(material_->crop), replacement->crop);
+        replacement->color_matrix = material_->color_matrix;
+      }
+      material_ = replacement;
       setMaterial(material_); // OwnsMaterial：旧材质自动删除
     }
+    material_->smooth = smooth_;
     markDirty(QSGNode::DirtyMaterial);
     return material_;
   }
@@ -865,6 +899,7 @@ private:
   }
 
   QSGGeometry geometry_;
+  bool multisampling_ = true, smooth_ = true;
   QRectF rect_;
   GlVideoMaterial *material_ = nullptr;
   // PENMODS PATCH: 抽样参数所需的状态
@@ -903,46 +938,80 @@ public:
     LOG(INFO) << "Video renderer: CPU RGBA";
   }
 
+  ~VideoRootNode() override {
+    av_frame_free(&cpu_frame_);
+  }
+
+  void SetSampling(bool downsampling, bool smooth) {
+#if FFPLAYER_GL_RENDER
+    if (gl_node_)
+      gl_node_->SetSampling(downsampling, smooth);
+#endif
+    if (downsampling_ != downsampling || smooth_ != smooth) {
+      downsampling_ = downsampling;
+      smooth_ = smooth;
+      cpu_dirty_ = true;
+    }
+    if (tex_node_) {
+      tex_node_->setFiltering(smooth_ ? QSGTexture::Linear : QSGTexture::Nearest);
+      tex_node_->markDirty(QSGNode::DirtyMaterial);
+    }
+  }
+
   // 接管 frame 所有权
   void SetFrame(AVFrame *frame, const QRectF &rect, int rotation, qreal dpr) {
+    dpr_ = dpr;
 #if FFPLAYER_GL_RENDER
     if (gl_node_) {
-      dpr_ = dpr; // PENMODS PATCH: UpdateLayout 需要它来算抽样参数
       if (gl_node_->SetFrame(frame))
         has_content_ = true;
       return;
     }
 #endif
-    // CPU 路径：直接转换到显示尺寸（不放大）
-    const QRectF tex_rect = ComputePlacement(rect, rotation).tex_rect;
-    const int dst_w = std::clamp(
-        static_cast<int>(std::lround(tex_rect.width() * dpr)), 1, frame->width);
-    const int dst_h =
-        std::clamp(static_cast<int>(std::lround(tex_rect.height() * dpr)), 1,
-                   frame->height);
-    if (converter_.ToRgba(frame, dst_w, dst_h, image_)) {
-      if (QSGTexture *texture = window_->createTextureFromImage(image_)) {
-        tex_node_->setTexture(texture);
-        has_content_ = true;
-      }
-    }
-    av_frame_free(&frame);
+    // Retain the source, so changing filtering while paused can recover full detail.
+    av_frame_free(&cpu_frame_);
+    cpu_frame_ = frame;
+    cpu_dirty_ = true;
+    UpdateCpuTexture(ComputePlacement(rect, rotation).tex_rect);
   }
 
   bool HasContent() const { return has_content_; }
 
-  void UpdateLayout(const QRectF &rect, int rotation) {
+  void UpdateLayout(const QRectF &rect, int rotation, qreal dpr = 1) {
+    dpr_ = dpr;
     const Placement p = ComputePlacement(rect, rotation);
 #if FFPLAYER_GL_RENDER
     if (gl_node_)
       gl_node_->SetRect(p.tex_rect, dpr_); // PENMODS PATCH: 多带一个 dpr
 #endif
-    if (tex_node_)
+    if (tex_node_) {
       tex_node_->setRect(p.tex_rect);
+      UpdateCpuTexture(p.tex_rect);
+    }
     setMatrix(p.matrix);
   }
 
 private:
+  void UpdateCpuTexture(const QRectF &tex_rect) {
+    if (!cpu_frame_)
+      return;
+    const bool filtered = downsampling_ && smooth_;
+    const int dst_w = filtered ? std::clamp(
+        static_cast<int>(std::lround(tex_rect.width() * dpr_)), 1, cpu_frame_->width) : cpu_frame_->width;
+    const int dst_h = filtered ? std::clamp(
+        static_cast<int>(std::lround(tex_rect.height() * dpr_)), 1, cpu_frame_->height) : cpu_frame_->height;
+    if (!cpu_dirty_ && image_.width() == dst_w && image_.height() == dst_h)
+      return;
+    if (converter_.ToRgba(cpu_frame_, dst_w, dst_h, image_)) {
+      if (QSGTexture *texture = window_->createTextureFromImage(image_)) {
+        tex_node_->setTexture(texture);
+        tex_node_->markDirty(QSGNode::DirtyMaterial);
+        has_content_ = true;
+        cpu_dirty_ = false;
+      }
+    }
+  }
+
 #if FFPLAYER_GL_RENDER
   static bool DetectGl(QQuickWindow *window) {
     if (EnvDisabled("FFPLAYER_GL"))
@@ -959,9 +1028,11 @@ private:
   }
 
   GlVideoNode *gl_node_ = nullptr;
-  qreal dpr_ = 1.0; // PENMODS PATCH: 供 GL 节点的抽样参数使用
 #endif
   QQuickWindow *window_;
+  qreal dpr_ = 1;
+  bool downsampling_ = true, smooth_ = true, cpu_dirty_ = false;
+  AVFrame *cpu_frame_ = nullptr;
   QSGSimpleTextureNode *tex_node_ = nullptr;
   SwsConverter converter_;
   QImage image_;

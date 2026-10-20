@@ -115,8 +115,12 @@ VideoPlayer {
 | `loading` / `seeking` / `errorString` | 异步状态与错误 |
 | `position` / `duration` | 秒；未知时长为 0 |
 | `videoDecoder` / `hardwareDecoding` | 当前解码器及硬解状态 |
+| `downsamplingEnabled` | 默认 true；关闭后使用独立的单次采样着色器，暂停时立即生效 |
+| `smooth` | 继承自 QQuickItem，独立控制线性／最近邻纹理采样，不受 `downsamplingEnabled` 限制 |
 
 不要使用播放状态的数字值；用 `VideoPlayer.PlayingState` 等枚举。错误通过 `errorOccurred` 通知，媒体结束通过 `endOfMedia` 通知。
+
+缩放页面绑定 `downsamplingEnabled: !zoomMode` 并保持 `smooth: true`，以原始纹理做双线性采样；需要最近邻时可单独设置 `smooth: false`。CPU 回退在关闭降采样时保留原尺寸转换，暂停后切换也能恢复源图细节；恢复普通模式后沿用原有降采样和颜色转换。
 
 ### 手势与底边进度条
 
@@ -205,3 +209,5 @@ player.clearSubtitles()         // 清除内容，需重新加载才能显示
 | `SSL_CERT_FILE` / `SSL_CERT_DIR` | 可选 HTTPS CA 文件 / 哈希证书目录；未设置时使用 OpenSSL 默认信任路径及设备 `/etc/ssl/certs`，不要求 CA 合集文件。显式配置加载失败时报错，始终校验证书链和主机名。 |
 
 HTTPS 默认验证证书链和主机名。设备系统时间和 CA 文件须正确。网络读写有超时及取消机制，尚不提供应用层自动重连、内嵌字幕轨选择或播放列表管理。
+
+设备测量结论见 [过滤修复与性能定位记录](../../doc/FFMPEG_PLAYER_FILTER_PERFORMANCE.md)。

@@ -1,6 +1,6 @@
 -- ============================================================================
 -- Haikure/ffmpeg-player —— Qt5 QML 视频播放器插件（已 vendor 进 PenMods）
---   上游   : https://github.com/Haikure/ffmpeg-player  (v1.0.1 / 62905fb, GPL-3.0)
+--   上游   : https://github.com/Haikure/ffmpeg-player  (v1.0.3 / d7733e3, GPL-3.0)
 --   改动   : external/ffmpeg-player/UPSTREAM.md
 --   分析与实测: doc/FFMPEG_PLAYER_ANALYSIS.md
 --   构建   : xmake build ffmpegplayerplugin
@@ -351,10 +351,10 @@ target("ffmpegplayerplugin")
         -- 任一实现头变化时重建两个 moc 对象，避免旧类布局与新代码混合链接。
         depend.on_changed(function ()
             for _, name in ipairs({"FFmpegPlayerPlugin", "FFmpegVideoPlayerQml"}) do
-                local generated = target:autogenfile(path.join("src", "moc_" .. name .. ".cpp"))
+                local generated = target:autogenfile(path.join("external", "ffmpeg-player", "src", "moc_" .. name .. ".cpp"))
                 os.tryrm(target:objectfile(generated))
             end
-        end, {files = os.files(path.join(os.projectdir(), "src", "*.hpp")),
+        end, {files = os.files(path.join(os.projectdir(), "external", "ffmpeg-player", "src", "*.hpp")),
               dependfile = target:dependfile("ffplayer-moc-headers")})
     end)
     -- libavcodec 依赖设备上的 librockchip_mpp/libdrm，链接时从这里解析

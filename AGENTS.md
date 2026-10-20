@@ -433,7 +433,7 @@ render them into the frame before the autorotate post-filter if that ever needs 
 
 ### Embedded FFmpeg Player (QML plugin)
 
-`external/ffmpeg-player/` vendors [`Haikure/ffmpeg-player`](https://github.com/Haikure/ffmpeg-player) v1.0.1
+`external/ffmpeg-player/` vendors [`Haikure/ffmpeg-player`](https://github.com/Haikure/ffmpeg-player) v1.0.3
 (GPL-3.0) — a Qt 5 QML video player that renders **into the host scene graph** (custom `QSGNode`, static FFmpeg
 3.4.8 + libass + OpenSSL 3 + libxml2), so the picture follows `YMainWindow.rotation` and PenMods controls can sit on
 top of it. `xmake build ffmpegplayerplugin` produces `build/<plat>/<arch>/<mode>/qml/FFmpegPlayer/`;
@@ -469,11 +469,11 @@ device measurements: `doc/FFMPEG_PLAYER_ANALYSIS.md`.
   are **symlinks** in git (a zip download turns them into text files and breaks `-lrockchip_mpp`). On this dev machine
   the xmake-repo `python` recipe needed `--enable-optimizations` removed (PGO test flake) because `harfbuzz` builds
   through `meson`.
-- The vendored `src/` is **not** pristine: `src/VideoRenderNode.hpp` carries a `// PENMODS PATCH` section that replaces
-  the single `GL_LINEAR` fetch with an adaptive N×N downsample when the video is larger than its display rect (upstream
-  minified without mipmaps, so >screen-resolution video aliased into a "sharpened" look; measured 13× excess
-  high-frequency energy at 1080p→302×170, now within the range of mpv/swscale). Keep the patch, and re-apply it when
-  syncing upstream. After any `src/` change, do a **full** plugin rebuild — an incremental build can mix v-old/v-new
+- The vendored `src/` matches upstream v1.0.3. The adaptive N×N downsampling code in `src/VideoRenderNode.hpp`
+  retains historical `// PENMODS PATCH` comments but is already upstream. Zoom disables multi-tap downsampling
+  while keeping bilinear filtering (`downsamplingEnabled: !zoomMode`, `smooth: true`); `smooth` independently
+  selects linear or nearest filtering for GL and CPU rendering. Preserve the PenMods-specific build integration.
+  After any `src/` change, do a **full** plugin rebuild — an incremental build can mix v-old/v-new
   objects and abort the host at `VideoPlayer` construction (see `external/ffmpeg-player/UPSTREAM.md`).
 
 ### Touch Calibration (udev rule)

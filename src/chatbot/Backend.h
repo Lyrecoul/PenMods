@@ -22,6 +22,7 @@
 #include <QThreadPool>
 #include <QTimer>
 #include <QVector>
+#include <QUuid>
 
 #include <nlohmann/json.hpp>
 using json = nlohmann::json;
@@ -46,6 +47,9 @@ struct MessagePart {
 
 // 单条消息（纯文本或多模态）
 struct MessageData {
+    QString              messageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    // Local display metadata. messageToJson deliberately excludes these fields.
+    QVariantList         toolStates;
     QString              role;          // "user" | "assistant" | "system" | "tool"
     QString              content;       // 纯文本（无多模态时使用）
     QString              reasoning;     // 模型推理摘要（不发送回 API）
@@ -77,6 +81,8 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
     Q_PROPERTY(bool isStreaming READ getIsStreaming WRITE setIsStreaming NOTIFY isStreamingChanged)
     Q_PROPERTY(bool isAvailable READ isAvailable CONSTANT)
     Q_PROPERTY(QVariantList messages READ getMessages NOTIFY messagesChanged)
+    Q_PROPERTY(QString responseMessageId READ responseMessageId NOTIFY streamStart)
+    Q_PROPERTY(QVariantList toolStates READ getToolStates NOTIFY toolStatesChanged)
     Q_PROPERTY(QString currentSessionId READ getCurrentSessionId NOTIFY sessionSwitched)
     Q_PROPERTY(QVariantMap apiCacheStats READ getApiCacheStats NOTIFY apiCacheStatsChanged)
 
@@ -190,6 +196,8 @@ public:
     QString      getDefaultPrompt() const;
     bool         getIsStreaming() const;
     QVariantList getMessages() const;
+    QString responseMessageId() const { return m_responseMessageId; }
+    QVariantList getToolStates() const;
     QVariantMap  getApiCacheStats() const;
 
     bool getCapText() const { return m_capText; }
@@ -244,6 +252,8 @@ signals:
     void requestCancelled();
     // Tool Call 信号：toolCallsJson 为完整 tool_calls 数组的 JSON 字符串
     void toolCallReceived(const QString& toolCallsJson);
+    void toolStateChanged(const QVariantMap& state);
+    void toolStatesChanged();
     void imageAttachmentsReceived(const QVariantList& attachments);
     void toolCallProgress(const QString& text, bool isComplete);
     void apiKeyChanged();
@@ -296,6 +306,18 @@ private:
     bool                   m_cancelled        = false;
     bool                   m_streamEndEmitted = false;
     int                    m_requestSeq       = 0;
+    QString                m_responseMessageId;
+    QString                m_responseSessionId;
+    QVariantList           m_responseToolStates;
+    bool                   m_toolFlushScheduled = false;
+    void prepareTool(int index, const json& call);
+    void updateTool(const QString& callId, const QString& state, const QString& text,
+                    const QString& result = QString());
+    void publishTool(QVariantMap state);
+    void finishOutstandingTools(const QString& state, const QString& reason);
+    void updateServerTool(const QJsonObject& item, const QString& state);
+    void attachResponseMetadata(MessageData& message) const;
+    void persistPartialResponse();
 
     QString m_apiKey;
     QString m_apiEndpoint;

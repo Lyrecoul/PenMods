@@ -309,12 +309,24 @@ bool startsBlock(const QStringList& lines, int index) {
 QJsonArray MarkdownParser::parse(const QString& text) {
     QJsonArray                      blocks;
     QStringList                     lines = text.split('\n', Qt::KeepEmptyParts);
+    QVector<int> sourcePositions;
+    int sourcePosition = 0;
+    for (const auto& line : lines) {
+        sourcePositions.append(sourcePosition);
+        sourcePosition += line.size() + 1;
+    }
+    int blockStart = 0;
+    const auto appendBlock = [&](QJsonObject block) {
+        block["sourceStart"] = blockStart;
+        blocks.append(block);
+    };
     static const QRegularExpression heading(R"(^(#{1,6})\s+(.+)$)");
     static const QRegularExpression unordered(R"(^[-*+]\s+(.+)$)");
     static const QRegularExpression ordered(R"(^\d+\.\s+(.+)$)");
     static const QRegularExpression rule(R"(^([-*_])(?:\s*\1){2,}\s*$)");
 
     for (int i = 0; i < lines.size();) {
+        blockStart = sourcePositions[i];
         const QString trimmed = lines[i].trimmed();
         if (trimmed.isEmpty()) {
             ++i;
@@ -326,7 +338,7 @@ QJsonArray MarkdownParser::parse(const QString& text) {
             QStringList   content;
             for (++i; i < lines.size() && !lines[i].trimmed().startsWith("```"); ++i) content.append(lines[i]);
             if (i < lines.size()) ++i;
-            blocks.append(
+            appendBlock(
                 QJsonObject{
                     {"type",     "code_block"      },
                     {"content",  content.join('\n')},
@@ -347,6 +359,7 @@ QJsonArray MarkdownParser::parse(const QString& text) {
             const int sameLine = lines[i].indexOf(close, bodyAt);
             if (sameLine >= 0) {
                 parts.append(lines[i].mid(bodyAt, sameLine - bodyAt));
+                sourcePositions[i] += sameLine + close.size();
                 lines[i] = lines[i].mid(sameLine + close.size());
             } else {
                 parts.append(lines[i].mid(bodyAt));
@@ -354,13 +367,14 @@ QJsonArray MarkdownParser::parse(const QString& text) {
                     const int closeAt = lines[i].indexOf(close);
                     if (closeAt >= 0) {
                         parts.append(lines[i].left(closeAt));
+                        sourcePositions[i] += closeAt + close.size();
                         lines[i] = lines[i].mid(closeAt + close.size());
                         break;
                     }
                     parts.append(lines[i]);
                 }
             }
-            blocks.append(
+            appendBlock(
                 QJsonObject{
                     {"type",    "math_block"              },
                     {"content", parts.join('\n').trimmed()}
@@ -371,7 +385,7 @@ QJsonArray MarkdownParser::parse(const QString& text) {
 
         const auto headingMatch = heading.match(trimmed);
         if (headingMatch.hasMatch()) {
-            blocks.append(
+            appendBlock(
                 QJsonObject{
                     {"type",     "heading"                               },
                     {"level",    headingMatch.captured(1).size()         },
@@ -382,7 +396,7 @@ QJsonArray MarkdownParser::parse(const QString& text) {
             continue;
         }
         if (rule.match(trimmed).hasMatch()) {
-            blocks.append(
+            appendBlock(
                 QJsonObject{
                     {"type", "hr"}
             }
@@ -397,7 +411,7 @@ QJsonArray MarkdownParser::parse(const QString& text) {
                 quote.append(lines[i].trimmed().mid(1).trimmed());
                 ++i;
             }
-            blocks.append(
+            appendBlock(
                 QJsonObject{
                     {"type",     "blockquote"                    },
                     {"segments", inlineSegments(quote.join('\n'))}
@@ -416,7 +430,7 @@ QJsonArray MarkdownParser::parse(const QString& text) {
                 items.append(inlineSegments(match.captured(1)));
                 ++i;
             }
-            blocks.append(
+            appendBlock(
                 QJsonObject{
                     {"type",    "list_block"},
                     {"ordered", isOrdered   },
@@ -442,7 +456,7 @@ QJsonArray MarkdownParser::parse(const QString& text) {
                 rows.append(row);
                 ++i;
             }
-            blocks.append(
+            appendBlock(
                 QJsonObject{
                     {"type",    "table"},
                     {"headers", headers},
@@ -461,12 +475,17 @@ QJsonArray MarkdownParser::parse(const QString& text) {
             paragraph.append(lines[i]);
             ++i;
         }
-        blocks.append(
+        appendBlock(
             QJsonObject{
                 {"type",     "paragraph"                         },
                 {"segments", inlineSegments(paragraph.join('\n'))}
         }
         );
+    }
+    for (int i = 0; i < blocks.size(); ++i) {
+        auto block = blocks[i].toObject();
+        block["sourceEnd"] = i + 1 < blocks.size() ? blocks[i + 1].toObject()["sourceStart"].toInt() : text.size();
+        blocks[i] = block;
     }
     return blocks;
 }

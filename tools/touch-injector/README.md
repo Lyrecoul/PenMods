@@ -21,8 +21,15 @@ $I tap   ui 160 107                # 点击
 $I longtap ui 160 107              # 600ms 长按
 $I hold  ui 160 107 3000           # 按住 3s（可在这期间截图，比如看长按倍速徽标）
 $I swipe ui 300 107 20 107         # 横向拖动（滚列表 / 拖动跳转）
+$I flicktap ui 160 150 160 60 160 90 60   # 先甩动再点：60ms 后在滑行中的列表上点击
 $I tap   ui 20 15 --lefthand       # 左手模式坐标
 ```
+
+`flicktap` 存在的理由：每次调用都要重新创建 uinput 设备并等 Weston 打开（300ms），分两次调用时
+「甩动后的惯性滑行」早就结束了，所以必须在同一次设备会话里完成甩动 + 延时 + 点击。
+`<delay_ms>` 是松手到按下之间的等待，用来落在惯性滑行窗口内（默认 `flickDeceleration` 下，一次
+90px/288ms 的甩动滑行约 200ms，所以 60ms 仍落在 `flicking` 里，300ms 已经结束）。实测结论见
+AGENTS.md「Touch injection」一节。
 
 `/userdisk/` 是持久分区（`/tmp` 是 tmpfs，每次重启都会丢），所以放在这里重启后还能用；
 调试完记得删掉。每次注入的坐标都要用截图确认（`weston-screenshooter` 需要 Weston 带 `--debug`）。

@@ -13,6 +13,10 @@
  * 用法：
  *   injector tap  ui <ux> <uy> [--lefthand]
  *   injector swipe ui <x1> <y1> <x2> <y2> [--lefthand]
+ *   injector flicktap ui <x1> <y1> <x2> <y2> <tx> <ty> <delay_ms> [--lefthand]
+ *                                                  # 甩动后 delay_ms 再点 (tx,ty)：
+ *                                                  # 用来在「列表惯性滑行中」点某个控件，
+ *                                                  # 分两次调用时 300ms 的设备打开延迟会错过滑行窗口。
  *   injector longtap ui <ux> <uy> [--lefthand]      # 600ms 长按
  *   injector hold ui <ux> <uy> <ms> [--lefthand]    # 按住指定毫秒（可在此期间截图）
  *   injector press ui <ux> <uy> [--lefthand]        # 按下不松（配合外部脚本）
@@ -109,10 +113,24 @@ int main(int argc, char** argv) {
 
     int ux1, uy1, ux2, uy2;
     int is_swipe   = strcmp(cmd, "swipe") == 0;
+    int is_flicktap = strcmp(cmd, "flicktap") == 0;
     int is_release = strcmp(cmd, "release") == 0;
     int hold_ms    = 0;
     if (strcmp(cmd, "hold") == 0) hold_ms = atoi(argv[5]);
-    if (is_swipe) {
+    int tap_x = 0, tap_y = 0, tap_delay_ms = 0;
+    if (is_flicktap) {
+        if (argc < 10) {
+            fprintf(stderr, "flicktap needs 4 swipe coords, 2 tap coords and a delay\n");
+            return 2;
+        }
+        ux1         = atoi(argv[3]);
+        uy1         = atoi(argv[4]);
+        ux2         = atoi(argv[5]);
+        uy2         = atoi(argv[6]);
+        tap_x       = atoi(argv[7]);
+        tap_y       = atoi(argv[8]);
+        tap_delay_ms = atoi(argv[9]);
+    } else if (is_swipe) {
         if (argc < 7) {
             fprintf(stderr, "swipe needs 4 coords\n");
             return 2;
@@ -146,7 +164,7 @@ int main(int argc, char** argv) {
     usleep(50000);
     button(1);
 
-    if (is_swipe) {
+    if (is_swipe || is_flicktap) {
         const int steps = 24;
         for (int i = 1; i <= steps; ++i) {
             int x = rx + (rx2 - rx) * i / steps;
@@ -169,6 +187,18 @@ int main(int argc, char** argv) {
 
     button(0);
     usleep(60000);
+
+    if (is_flicktap) {
+        int trx, try_;
+        convert(tap_x, tap_y, lefthand, &trx, &try_);
+        usleep((useconds_t)tap_delay_ms * 1000);
+        move_raw(trx, try_);
+        usleep(30000);
+        button(1);
+        usleep(50000);
+        button(0);
+        usleep(60000);
+    }
 
     ioctl(g_fd, UI_DEV_DESTROY);
     close(g_fd);

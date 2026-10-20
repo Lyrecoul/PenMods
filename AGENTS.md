@@ -796,7 +796,35 @@ zig cc -target aarch64-linux-gnu.2.27 -O2 -o injector injector.c   # glibc targe
 adb push injector /tmp/ && adb shell 'chmod +x /tmp/injector'
 adb shell '/tmp/injector tap ui 160 107'              # click a UI point
 adb shell '/tmp/injector swipe ui 290 107 20 107'     # drag / scroll
+adb shell '/tmp/injector flicktap ui 160 150 160 60 160 90 60'   # flick, then tap 60 ms later
 ```
+
+`flicktap` is the only way to click something **while the list is still coasting**: every invocation creates a fresh
+uinput device and waits 300 ms for Weston to open it, so two separate calls always miss the flick window (which lasts
+~200 ms for a 90 px/288 ms swipe). `tools/touch-injector/README.md` documents the tool.
+
+Isolated QML experiments run on-device with the system Qt (same 5.15.2 the app uses):
+
+```sh
+adb push test.qml /userdisk/ && adb shell 'killall YoudaoDictPen; cd /tmp && XDG_RUNTIME_DIR=/var/run \
+  WAYLAND_DISPLAY=wayland-0 QT_WAYLAND_SHELL_INTEGRATION=xdg-shell-v6 qmlscene /userdisk/test.qml'
+```
+
+The shell-integration variable is required (only `libxdg-shell-v6.so` is installed, so `qmlscene` otherwise fails with
+`No shell integration named "xdg-shell" found` and shows no window); `console.log` goes to the terminal. This is how
+the following `preventStealing` facts were measured — check them before “fixing” a click that a list swallows:
+
+- `preventStealing` is read at **press** and becomes the item's `keepMouseGrab`, while the steal itself happens on a
+  later move once the drag threshold is crossed. Binding it to “the list is moving” therefore buys nothing: the list is
+  idle at press time, the move still gets stolen, and the click arrives as `onCanceled`. A conditional
+  (`preventStealing: list.moving || list.flicking`) behaves exactly like `false`; measured on-device, a 12 px/288 ms
+  drifting tap produces `clicked` with `true` and `canceled` with either `false` or the conditional.
+- A press *during a coast* cannot be recovered at all: `QQuickFlickable::filterMouseEvent()` consumes the press whenever
+  `stealThisEvent` is true (`filtered = stealThisEvent || …`), and `keepMouseGrab` only prevents the grab transfer, not
+  the filtering.
+- What `preventStealing: true` really buys is tolerance for a tap that drifts (the pen's screen is 170 px with a
+  stylus-like touch, so taps jitter): the price is that the widget cannot start a list drag. Needing both means
+  forwarding the movement by hand (`preventStealing: true` + `onPositionChanged` adjusting `contentY`), not a boolean.
 
 Confirm every step with a screenshot. `evtest /dev/input/eventN` prints a device's capabilities and events, which
 isolates “device created but the app ignores it” from “wrong coordinates”. Remove `/tmp/injector` when done.

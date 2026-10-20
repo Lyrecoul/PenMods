@@ -22,6 +22,8 @@ $I longtap ui 160 107              # 600ms 长按
 $I hold  ui 160 107 3000           # 按住 3s（可在这期间截图，比如看长按倍速徽标）
 $I swipe ui 300 107 20 107         # 横向拖动（滚列表 / 拖动跳转）
 $I flicktap ui 160 150 160 60 160 90 60   # 先甩动再点：60ms 后在滑行中的列表上点击
+$I type "write a long article"    # 逐字符输入（小写字母/数字/空格/.-_,），走第二个 uinput 键盘设备
+$I bksp 12                         # 退格 n 次
 $I tap   ui 20 15 --lefthand       # 左手模式坐标
 ```
 
@@ -30,6 +32,11 @@ $I tap   ui 20 15 --lefthand       # 左手模式坐标
 `<delay_ms>` 是松手到按下之间的等待，用来落在惯性滑行窗口内（默认 `flickDeceleration` 下，一次
 90px/288ms 的甩动滑行约 200ms，所以 60ms 仍落在 `flicking` 里，300ms 已经结束）。实测结论见
 AGENTS.md「Touch injection」一节。
+
+`type` / `bksp` 用的是一个独立的 uinput 键盘设备（`EV_KEY` 位 + `KEY_A..Z` / 数字 / 空格 / 退格），
+Weston 会像接上真键盘一样把它加进 seat，所以可以直接往 QML `TextInput` 里打字，不用去点 31 次屏幕键盘。
+注意 app 的输入页默认可能处于拼音模式（`isPinyinMode`），那种模式下按键会进 Rime 变成候选词而不是
+字面文本；长按功能行第一个键（`abc`）可切换，切换后再 `type`。只支持小写 ASCII 子集。
 
 `/userdisk/` 是持久分区（`/tmp` 是 tmpfs，每次重启都会丢），所以放在这里重启后还能用；
 调试完记得删掉。每次注入的坐标都要用截图确认（`weston-screenshooter` 需要 Weston 带 `--debug`）。

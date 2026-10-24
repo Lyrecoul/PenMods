@@ -77,7 +77,7 @@ jobs:
           pacman -S --noconfirm \
             base-devel git zig wget curl \
             python3 ninja cmake nasm libxcrypt lame opencc qt5-tools qt5-base \
-            unzip perl
+            unzip perl openssl python-certifi
 
       - name: 安装 aarch64-linux-gnu 工具链
         run: |
@@ -94,6 +94,15 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      # 内嵌 CA 包没有任何吊销检查（issue #18）：黑名单里的根或 hash 与 PEM 错位时直接失败；
+      # certifi 跟 Mozilla 最快，比对只报 warning，提示该跑 scripts/update_ca_bundle.sh 了。
+      - name: 校验内嵌 CA 证书包
+        run: |
+          sh scripts/update_ca_bundle.sh --check \
+            "$(python3 -c 'import certifi; print(certifi.where())')" 2> ca-check.log || { cat ca-check.log; exit 1; }
+          cat ca-check.log
+          sed -n 's/^warning: /::warning title=CA bundle::/p' ca-check.log
 
       - name: 缓存 Qt 5.15.2
         id: cache-qt

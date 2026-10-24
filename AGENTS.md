@@ -172,6 +172,18 @@ Bundle maintenance:
   writes `$(builddir)/config/CaBundleData.h` (`kCaBundlePem`, `kCaBundleHashes[]`, `kCaBundleCount`, ~182 KB). The
   generator asserts `#hashes == #certificates`; it lives inside `on_config` because xmake 3.x gives the `xmake.lua`
   main chunk neither `io` nor `import`, and target scripts run in a sandbox that cannot see main-chunk globals.
+- **When to refresh:** whenever Mozilla ships a new NSS root store, and immediately after a CA incident — update the
+  host's `ca-certificates` first (the script reads the host bundle). The embedded store has **no revocation checking**
+  (no CRL, no OCSP, no OneCRL/CRLSet), so a compromised CA is only blocked once its root leaves this bundle. Issue #18:
+  the 2026-10-18 snapshot still carried the emSign roots NSS 3.131.1 removed on 2026-10-20 (`emSign ECC Root CA - G3`
+  issued the eight intermediates whose private keys went public); the refresh from NSS 3.132 dropped 121 → 118.
+- `resource/certs/distrusted.sha256` is a blocklist of root SHA-256 fingerprints: regeneration refuses a source that
+  contains one, so a lagging host package (or an old device `roots.pem`) cannot reintroduce it. Add an entry for every
+  root distrusted after an incident. `scripts/update_ca_bundle.sh --check [ref.pem]` validates the committed files
+  (hash per certificate *by position*, blocklist) and, given a reference such as certifi's `cacert.pem`, warns about
+  shipped roots the reference no longer has; CI runs it with certifi before the build.
+- **Never delete PEM blocks by hand.** The hashes are matched by position, so the count check still passes while every
+  later certificate lands under the wrong `<hash>.0` and the store fails silently. Always regenerate.
 - **Do not pre-compress it.** Raw PEM in `.rodata` costs +181,603 bytes of `libPenMods.so` (+108 KiB in the OTA zip,
   because zip deflates the `.so` anyway — a zlib blob saves the same zip bytes but is incompressible itself) and its
   pages stay file-backed and evictable. A zlib blob would save ~75 KiB of mapping while turning the inflated 182 KiB

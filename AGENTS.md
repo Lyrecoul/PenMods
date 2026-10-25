@@ -783,6 +783,11 @@ the 320×170 UI. If `weston-screenshooter` reports a protocol error, the unit wa
 `/etc/init.d/S50launcher`, add `--debug` to the `weston ...` command (~line 96), reboot (or restart Weston), and
 restore the file when done.
 
+When editing the launcher is not acceptable, PenMods itself carries a fallback that needs no `--debug` and no sector
+write: `adb shell touch /tmp/penmods_shot` grabs the next frame from the host `QQuickView` within a second into
+`/tmp/penmods_shot-<n>.png`, appending the outcome (or the failure reason) to `/tmp/penmods_shot.log`. The image is
+already the 320×170 logical UI, so no rotation is needed. See `doc/SCREENSHOT_CHANNEL.md`.
+
 ### Touch injection (for UI navigation)
 
 Driving the UI over ADB needs a `/dev/uinput` device. Two findings on the tested unit:

@@ -734,6 +734,31 @@ git push origin main
 git push origin vX.Y.Z
 ```
 
+### Side artifacts the OTA zip does not carry
+
+Three Release-page files are **not** inside `update_vX.Y.Z.zip` and must be attached by hand. CI never publishes them:
+`PENMODS_WITH_PLAYER=1` is required to build the player at all, and the workflow only uploads a 7-day artifact.
+
+| Asset | Source | Republish when |
+|---|---|---|
+| `ffmpegplayer-plugin.zip` | `build/<plat>/<arch>/<mode>/qml/FFmpegPlayer/` after `xmake build ffmpegplayerplugin` | anything under `external/ffmpeg-player/` changed (`git log Vprev..Vnew -- external/ffmpeg-player`) |
+| `mathjax-server.zip` | `mathjax-server/build.sh` output | `mathjax-server/` changed or `RENDERER_VERSION` was bumped |
+| `penmods-ppocr.sh` | `tools/ppocr-backend/` one-file installer | `tools/ppocr-backend/` changed |
+
+- **Never carry a "same as the previous release, no need to re-download" row over by assumption.** V2.5.5 shipped the
+  #16 zoom-filter fix (a new `downsamplingEnabled` property on the plugin) while its notes still claimed the player zip
+  was unchanged from 2.4.1, so an OTA-only device paired the new page (`ExternalPlayerEmbedded.qml` binds
+  `downsamplingEnabled: !zoomMode`) with the old plugin: `Cannot assign to non-existent property`, and the fix
+  silently did nothing. Diff against the previously published zip instead — `strings -a <plugin>.so | grep -c
+  downsamplingEnabled` is enough.
+- Keep the archive layout `FFmpegPlayer/{libffmpegplayerplugin.so,qmldir}` at the zip root (users unzip straight into
+  `/userdata/PenMods/qml/`), and stage release inputs in `build/release-<version>/` next to the OTA files so the next
+  release can rebuild the same set.
+- A player build is safe to publish only when it came from a *single* pass: every object under
+  `build/.objs/ffmpegplayerplugin` carries the same timestamp and nothing under `external/` is newer than the linked
+  `.so`. An incremental build can mix v-old/v-new objects and aborts the host at `VideoPlayer` construction (see
+  `### Embedded FFmpeg Player`).
+
 ### 4. Verify through the CDN
 
 jsDelivr caches **versioned paths permanently (~1 year)**, so the manifest and the artifact can lag a push by seconds

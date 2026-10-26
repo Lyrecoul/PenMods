@@ -172,3 +172,169 @@ app 已经把裁切行缩到 ~48 px 再交给我们,所以 `target_h=48` 表示"
   形近字错误(`深人`/`深入`、`赁`/`凭`)有望改善;
 - **运行时开关**:用 dlopen 转发回厂商引擎看似可行,但存在符号 interposition 递归风险,暂不做;
   现在的开关方式就是 `deploy.sh on/off`。
+
+---
+
+## 8. 多行扫描「漏句子」诊断（2026-10-26，issue #22-2）
+
+用户报告「多行扫描漏句子非常严重」。先确认链路，再判断丢在哪一层；**不要**把所有扫描图拼起来重新 OCR
+（延迟/内存都不可接受）。
+
+### 8.1 多行链路（反汇编 `binary/YoudaoDictPen` 确认）
+
+```
+YCapture::OCR_capture()                       每帧 camera_get_frame → ydstitch_push_rawdata_new()
+  └─ YCapture::lines_OCR(int,int)             单行：一行扫一次
+     YCapture::paragraphs_OCR(int,int)        多行整段：循环 OCR_capture() → ydstitch_get_ocr_result()
+        每轮把新文本 append 到 YCapture+0x88（含行尾 '-' 合并）；最后发一次
+        YCapture::ocrComplete(text, int)      ← 多行在这一层已经是「整段文本」
+          │ (queued, libstdc++ ABI)
+          ▼
+YSystemBase::onOcrComplete(std::string const&, int)
+  └─ YSystemBase::onScanFinish(QString const&, int)
+       scanType==0: 结果 = 新文本（替换）
+       scanType!=0: 结果 = StrUtils::joinString(上次基串, 新文本)（追加）
+       → ocrCompletedResultChanged()
+          ▼
+QML systemBase.ocrCompletedResult → YScanWordsResultLoader 逐字显示 / entryResult() 查询
+```
+
+`onScanStart()` 清空显示串，`onStopContinueScan()` 清空追加基串。PenMods 在普通查词流程里对这些
+slot 是 pass-through（仅 `inputPageShowing`/`autoSendScan` 时拦截）。所以词典多行流程里 PenMods 唯一
+会改文本的地方是 `QueryTweaks::entryResult` 的小写/空格折叠（不删句）。
+
+因此「漏句」只可能发生在：①原厂帧拼接/行切分；②`yocr_recognize` 逐行识别；③`paragraphs_OCR`
+把结果发布给 `ocrComplete` 之前（尾部行还没识别完/被中断）；④PenMods 拦截路径（AI 快速发送）；
+⑤QML 显示/查询。
+
+### 8.2 PP-OCR 的延迟结构（`/userdisk/ppocr_shim.log` 实测，484 次识别）
+
+原厂 OCR 线程对同一行会**反复识别逐渐变宽的裁切图**（帧拼接越长，裁切越宽），最后取最宽那次：
+
+```
+68x40 229ms → 138x46 360ms → 358x47 654ms → 416x46 658ms → 731x47 1483ms → 1371x48 2079ms
+```
+
+按「同一行、宽度单调增长」把 484 次识别归并成 160 个行终稿：
+
+| 指标 | 数值 |
+|---|---|
+| 行终稿（最宽裁切）识别耗时 | 86.7 s（160 次） |
+| 被后续更宽裁切取代的中间识别耗时 | 111.0 s（324 次） |
+| 中间识别占比 | **56.2%**（全量日志；单次多行会话实测 38.4%，见 §8.6/8.7） |
+
+单行总耗时常见 2–4.5 s，6 行长英文段落约 27 s；厂商引擎约 0.25 s/次，同样的重复识别在厂商引擎下
+只花约 1/8 时间。**这是多行场景下 PP-OCR 与厂商引擎差距最大的地方，也是「尾部行在扫描收尾前来不及
+识别」的主要嫌疑**（厂商 OCR 线程等待结果时，`paragraphs_OCR` 的发布时机/`yocr_set_running_interrupt(1)`
+会让未完成的行被丢弃或留在队列里；single-line 不受影响）。
+
+注意：以上只是根因假设，必须用真机扫描 + 下面第 8.4 节的逐层日志确认；**不要在未确认前改识别算法**。
+
+### 8.3 已加入的可观测性（PenMods 侧，只读、不改变行为）
+
+`src/tweaker/KeyBoard.cpp` 增加 `[ScanDiag]` 日志，每次扫描按 session 序号串起所有层：
+
+| 日志事件 | 层 |
+|---|---|
+| `onScanStart` | 手势开始 + `continueScan/inputPageShowing/autoSendScan/vendorScanType` |
+| `onScanning`（debug） | 多帧拼接过程中的实时文本（每帧变化一条） |
+| `onOcrComplete(PRE-JOIN)` | `YCapture` 交给 `YSystemBase` 的原始文本（多行 = 整段） |
+| `onScanFinish(RAW)` / `(POST-MERGE)` | 合并前 / 合并后（后者就是 QML 显示/查询的文本） |
+| `onContinueScan` / `onStopContinueScan` | 原厂连续扫描追加/清空追加基串 |
+| `ocrCompletedResultChanged(DISPLAY)` | 显示文本变更（被拦截时也记一条 `SUPPRESSED`） |
+| `showDictPage(DISPLAY)` | 词典页实际拿到的文本（最终显示长度） |
+
+每条都带 `len / utf8 / lines / newlines / blanks / preview`，足够判断「原厂原始文本 → 合并文本 →
+显示文本」在哪一步少了句子。日志在发布构建里也可用（`info` 级；只有逐帧的 `onScanning` 是 `debug`）。
+
+`tools/ppocr-backend/regression/` 提供配套工具：
+
+- `gen_samples.py`：生成 6 张可打印多行样张（单行/多行中文/中英混合/行尾标点+空行/重复句/连续扫描），
+  打印步骤见 `build/diag/scan/USER-SCANS.md`；
+- `collect.sh`：采集 `DictPen_*.log` + `ppocr_shim.log` + 配置快照（PP-OCR 开关、`target_h`、
+  `continuescan`、`auto_send_scan`）+ 结果页截图；
+- `analyze_scan_diag.py`：按 session 对齐两份日志，输出「shim 识别 / 合并后 / 显示」逐行命中表和
+  **最后一次识别完成时刻 vs 扫描收尾时刻**（正值 = 尾部滞后）。
+
+### 8.4 判定规则与实验设计
+
+- 基线：当前配置（PP-OCR 开、`target_h=48`、`continuescan=true`、`auto_send_scan=true`）；
+- 差分：`penmods-ppocr.sh disable`（或删 `/userdisk/Qtlib/libyocr.so`）+ 重启 app，用厂商引擎重复同样样张。
+  两次都跑同一组样张，才能把「原厂固有问题」和「PP-OCR 引入的问题」分开；
+- 判定：`shim识别 ✓ / 合并后 ✗` → 丢在原厂发布层（闭源，只能给可观测性/降级）；
+  `合并后 ✓ / 显示 ✗` → 丢在 PenMods/QML（可修）；`尾部滞后 > 0` 且缺最后几行 → 识别慢于扫描收尾。
+
+### 8.5 不能破坏的约束
+
+- 仍然只替换 `yocr_recognize` 这一层；`SegLine`/`seg_middle_line`/检测模型不动；
+- OpenCV ROI 必须按 `step.p[0]` 取（非连续 Mat）、通道数按 `cn-1` 解析；
+- 网络输出多出的 space 类别必须保留（否则英文粘词）；
+- 不改 `target_h` 默认语义（48 = 不再二次缩放）；
+- 任何「跳过/降速中间裁切识别」的优化必须用同一组样张验证**最终文本不退化**，并且默认关闭、
+  由文件开关显式启用后才实验，不能直接替换现有行为。
+
+### 8.6 真机 12 步回归结果与根因判定（2026-10-26）
+
+在 YDP02X（Exam_V0，firmware 2.1.2，PenMods 诊断构建）上按 `build/diag/scan/USER-SCANS.md`
+跑了 6 张样张，日志与报告见 `build/diag/scan/report.md`（574 次 shim 识别、28 个手势、6 段完整发布）。
+
+| 段 | 样张 | 手势 | 最终文本 | 逐手势结果是否都进了最终文本 | 结论 |
+|---|---|---|---|---|---|
+| 1 | S0 单行 | 1 | 17 字完整 | 1/1 | 无丢失 |
+| 2 | S1 多行中文 | 5 | 5 句完整 | 5/5 | 无丢失（4 个换行被 joinString 去掉属设计行为） |
+| 3 | S2 中英混合 | 4 | 4 行完整 | 4/4 | 第 1 遍最后一行句末 `.` 在 OCR 层就没识别到；第 2 遍正常 |
+| 4 | S3 行尾标点+空行 | 4 | 4 个非空行完整 | 4/4 | 空行后没有丢行 |
+| 5 | S4 重复句 | 10 | 整段出现两遍 | 10/10 | 用户两次扫同一张纸（都在 2s 窗口内）→ 厂商累加、**无去重**；第 2 遍 PP-OCR 有 2 处错字 |
+| 6 | S2 重复扫描 | 4 | 4 行完整 | 4/4 | 无丢失 |
+
+**结论：这一轮词典多行流程没有任何一层丢句。** PenMods 在普通查词多行流程里是 pass-through，
+逐层日志（原厂 `=>OCR Result` → `onOcrComplete` → `onScanFinish(POST-MERGE)` → `showDictPage`）
+全部闭环。
+
+**「漏句子」的最可能机制（待 differential 确认）**：厂商多行继续扫描要求「抬笔后 <2 s 内开始下一行」
+才累加；实测 PP-OCR 每行结果在抬笔后 **1.4–2.9 s** 才出现，本轮回访用户手势间隔只有 0.6–1.0 s，
+所以都成功累加。普通用户会**看到文字出现后再扫下一行**（间隔 >2 s），窗口过期后厂商结束当前段落、
+下一行另起新查询，结果页只剩后几行 —— 表现就是「多行漏句子非常严重」。厂商引擎约 0.25 s/行，
+用户不会等，所以不触发。验证步骤见 `build/diag/scan/USER-SCANS-2.md`（慢节奏 A/B + 厂商引擎差分）。
+
+### 8.7 shim 侧可做的延迟优化（默认关闭，需样张回归验证）
+
+先量化清楚（同一轮真机日志）：**最终裁切图的识别占 61.6% 时间（28.3 s / 45.9 s）**，这部分是识别
+精度所在，不能省；被更宽裁切取代的中间裁切图占 38.4%，其中宽度 <300px 的占 27%。也就是说：
+**shim 侧最多只能把每行延迟降 ~20–38%，无法追平厂商引擎的 0.25 s**，所以它是缓解手段，不是根治手段。
+
+已实现的可选开关（默认关闭 = 与原行为逐字节一致）：
+
+```sh
+# 打开：同一行连续变宽、且裁切宽度 <=300px 的中间裁切图用 24px 高度识别
+adb shell 'echo 24 > /userdisk/ppocr_adaptive_h'      # 16..48，删除即关闭
+adb shell 'rm -f /userdisk/ppocr_adaptive_h'          # 回滚
+```
+
+约束与依据：
+
+- 只对「同一行、宽度严格变宽、距上次调用 <4 s、宽度 ≤300px、宽度至少增加 20%」的调用降档；
+  实测该会话所有**最终**裁切图宽度 ≥308px，因此最终文本的裁切图仍按 `target_h` 全质量识别；
+- 无法在线区分「异常短的最终行」与中间裁切图 → 所以是**用户显式开启的实验开关**，不是默认行为；
+- 每次降档都会在 `/userdisk/ppocr_shim.log` 写 `adaptive: ...` 和 `recognize[adaptive]: ...`，
+  便于统计命中次数与实际节省；
+- 验证方法：用 `tools/ppocr-backend/regression/` 的 6 张样张分别在开关关闭/开启下扫描，最终文本必须
+  与 ground truth（`samples.json`）逐行一致；再在真实书页上抽 5 页对比。开关关闭时不改变任何现有行为。
+
+**更省事、无代码风险的降级方案**（推荐普通用户）：
+
+| 方案 | 命令/入口 | 效果 |
+|---|---|---|
+| 关「精度优先」（target_h=32） | 设置 → 实验性功能 → 识别精度优先 关；或 `adb shell 'echo 32 > /userdisk/ppocr_target_h'` | 每行约减半延迟，密集中文可能丢笔画 |
+| 多行场景不用 PP-OCR | 设置里关闭，或 `adb shell 'rm -f /userdisk/Qtlib/libyocr.so'` + 重启 app | 多行翻译恢复正常（单行精度让位） |
+| 完全卸载 | `sh /userdisk/penmods-ppocr.sh remove` | 回厂商引擎 |
+
+部署/回滚（shim 改动只影响实验后端，不参与 xmake 主构建）：
+
+```sh
+cd tools/ppocr-backend
+sh scripts/build.sh              # -> build/libyocr.so
+sh scripts/deploy.sh on 48       # 原子替换 + loader 预检 + 重启 app
+sh scripts/deploy.sh off         # 回滚到厂商引擎并重启
+sh scripts/deploy.sh status      # 确认当前加载的是 shim 还是厂商库
+```

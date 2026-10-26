@@ -28,6 +28,7 @@
 using json = nlohmann::json;
 
 #include "common/service/Logger.h"
+#include "shell/ShellCommandPolicy.h"
 
 namespace mod::chatbot {
 
@@ -112,6 +113,8 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
     Q_PROPERTY(bool tavilyConfigured READ getTavilyConfigured NOTIFY tavilyConfigChanged)
 
     Q_PROPERTY(bool shellToolEnabled READ getShellToolEnabled WRITE setShellToolEnabled NOTIFY shellToolConfigChanged)
+    // off | confirm | automatic；旧 shellToolEnabled 仍兼容（true 映射为 confirm，绝不自动开启 automatic）
+    Q_PROPERTY(QString shellMode READ getShellMode WRITE setShellMode NOTIFY shellToolConfigChanged)
 
     Q_PROPERTY(
         bool mathRenderEnabled READ getMathRenderEnabled WRITE setMathRenderEnabled NOTIFY mathRenderConfigChanged
@@ -151,6 +154,9 @@ public:
     Q_INVOKABLE void    denyShellCommand(const QString& toolCallId);
     Q_INVOKABLE QString getShellToolConfig();
     Q_INVOKABLE void    setShellToolConfig(const QString& configJson);
+    // 命令结构审计（confirm 对话框用，不执行）。返回 JSON：
+    // {ok,error,summary,commands[],warnings[],features[],mode,allowed,needsConfirm,decisionCode,reason,policyVersion}
+    Q_INVOKABLE QString auditShellCommand(const QString& command);
 
     // 多会话管理
     Q_INVOKABLE QString      getSessions();
@@ -162,12 +168,22 @@ public:
     Q_INVOKABLE QVariantList getSessionMessages(const QString& sessionId);
 
     // 多模型管理
+    // getModels()/getActiveModel() 保留给旧版外部资源库（libPenModsResources.so 可能先于主库被替换）：
+    // 返回归一化后的数据，但**不含完整 apiKey**（只给 apiKeySet 标志），旧 QML 保存时未提交 apiKey
+    // 不会清空已存密钥。新 QML 用 getModelSummaries()/getModelDetail()。
     Q_INVOKABLE QString getModels();
+    Q_INVOKABLE QString getModelSummaries();
+    Q_INVOKABLE QString getModelDetail(const QString& modelId);
     Q_INVOKABLE bool    addModel(const QString& modelJson);
     Q_INVOKABLE bool    removeModel(const QString& modelId);
     Q_INVOKABLE bool    setActiveModel(const QString& modelId);
     Q_INVOKABLE QString getActiveModel();
+    Q_INVOKABLE QString getActiveModelId();
     Q_INVOKABLE bool    loadModelsFile();
+    // 最近一次 addModel/removeModel/setActiveModel 的失败原因（可直接展示，不含密钥）
+    Q_INVOKABLE QString getLastModelError();
+    // 自定义请求体参数（extraParams）允许的最大字节数，供 QML 预校验/提示
+    Q_INVOKABLE int extraParamsMaxBytes();
 
     // 多提示词管理
     Q_INVOKABLE QString getPrompts();
@@ -224,8 +240,10 @@ public:
     bool getTavilyConfigured() const { return !m_searchTavilyKey.isEmpty(); }
     void setTavilyEnabled(bool v);
 
-    bool getShellToolEnabled() const { return m_shellToolEnabled; }
-    void setShellToolEnabled(bool v);
+    bool    getShellToolEnabled() const { return m_shellToolEnabled; }
+    QString getShellMode() const { return QString::fromLatin1(mod::shell::toolModeName(m_shellMode)); }
+    void    setShellToolEnabled(bool v);
+    void    setShellMode(const QString& mode);
 
     bool    getMathRenderEnabled() const { return m_mathRenderEnabled; }
     QString getMathServerPath() const { return m_mathServerPath; }
@@ -401,9 +419,20 @@ private:
     // 多模型管理
     json m_modelsData;
 
+    // 归一化后每个模型的提示（extraParams 非法/超长等），不写入配置文件，只在编辑页提示用
+    QHash<QString, QString> m_modelWarnings;
+    QString                 m_lastModelError;
+
+    static constexpr int kModelExtraParamsMaxBytes = 4096;      // extraParams 序列化后上限
+    static constexpr int kModelJsonMaxBytes        = 32 * 1024; // addModel 入参 JSON 上限
+
     void initModels();
     void saveModels();
-    void applyModelConfig(const json& modelObj);
+    void normalizeModelsData();
+    json normalizeModel(const json& raw, const std::string& fallbackId, std::string& warning) const;
+    // extraParams 统一入口：只接受 JSON object；兼容旧版本存成字符串（含二次 stringify 的嵌套字符串）
+    static bool parseExtraParams(const json& raw, json& out, std::string& error);
+    void        applyModelConfig(const json& modelObj);
 
     // 多提示词管理
     json m_promptsData;
@@ -440,34 +469,74 @@ private:
     void                 requestDeepSeekSearch(const QString& toolCallId, const QString& query, int attempt);
 
     // Shell tool
-    bool        m_shellToolEnabled   = false;
-    int         m_shellToolTimeoutMs = 10000;
-    int         m_shellToolMaxOutput = 4096;
-    QStringList m_shellToolBlocklist;
+    mod::shell::ToolMode m_shellMode              = mod::shell::ToolMode::Off;
+    bool                 m_shellToolEnabled       = false; // 派生：mode != off（兼容旧 QML 属性）
+    int                  m_shellToolTimeoutMs     = 10000;
+    int                  m_shellToolMaxOutput     = 4096;
+    int                  m_shellToolMaxConcurrent = 2;
+    int                  m_shellToolQueueLimit    = 8;
+    QStringList          m_shellToolBlocklist;
 
+    // confirm 模式：等待用户确认（不占用并发槽位）
     struct PendingShellExec {
         QString toolCallId;
         QString command;
     };
     QVector<PendingShellExec> m_pendingShellExecs;
 
+    // 已批准（confirm）或策略放行（automatic）：等待并发槽位/正在执行的请求
+    struct QueuedShellExec {
+        QString toolCallId;
+        QString command;
+        QString sessionId;
+        QString batchId;
+        int     requestSeq = 0;
+        bool    automatic  = false;
+    };
+    QVector<QueuedShellExec> m_queuedShellExecs;
+
     // 异步 Shell 执行追踪（避免主线程阻塞）
     struct ActiveShellExec {
         QString   toolCallId;
         QString   command;
-        QProcess* process = nullptr;
-        QTimer*   timer   = nullptr;
-        QString   stdoutBuf;
-        QString   stderrBuf;
+        QString   sessionId;
+        QString   batchId;
+        int       requestSeq = 0;
+        bool      automatic  = false;
+        int       timeoutMs  = 0;
+        QProcess* process    = nullptr;
+        QTimer*   timer      = nullptr;
+        // 边读边截断，避免子进程输出无上限占用内存
+        QString stdoutBuf;
+        QString stderrBuf;
+        int     stdoutBytes     = 0;
+        int     stderrBytes     = 0;
+        bool    stdoutTruncated = false;
+        bool    stderrTruncated = false;
     };
     QMap<QString, ActiveShellExec*> m_activeShellExecs;
 
-    void    initShellTool();
-    bool    isCommandBlocked(const QString& command);
-    void    executeShellCommand(const QString& toolCallId, const QString& command);
+    void                     initShellTool();
+    void                     persistShellToolConfig();
+    mod::shell::PolicyConfig shellPolicyConfig() const;
+    void                     enqueueShellExec(const QueuedShellExec& request);
+    void                     startShellProcess(const QueuedShellExec& request);
+    void                     drainShellQueue();
+    bool                     isShellRequestCurrent(const QueuedShellExec& request) const;
+    void                     finalizeShellExec(
+        const QString& toolCallId,
+        const QString& resultText,
+        bool           success,
+        const QString& summary,
+        int            exitCode
+    );
+    QString shellResultText(const ActiveShellExec& exec) const;
     void    cleanupShellExec(const QString& toolCallId);
     void    abortPendingShellExecs(const QString& reason);
-    QString truncateOutput(const QString& output, int maxBytes);
+    // 模式切到 off 时，取消所有待确认/排队/执行中的命令，并给模型明确结果
+    void abortAllShellExecs(const QString& reason);
+    // 模式切走 automatic 时，取消排队/正在执行的 automatic 命令并给模型明确结果
+    void abortAutomaticShellExecs(const QString& reason);
 
     // 数学公式渲染
     bool    m_mathRenderEnabled = false;

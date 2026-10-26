@@ -6,6 +6,8 @@
 
 #include "mod/Mod.h"
 
+#include "chatbot/Backend.h"
+
 #include "mod/Config.h"
 #include "wallpaper/WallpaperManager.h"
 
@@ -22,13 +24,37 @@
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
+#include <QProcess>
 #include <QProcessEnvironment>
 #include <QQmlContext>
 #include <QQuickView>
+#include <QTimer>
 
 #include <unistd.h>
 
 namespace mod {
+
+namespace {
+
+// 应用重启：延迟给 QML 的提示/toast 留出显示时间；看门狗用于命令没能结束进程时复位状态。
+constexpr int kApplicationRestartDelayMs    = 1500;
+constexpr int kApplicationRestartWatchdogMs = 10000;
+
+// guardian 的崩溃升级阈值：/usr/bin/runDictPen 在应用退出后维护 /tmp/app_crash_count
+// （连续两次退出间隔 < 15s 时 +1，否则清零），> 5 时执行 update_engine --misc=clear + reboot
+// 并进入 recovery。留 2 次余量，计数偏高时拒绝本次软重启。
+constexpr int kApplicationRestartCrashCountLimit = 3;
+
+/// /tmp/app_crash_count 不存在或内容非法（老固件/其它机型）时返回 -1，调用方降级为不阻断。
+int readApplicationCrashCount() {
+    const std::string raw = readFile("/tmp/app_crash_count");
+    if (raw.empty()) return -1;
+    bool      ok    = false;
+    const int count = QString::fromStdString(raw).trimmed().toInt(&ok);
+    return ok && count >= 0 ? count : -1;
+}
+
+} // namespace
 
 Mod::Mod() {
 
@@ -93,6 +119,66 @@ void Mod::uninstall() {
 void Mod::softReboot() { std::terminate(); }
 
 void Mod::reboot() { exec("sync && reboot"); }
+
+bool Mod::isApplicationRestartPending() const { return mApplicationRestartPending; }
+
+bool Mod::restartApplication() {
+    if (mApplicationRestartPending) {
+        // 防重复点击：C++ 侧状态标志，QML 侧同时禁用入口（applicationRestartPending）。
+        showToast("应用正在重新启动，请稍候", "#E9900C");
+        return false;
+    }
+
+    const int crashCount = readApplicationCrashCount();
+    spdlog::info("Application restart requested by user (app_crash_count={})", crashCount);
+    if (crashCount < 0) {
+        // 文件不存在/不可读（老固件或其它机型）时降级为不阻断，只记日志。
+        spdlog::info("app_crash_count is not readable, application restart guard degraded");
+    } else if (crashCount >= kApplicationRestartCrashCountLimit) {
+        spdlog::warn("Refusing application restart: app_crash_count={}", crashCount);
+        showToast("近期重启过于频繁，请关机后再开机", "#E9900C");
+        return false;
+    }
+
+    // 先落盘再重启。Config 的每次 write() 都是立即整文件写盘，没有需要额外 flush 的缓存；
+    // AI 助手在每次消息变更后已用 QSaveFile 原子写 sessions.json，cancelRequest() 会把
+    // 正在流式输出的半截回答 persistPartialResponse() 并再次 saveSessions()，
+    // 同时终止在途请求，避免重启后旧回调把结果写进新进程的历史。
+    chatbot::ChatBot::getInstance().cancelRequest();
+
+    mApplicationRestartPending = true;
+    emit applicationRestartPendingChanged();
+
+    // 延迟执行：让 QML 的提示先显示出来，也避免在按钮回调里直接结束进程。
+    QTimer::singleShot(kApplicationRestartDelayMs, this, &Mod::_performApplicationRestart);
+    spdlog::info("Application restart scheduled in {} ms", kApplicationRestartDelayMs);
+    return true;
+}
+
+void Mod::_performApplicationRestart() {
+    // sync 必须在 kill 之前完成，而且 shell 不能随本进程一起死：QProcess::startDetached
+    // 启动的子进程会被 init 收养，本进程收到 SIGTERM 后命令仍会跑完。
+    const bool started = QProcess::startDetached("/bin/sh", QStringList{"-c", "sync; killall YoudaoDictPen"});
+    if (!started) {
+        spdlog::error("Failed to start application restart command: /bin/sh");
+        mApplicationRestartPending = false;
+        emit applicationRestartPendingChanged();
+        showToast("重启应用失败，请手动重启设备", "#E9900C");
+        return;
+    }
+
+    // pending 保持到进程真正被结束为止；如果 killall 没生效（进程名变化/命令失败），
+    // 看门狗复位状态并提示，避免 UI 永远停在“正在重启”。
+    QTimer::singleShot(kApplicationRestartWatchdogMs, this, &Mod::_onApplicationRestartWatchdog);
+}
+
+void Mod::_onApplicationRestartWatchdog() {
+    if (!mApplicationRestartPending) return;
+    spdlog::error("Application restart did not happen within {} ms", kApplicationRestartWatchdogMs);
+    mApplicationRestartPending = false;
+    emit applicationRestartPendingChanged();
+    showToast("重启应用失败，请手动重启设备", "#E9900C");
+}
 
 bool Mod::getVoiceChatEnabled() const { return mVoiceChatEnabled; }
 

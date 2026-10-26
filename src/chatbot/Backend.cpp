@@ -15,6 +15,7 @@
 #include "common/util/System.h"
 #include "mod/Config.h"
 #include "mod/Mod.h"
+#include "shell/ShellCommandPolicy.h"
 
 #include <QDateTime>
 #include <QDir>
@@ -28,6 +29,7 @@
 #include <QNetworkReply>
 #include <QPointer>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QQmlContext>
 #include <QRegularExpression>
 #include <QRunnable>
@@ -40,6 +42,14 @@
 
 #include <type_traits>
 #include <utility>
+
+#include <signal.h>
+#include <sys/types.h>
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <set>
 
 namespace mod::chatbot {
 namespace {
@@ -218,7 +228,7 @@ ChatBot::ChatBot()
 
     auto& config = mod::Config::getInstance();
     json  aiCfg  = config.read("ai");
-    if (!aiCfg.is_null()) {
+    if (aiCfg.is_object()) {
         m_isStreaming            = aiCfg.value("streaming", true);
         const QString renderMode = QString::fromStdString(aiCfg.value("bubble_render_mode", std::string("full")));
         if (renderMode == "full" || renderMode == "basic" || renderMode == "plain") m_bubbleRenderMode = renderMode;
@@ -259,24 +269,11 @@ ChatBot::ChatBot()
 }
 
 ChatBot::~ChatBot() {
-    // 清理所有正在执行的 shell 命令
-    for (auto it = m_activeShellExecs.constBegin(); it != m_activeShellExecs.constEnd(); ++it) {
-        auto* e = it.value();
-        if (e->timer) {
-            e->timer->stop();
-            e->timer->deleteLater();
-        }
-        if (e->process) {
-            e->process->disconnect(this);
-            if (e->process->state() != QProcess::NotRunning) {
-                e->process->kill();
-                e->process->waitForFinished(200);
-            }
-            e->process->deleteLater();
-        }
-        delete e;
-    }
-    m_activeShellExecs.clear();
+    // 清理排队/待确认/正在执行的 shell 命令；进程组 kill 在 cleanupShellExec 中处理。
+    m_pendingShellExecs.clear();
+    m_queuedShellExecs.clear();
+    const auto activeKeys = m_activeShellExecs.keys();
+    for (const auto& key : activeKeys) cleanupShellExec(key);
 }
 
 // -----------------------------------------------------------------------
@@ -288,7 +285,7 @@ void ChatBot::reloadConfig() {
     config.reload();
 
     json aiCfg = config.read("ai");
-    if (!aiCfg.is_null()) {
+    if (aiCfg.is_object()) {
         bool old      = m_isStreaming;
         m_isStreaming = aiCfg.value("streaming", true);
         if (old != m_isStreaming) emit isStreamingChanged();
@@ -325,7 +322,7 @@ void ChatBot::sanitizeConfig() {
     config.reload();
 
     json aiCfg = config.read("ai");
-    if (!aiCfg.is_null()) {
+    if (aiCfg.is_object()) {
         bool old      = m_isStreaming;
         m_isStreaming = aiCfg.value("streaming", true);
         if (old != m_isStreaming) emit isStreamingChanged();
@@ -3200,77 +3197,378 @@ void ChatBot::setProxyVisionPrompt(const QString& v) {
 // 多模型管理
 // -----------------------------------------------------------------------
 
+namespace {
+
+const char* kDefaultProxyVisionPrompt = "请详细描述这张图片的内容。如果图片中有文字，请完整转录。";
+
+bool containsKey(const json& obj, const char* key) { return obj.is_object() && obj.find(key) != obj.end(); }
+
+std::string readString(const json& obj, const char* key, const std::string& fallback = std::string()) {
+    if (!obj.is_object()) return fallback;
+    const auto it = obj.find(key);
+    if (it == obj.end() || !it->is_string()) return fallback;
+    return it->get<std::string>();
+}
+
+int readInt(const json& obj, const char* key, int fallback) {
+    if (!obj.is_object()) return fallback;
+    const auto it = obj.find(key);
+    if (it == obj.end()) return fallback;
+    if (it->is_number_integer()) return it->get<int>();
+    if (it->is_number_unsigned()) return static_cast<int>(it->get<unsigned>());
+    if (it->is_number_float()) return static_cast<int>(it->get<double>());
+    if (it->is_string()) {
+        try {
+            return std::stoi(it->get<std::string>());
+        } catch (...) {}
+    }
+    return fallback;
+}
+
+double readDouble(const json& obj, const char* key, double fallback) {
+    if (!obj.is_object()) return fallback;
+    const auto it = obj.find(key);
+    if (it == obj.end()) return fallback;
+    if (it->is_number()) return it->get<double>();
+    if (it->is_string()) {
+        try {
+            return std::stod(it->get<std::string>());
+        } catch (...) {}
+    }
+    return fallback;
+}
+
+bool readBool(const json& obj, const char* key, bool fallback) {
+    if (!obj.is_object()) return fallback;
+    const auto it = obj.find(key);
+    if (it == obj.end()) return fallback;
+    if (it->is_boolean()) return it->get<bool>();
+    if (it->is_number()) return it->get<double>() != 0.0;
+    if (it->is_string()) {
+        const std::string value = it->get<std::string>();
+        if (value == "true" || value == "1") return true;
+        if (value == "false" || value == "0" || value.empty()) return false;
+    }
+    return fallback;
+}
+
+std::string trimCopy(std::string value) {
+    const auto notSpace = [](unsigned char c) { return !std::isspace(c); };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), notSpace));
+    value.erase(std::find_if(value.rbegin(), value.rend(), notSpace).base(), value.end());
+    return value;
+}
+
+std::string slugifyModelId(const std::string& source) {
+    std::string out;
+    bool        lastDash = false;
+    for (unsigned char c : source) {
+        if (std::isalnum(c)) {
+            out.push_back(static_cast<char>(std::tolower(c)));
+            lastDash = false;
+        } else if (!out.empty() && !lastDash) {
+            out.push_back('-');
+            lastDash = true;
+        }
+    }
+    while (!out.empty() && out.back() == '-') out.pop_back();
+    if (out.empty()) out = "model";
+    return out;
+}
+
+// 新建模型的默认模板（id/name 由用户填写；其余字段给编辑页可直接使用的默认值）
+json emptyModelTemplate() {
+    json model;
+    model["id"]                      = "";
+    model["name"]                    = "";
+    model["provider"]                = "";
+    model["endpoint"]                = "";
+    model["apiKey"]                  = "";
+    model["modelId"]                 = "";
+    model["apiProtocol"]             = "chat_completions";
+    model["temperature"]             = 0.7;
+    model["maxContextSize"]          = 0;
+    model["reasoningEffort"]         = "";
+    model["nativeWebSearchEnabled"]  = false;
+    model["nativeWebSearchProvider"] = "auto";
+    model["capabilities"]            = json{
+        {"text",            true },
+        {"vision",          false},
+        {"audio",           false},
+        {"toolCall",        false},
+        {"reasoning",       false},
+        {"imageGeneration", false}
+    };
+    model["extraParams"]        = json::object();
+    model["proxyVisionModelId"] = "";
+    model["proxyVisionPrompt"]  = "";
+    return model;
+}
+
+} // namespace
+
+bool ChatBot::parseExtraParams(const json& raw, json& out, std::string& error) {
+    out = json::object();
+    error.clear();
+    if (raw.is_null()) return true;
+    if (raw.is_object()) {
+        if (static_cast<int>(raw.dump().size()) > kModelExtraParamsMaxBytes) {
+            error = "自定义请求体参数过大（上限 4096 字节）";
+            return false;
+        }
+        out = raw;
+        return true;
+    }
+    if (!raw.is_string()) {
+        error = "自定义请求体参数必须是 JSON object";
+        return false;
+    }
+
+    std::string text = raw.get<std::string>();
+    if (trimCopy(text).empty()) return true;
+    if (static_cast<int>(text.size()) > kModelExtraParamsMaxBytes * 8) {
+        error = "自定义请求体参数过大（上限 4096 字节）";
+        return false;
+    }
+
+    json parsed = json::parse(text, nullptr, false);
+    // 旧版本 QML 会 JSON.stringify 一个字符串字段、后端再 parse，于是配置里留下 string 套 string。
+    // 这里最多再拆一层；仍拆不出 object 就按非法处理（不静默改写用户数据）。
+    for (int depth = 0; depth < 1 && parsed.is_string(); ++depth)
+        parsed = json::parse(parsed.get<std::string>(), nullptr, false);
+
+    if (parsed.is_discarded() || !parsed.is_object()) {
+        error = "自定义请求体参数不是合法的 JSON object";
+        return false;
+    }
+    if (static_cast<int>(parsed.dump().size()) > kModelExtraParamsMaxBytes) {
+        error = "自定义请求体参数过大（上限 4096 字节）";
+        return false;
+    }
+    out = parsed;
+    return true;
+}
+
 void ChatBot::initModels() {
     json aiCfg = mod::Config::getInstance().read("ai");
+    if (!aiCfg.is_object()) aiCfg = json::object();
 
-    if (aiCfg.contains("models") && aiCfg["models"].is_array() && !aiCfg["models"].empty()) {
+    m_modelWarnings.clear();
+
+    const bool hasModels = aiCfg.contains("models") && aiCfg["models"].is_array() && !aiCfg["models"].empty();
+    m_modelsData         = json::object();
+    if (hasModels) {
         m_modelsData["models"]        = aiCfg["models"];
-        m_modelsData["activeModelId"] = aiCfg.value("activeModelId", "");
+        m_modelsData["activeModelId"] = readString(aiCfg, "activeModelId", "");
     } else {
         info("创建默认模型配置");
         json defaultModel;
-        defaultModel["id"]                 = m_model.toStdString();
-        defaultModel["name"]               = "DeepSeek V4.1 Flash";
-        defaultModel["provider"]           = "DeepSeek";
-        defaultModel["endpoint"]           = m_apiEndpoint.toStdString();
-        defaultModel["apiKey"]             = m_apiKey.toStdString();
-        defaultModel["modelId"]            = m_model.toStdString();
-        defaultModel["apiProtocol"]        = "chat_completions";
-        defaultModel["temperature"]        = m_temperature;
-        defaultModel["reasoningEffort"]    = "";
+        defaultModel["id"]                      = m_model.toStdString();
+        defaultModel["name"]                    = "DeepSeek V4.1 Flash";
+        defaultModel["provider"]                = "DeepSeek";
+        defaultModel["endpoint"]                = m_apiEndpoint.toStdString();
+        defaultModel["apiKey"]                  = m_apiKey.toStdString();
+        defaultModel["modelId"]                 = m_model.toStdString();
+        defaultModel["apiProtocol"]             = "chat_completions";
+        defaultModel["temperature"]             = m_temperature;
+        defaultModel["maxContextSize"]          = 0;
+        defaultModel["reasoningEffort"]         = "";
+        defaultModel["nativeWebSearchEnabled"]  = false;
+        defaultModel["nativeWebSearchProvider"] = "auto";
+        defaultModel["capabilities"]            = json{
+            {"text",            true },
+            {"vision",          false},
+            {"audio",           false},
+            {"toolCall",        false},
+            {"reasoning",       false},
+            {"imageGeneration", false}
+        };
         defaultModel["extraParams"]        = json::object();
         defaultModel["proxyVisionModelId"] = "";
-        defaultModel["proxyVisionPrompt"]  = "请详细描述这张图片的内容。如果图片中有文字，请完整转录。";
+        defaultModel["proxyVisionPrompt"]  = kDefaultProxyVisionPrompt;
         m_modelsData["models"]             = json::array({defaultModel});
         m_modelsData["activeModelId"]      = m_model.toStdString();
-        saveModels();
     }
 
-    if (m_modelsData.contains("activeModelId")) {
-        std::string activeId = m_modelsData["activeModelId"];
-        for (const auto& model : m_modelsData["models"]) {
-            if (model.contains("id") && model["id"] == activeId) {
-                applyModelConfig(model);
-                break;
-            }
+    normalizeModelsData();
+    if (!hasModels) saveModels();
+
+    const std::string activeId = readString(m_modelsData, "activeModelId", "");
+    for (const auto& model : m_modelsData["models"]) {
+        if (!activeId.empty() && readString(model, "id", "") == activeId) {
+            applyModelConfig(model);
+            break;
         }
     }
 }
 
 void ChatBot::saveModels() {
     json aiCfg = mod::Config::getInstance().read("ai");
-    if (aiCfg.is_null()) aiCfg = json::object();
-    aiCfg["models"]        = m_modelsData["models"];
-    aiCfg["activeModelId"] = m_modelsData.value("activeModelId", "");
+    if (!aiCfg.is_object()) aiCfg = json::object();
+    // 只写入归一化后的模型数据；编辑页临时字段在 normalizeModel 里已经剥离。
+    aiCfg["models"]        = m_modelsData.value("models", json::array());
+    aiCfg["activeModelId"] = readString(m_modelsData, "activeModelId", "");
     mod::Config::getInstance().write("ai", aiCfg);
 }
 
-void ChatBot::applyModelConfig(const json& modelObj) {
-    if (modelObj.contains("endpoint")) m_apiEndpoint = QString::fromStdString(modelObj["endpoint"]);
-    if (modelObj.contains("apiKey")) m_apiKey = QString::fromStdString(modelObj["apiKey"]);
-    if (modelObj.contains("modelId")) m_model = QString::fromStdString(modelObj["modelId"]);
-    m_apiProtocol = QString::fromStdString(modelObj.value("apiProtocol", "chat_completions"));
-    if (m_apiProtocol != "responses") m_apiProtocol = "chat_completions";
-    if (modelObj.contains("temperature") && modelObj["temperature"].is_number())
-        m_temperature = modelObj["temperature"];
-    if (modelObj.contains("extraParams") && modelObj["extraParams"].is_object())
-        m_extraParams = modelObj["extraParams"];
-    else m_extraParams = json::object();
+// 单个模型归一化：缺字段补默认、错类型转默认，并兼容旧格式（extraParams 字符串、
+// capabilities 缺失/字符串数组、旧 nativeWebSearch 键名等）。必须幂等。
+json ChatBot::normalizeModel(const json& raw, const std::string& fallbackId, std::string& warning) const {
+    warning.clear();
+    json out = raw.is_object() ? raw : json::object();
 
-    m_maxContextSize                          = modelObj.value("maxContextSize", 0);
-    m_reasoningEffort                         = QString::fromStdString(modelObj.value("reasoningEffort", ""));
+    // 编辑页/摘要接口用的临时字段，绝不能写回配置
+    for (const char* transient : {"isNew", "isActive", "apiKeySet", "normalizeWarning", "extraParamsError", "missing"})
+        out.erase(transient);
+
+    std::string id = readString(raw, "id", "");
+    if (id.empty()) id = fallbackId;
+    if (id.empty()) id = "model";
+    out["id"]       = id;
+    out["name"]     = readString(raw, "name", id);
+    out["provider"] = readString(raw, "provider", "");
+    out["endpoint"] = readString(raw, "endpoint", "");
+    out["modelId"]  = readString(raw, "modelId", "");
+    out["apiKey"]   = readString(raw, "apiKey", "");
+    out["apiProtocol"] =
+        readString(raw, "apiProtocol", "chat_completions") == "responses" ? "responses" : "chat_completions";
+
+    double temperature = readDouble(raw, "temperature", 0.7);
+    if (!std::isfinite(temperature)) temperature = 0.7;
+    out["temperature"] = std::max(0.0, std::min(2.0, temperature));
+
+    out["maxContextSize"] = std::max(0, readInt(raw, "maxContextSize", 0));
+
+    static const std::set<std::string> reasoningEfforts = {"none", "minimal", "low", "medium", "high", "xhigh"};
+    std::string                        effort           = readString(raw, "reasoningEffort", "");
+    if (reasoningEfforts.find(effort) == reasoningEfforts.end()) effort.clear();
+    out["reasoningEffort"] = effort;
+
+    // nativeWebSearch：新键优先，旧键名兼容
+    bool webSearchEnabled = readBool(raw, "nativeWebSearchEnabled", false);
+    if (!containsKey(raw, "nativeWebSearchEnabled") && containsKey(raw, "webSearchEnabled"))
+        webSearchEnabled = readBool(raw, "webSearchEnabled", false);
+    out["nativeWebSearchEnabled"] = webSearchEnabled;
+
+    static const std::set<std::string> webSearchProviders = {"auto", "openai", "xai", "compatible"};
+    std::string                        webSearchProvider  = readString(raw, "nativeWebSearchProvider", "auto");
+    if (webSearchProviders.find(webSearchProvider) == webSearchProviders.end()) {
+        const std::string legacy = readString(raw, "webSearchProvider", "");
+        webSearchProvider        = webSearchProviders.count(legacy) ? legacy : "auto";
+    }
+    out["nativeWebSearchProvider"] = webSearchProvider;
+
+    // capabilities：object（当前格式）/ 字符串数组（旧格式“支持的能力名列表”）/ 缺失
+    json caps = json::object();
+    if (containsKey(raw, "capabilities") && raw["capabilities"].is_object()) {
+        caps = raw["capabilities"];
+    } else if (containsKey(raw, "capabilities") && raw["capabilities"].is_array()) {
+        for (const auto& item : raw["capabilities"])
+            if (item.is_string()) caps[item.get<std::string>()] = true;
+    }
+    json capOut;
+    capOut["text"]            = readBool(caps, "text", true);
+    capOut["vision"]          = readBool(caps, "vision", false);
+    capOut["audio"]           = readBool(caps, "audio", false);
+    capOut["toolCall"]        = readBool(caps, "toolCall", false);
+    capOut["reasoning"]       = readBool(caps, "reasoning", false);
+    capOut["imageGeneration"] = readBool(caps, "imageGeneration", false);
+    // 未知能力字段原样保留（前向兼容）
+    for (auto it = caps.begin(); it != caps.end(); ++it)
+        if (!capOut.contains(it.key())) capOut[it.key()] = it.value();
+    out["capabilities"] = capOut;
+
+    json        extraParams;
+    std::string extraParamsError;
+    const json  rawExtra = containsKey(raw, "extraParams") ? raw["extraParams"] : json();
+    if (parseExtraParams(rawExtra, extraParams, extraParamsError)) {
+        out["extraParams"] = extraParams;
+    } else {
+        out["extraParams"] = json::object();
+        warning            = extraParamsError;
+    }
+
+    out["proxyVisionModelId"] = readString(raw, "proxyVisionModelId", "");
+    out["proxyVisionPrompt"]  = containsKey(raw, "proxyVisionPrompt") ? readString(raw, "proxyVisionPrompt", "")
+                                                                      : std::string(kDefaultProxyVisionPrompt);
+    return out;
+}
+
+void ChatBot::normalizeModelsData() {
+    m_modelWarnings.clear();
+    if (!m_modelsData.is_object()) m_modelsData = json::object();
+    if (!m_modelsData.contains("models") || !m_modelsData["models"].is_array()) m_modelsData["models"] = json::array();
+
+    json                  normalized = json::array();
+    std::set<std::string> usedIds;
+    int                   index = 0;
+    for (const auto& raw : m_modelsData["models"]) {
+        ++index;
+        if (!raw.is_object()) {
+            warn("忽略第 {} 个非对象的模型配置", index);
+            continue;
+        }
+        std::string       warning;
+        json              model  = normalizeModel(raw, "model-" + std::to_string(index), warning);
+        std::string       id     = readString(model, "id", "model-" + std::to_string(index));
+        const std::string base   = id;
+        int               suffix = 2;
+        while (usedIds.find(id) != usedIds.end()) id = base + "-" + std::to_string(suffix++);
+        model["id"] = id;
+        usedIds.insert(id);
+        if (!warning.empty()) {
+            m_modelWarnings.insert(QString::fromStdString(id), QString::fromStdString(warning));
+            warn("模型 {} 的自定义请求体参数已忽略：{}", id, warning);
+        }
+        normalized.push_back(model);
+    }
+    m_modelsData["models"] = normalized;
+
+    std::string activeId = readString(m_modelsData, "activeModelId", "");
+    bool        found    = false;
+    if (!activeId.empty()) {
+        for (const auto& model : normalized)
+            if (readString(model, "id", "") == activeId) found = true;
+    }
+    if (!found) activeId = normalized.empty() ? "" : readString(normalized[0], "id", "");
+    m_modelsData["activeModelId"] = activeId;
+}
+
+void ChatBot::applyModelConfig(const json& modelObj) {
+    m_apiEndpoint = QString::fromStdString(readString(modelObj, "endpoint", ""));
+    m_apiKey      = QString::fromStdString(readString(modelObj, "apiKey", ""));
+    m_model       = QString::fromStdString(readString(modelObj, "modelId", ""));
+    m_apiProtocol = QString::fromStdString(readString(modelObj, "apiProtocol", "chat_completions"));
+    if (m_apiProtocol != "responses") m_apiProtocol = "chat_completions";
+    m_temperature = readDouble(modelObj, "temperature", 0.7);
+    if (!std::isfinite(m_temperature)) m_temperature = 0.7;
+    m_temperature = std::max(0.0, std::min(2.0, m_temperature));
+
+    json        extraParams;
+    std::string extraParamsError;
+    if (!parseExtraParams(
+            containsKey(modelObj, "extraParams") ? modelObj["extraParams"] : json(),
+            extraParams,
+            extraParamsError
+        ))
+        extraParams = json::object();
+    m_extraParams = extraParams;
+
+    m_maxContextSize = std::max(0, readInt(modelObj, "maxContextSize", 0));
+
     static const QStringList reasoningEfforts = {"none", "minimal", "low", "medium", "high", "xhigh"};
+    m_reasoningEffort                         = QString::fromStdString(readString(modelObj, "reasoningEffort", ""));
     if (!reasoningEfforts.contains(m_reasoningEffort)) m_reasoningEffort.clear();
 
-    m_nativeWebSearchEnabled  = modelObj.value("nativeWebSearchEnabled", false);
-    m_nativeWebSearchProvider = QString::fromStdString(modelObj.value("nativeWebSearchProvider", "auto"));
-    static const QStringList nativeWebSearchProviders = {"auto", "openai", "xai", "compatible"};
-    if (!nativeWebSearchProviders.contains(m_nativeWebSearchProvider)) m_nativeWebSearchProvider = "auto";
+    m_nativeWebSearchEnabled                    = readBool(modelObj, "nativeWebSearchEnabled", false);
+    static const QStringList webSearchProviders = {"auto", "openai", "xai", "compatible"};
+    m_nativeWebSearchProvider = QString::fromStdString(readString(modelObj, "nativeWebSearchProvider", "auto"));
+    if (!webSearchProviders.contains(m_nativeWebSearchProvider)) m_nativeWebSearchProvider = "auto";
 
-    m_proxyVisionModelId = QString::fromStdString(modelObj.value("proxyVisionModelId", ""));
-    m_proxyVisionPrompt  = QString::fromStdString(
-        modelObj.value("proxyVisionPrompt", "请详细描述这张图片的内容。如果图片中有文字，请完整转录。")
-    );
+    const QString oldProxyVisionModelId = m_proxyVisionModelId;
+    const QString oldProxyVisionPrompt  = m_proxyVisionPrompt;
+    m_proxyVisionModelId                = QString::fromStdString(readString(modelObj, "proxyVisionModelId", ""));
+    m_proxyVisionPrompt = QString::fromStdString(readString(modelObj, "proxyVisionPrompt", kDefaultProxyVisionPrompt));
 
     m_capText            = true;
     m_capVision          = false;
@@ -3278,104 +3576,217 @@ void ChatBot::applyModelConfig(const json& modelObj) {
     m_capToolCall        = false;
     m_capReasoning       = false;
     m_capImageGeneration = false;
-    if (modelObj.contains("capabilities") && modelObj["capabilities"].is_object()) {
+    if (containsKey(modelObj, "capabilities") && modelObj["capabilities"].is_object()) {
         const auto& cap      = modelObj["capabilities"];
-        m_capText            = cap.value("text", true);
-        m_capVision          = cap.value("vision", false);
-        m_capAudio           = cap.value("audio", false);
-        m_capToolCall        = cap.value("toolCall", false);
-        m_capReasoning       = cap.value("reasoning", false);
-        m_capImageGeneration = cap.value("imageGeneration", false);
+        m_capText            = readBool(cap, "text", true);
+        m_capVision          = readBool(cap, "vision", false);
+        m_capAudio           = readBool(cap, "audio", false);
+        m_capToolCall        = readBool(cap, "toolCall", false);
+        m_capReasoning       = readBool(cap, "reasoning", false);
+        m_capImageGeneration = readBool(cap, "imageGeneration", false);
     }
     emit activeModelCapabilitiesChanged();
+    if (oldProxyVisionModelId != m_proxyVisionModelId || oldProxyVisionPrompt != m_proxyVisionPrompt)
+        emit proxyVisionSettingsChanged();
 }
 
-QString ChatBot::getModels() { return QString::fromStdString(m_modelsData.dump(2)); }
+QString ChatBot::getModels() {
+    const std::string activeId = readString(m_modelsData, "activeModelId", "");
+    json              out      = json::object();
+    json              list     = json::array();
+    for (const auto& model : m_modelsData.value("models", json::array())) {
+        json copy = model;
+        copy.erase("apiKey"); // 旧资源库同样拿不到完整密钥；保存时未提交 apiKey 不会清空已存值
+        copy["apiKeySet"] = !readString(model, "apiKey", "").empty();
+        copy["isActive"]  = readString(model, "id", "") == activeId;
+        list.push_back(std::move(copy));
+    }
+    out["models"]        = list;
+    out["activeModelId"] = activeId;
+    return QString::fromStdString(out.dump(2));
+}
+
+QString ChatBot::getModelSummaries() {
+    // 列表页只需要的字段：不含 apiKey / extraParams / prompts，避免每次刷新序列化整份配置
+    const std::string activeId = readString(m_modelsData, "activeModelId", "");
+    const json        models   = m_modelsData.value("models", json::array());
+    json              out      = json::object();
+    json              list     = json::array();
+    for (const auto& model : models) {
+        const std::string id            = readString(model, "id", "");
+        json              capabilities  = json::object();
+        const json&       cap           = model["capabilities"];
+        capabilities["text"]            = readBool(cap, "text", true);
+        capabilities["vision"]          = readBool(cap, "vision", false);
+        capabilities["audio"]           = readBool(cap, "audio", false);
+        capabilities["toolCall"]        = readBool(cap, "toolCall", false);
+        capabilities["reasoning"]       = readBool(cap, "reasoning", false);
+        capabilities["imageGeneration"] = readBool(cap, "imageGeneration", false);
+        list.push_back(
+            json{
+                {"id", id},
+                {"name", readString(model, "name", id)},
+                {"provider", readString(model, "provider", "")},
+                {"modelId", readString(model, "modelId", "")},
+                {"endpoint", readString(model, "endpoint", "")},
+                {"apiProtocol", readString(model, "apiProtocol", "chat_completions")},
+                {"apiKeySet", !readString(model, "apiKey", "").empty()},
+                {"isActive", id == activeId},
+                {"hasWarning", m_modelWarnings.contains(QString::fromStdString(id))},
+                {"capabilities", capabilities},
+        }
+        );
+    }
+    out["models"]        = list;
+    out["activeModelId"] = activeId;
+    return QString::fromStdString(out.dump());
+}
+
+QString ChatBot::getModelDetail(const QString& modelId) {
+    json detail;
+    if (modelId.isEmpty()) {
+        detail = emptyModelTemplate();
+    } else {
+        const std::string id    = modelId.toStdString();
+        bool              found = false;
+        for (const auto& model : m_modelsData.value("models", json::array())) {
+            if (readString(model, "id", "") != id) continue;
+            detail = model;
+            found  = true;
+            break;
+        }
+        if (!found) {
+            // 页面打开期间模型被删掉：返回 missing 让 QML 关闭页面并刷新列表，而不是永远空白
+            detail            = emptyModelTemplate();
+            detail["id"]      = id;
+            detail["name"]    = id;
+            detail["missing"] = true;
+        }
+    }
+
+    const std::string id = readString(detail, "id", "");
+    detail["isNew"]      = modelId.isEmpty();
+    detail["isActive"] =
+        !modelId.isEmpty() && !detail.value("missing", false) && id == readString(m_modelsData, "activeModelId", "");
+    // 完整 apiKey 不交给 QML：编辑表单只需要知道“是否已配置”，保存时未提交 apiKey 就不会改动已存密钥
+    detail["apiKeySet"] = !readString(detail, "apiKey", "").empty();
+    detail.erase("apiKey");
+    if (!modelId.isEmpty() && m_modelWarnings.contains(modelId))
+        detail["normalizeWarning"] = m_modelWarnings.value(modelId).toStdString();
+    return QString::fromStdString(detail.dump(2));
+}
 
 bool ChatBot::addModel(const QString& modelJson) {
-    QJsonDocument doc = QJsonDocument::fromJson(modelJson.toUtf8());
-    if (!doc.isObject()) return false;
+    m_lastModelError.clear();
 
-    QJsonObject input    = doc.object();
-    std::string id       = input["id"].toString().toStdString();
-    std::string modelId  = input["modelId"].toString().toStdString();
-    std::string endpoint = input["endpoint"].toString().toStdString();
-
-    if (id.empty() || modelId.empty() || endpoint.empty()) {
-        warn("添加模型失败：缺少必填字段 (id, modelId, endpoint)");
+    const QByteArray payload = modelJson.toUtf8();
+    if (payload.size() > kModelJsonMaxBytes) {
+        m_lastModelError = QStringLiteral("模型配置过大（上限 32 KiB）");
+        warn("添加模型失败：入参 {} 字节，超过上限 {}", payload.size(), kModelJsonMaxBytes);
+        return false;
+    }
+    QJsonDocument doc = QJsonDocument::fromJson(payload);
+    if (!doc.isObject()) {
+        m_lastModelError = QStringLiteral("模型配置格式错误");
+        warn("添加模型失败：JSON 不是 object");
+        return false;
+    }
+    const json raw = json::parse(doc.toJson(QJsonDocument::Compact).toStdString(), nullptr, false);
+    if (!raw.is_object()) {
+        m_lastModelError = QStringLiteral("模型配置格式错误");
+        warn("添加模型失败：JSON 解析失败");
         return false;
     }
 
-    json newModel;
-    newModel["id"]                            = id;
-    newModel["name"]                          = input["name"].toString().toStdString();
-    newModel["provider"]                      = input["provider"].toString().toStdString();
-    newModel["endpoint"]                      = endpoint;
-    newModel["apiKey"]                        = input["apiKey"].toString().toStdString();
-    newModel["modelId"]                       = modelId;
-    QString apiProtocol                       = input["apiProtocol"].toString();
-    newModel["apiProtocol"]                   = apiProtocol == "responses" ? "responses" : "chat_completions";
-    newModel["temperature"]                   = input.contains("temperature") ? input["temperature"].toDouble() : 0.7;
-    newModel["maxContextSize"]                = input.contains("maxContextSize") ? input["maxContextSize"].toInt() : 0;
-    QString                  reasoningEffort  = input["reasoningEffort"].toString();
-    static const QStringList reasoningEfforts = {"none", "minimal", "low", "medium", "high", "xhigh"};
-    newModel["reasoningEffort"] =
-        reasoningEfforts.contains(reasoningEffort) ? reasoningEffort.toStdString() : std::string();
-    newModel["nativeWebSearchEnabled"]                = input["nativeWebSearchEnabled"].toBool(false);
-    QString                  nativeWebSearchProvider  = input["nativeWebSearchProvider"].toString("auto");
-    static const QStringList nativeWebSearchProviders = {"auto", "openai", "xai", "compatible"};
-    newModel["nativeWebSearchProvider"] =
-        nativeWebSearchProviders.contains(nativeWebSearchProvider) ? nativeWebSearchProvider.toStdString() : "auto";
+    auto& models = m_modelsData["models"];
+    if (!models.is_array()) models = json::array();
 
-    // capabilities
-    {
-        json cap;
-        cap["text"]            = true;
-        cap["vision"]          = false;
-        cap["audio"]           = false;
-        cap["toolCall"]        = false;
-        cap["reasoning"]       = false;
-        cap["imageGeneration"] = false;
-        if (input.contains("capabilities") && input["capabilities"].isObject()) {
-            const auto qcap = input["capabilities"].toObject();
-            if (qcap.contains("text")) cap["text"] = qcap["text"].toBool(true);
-            if (qcap.contains("vision")) cap["vision"] = qcap["vision"].toBool(false);
-            if (qcap.contains("audio")) cap["audio"] = qcap["audio"].toBool(false);
-            if (qcap.contains("toolCall")) cap["toolCall"] = qcap["toolCall"].toBool(false);
-            if (qcap.contains("reasoning")) cap["reasoning"] = qcap["reasoning"].toBool(false);
-            if (qcap.contains("imageGeneration")) cap["imageGeneration"] = qcap["imageGeneration"].toBool(false);
-        }
-        newModel["capabilities"] = cap;
-    }
-
-    // extraParams：接受字符串化的 JSON object
-    if (input.contains("extraParams") && !input["extraParams"].toString().isEmpty()) {
-        try {
-            newModel["extraParams"] = json::parse(input["extraParams"].toString().toStdString());
-        } catch (...) {
-            newModel["extraParams"] = json::object();
-        }
-    } else {
-        newModel["extraParams"] = json::object();
-    }
-
-    // proxyVision
-    newModel["proxyVisionModelId"] = input["proxyVisionModelId"].toString().toStdString();
-    newModel["proxyVisionPrompt"]  = input["proxyVisionPrompt"].toString().toStdString();
-
-    bool updated = false;
-    for (auto& model : m_modelsData["models"]) {
-        if (model["id"] == id) {
-            model   = newModel;
-            updated = true;
-            break;
+    const std::string requestedId = readString(raw, "id", "");
+    json*             existing    = nullptr;
+    if (!requestedId.empty()) {
+        for (auto& model : models) {
+            if (readString(model, "id", "") == requestedId) {
+                existing = &model;
+                break;
+            }
         }
     }
-    if (!updated) m_modelsData["models"].push_back(newModel);
+    const bool updating = existing != nullptr;
+
+    json merged = updating ? *existing : emptyModelTemplate();
+    if (!updating) {
+        const std::string baseId =
+            requestedId.empty() ? slugifyModelId(readString(raw, "name", "")) : slugifyModelId(requestedId);
+        const auto idTaken = [&models](const std::string& candidate) {
+            for (const auto& model : models)
+                if (readString(model, "id", "") == candidate) return true;
+            return false;
+        };
+        std::string unique = baseId;
+        int         suffix = 2;
+        while (idTaken(unique)) unique = baseId + "-" + std::to_string(suffix++);
+        merged["id"] = unique;
+    }
+
+    // 逐字段合并：只覆盖提交了的字段，未编辑字段保持原值（旧配置里的未知字段也原样保留）
+    if (containsKey(raw, "name")) merged["name"] = readString(raw, "name", "");
+    if (containsKey(raw, "provider")) merged["provider"] = readString(raw, "provider", "");
+    if (containsKey(raw, "endpoint")) merged["endpoint"] = readString(raw, "endpoint", "");
+    if (containsKey(raw, "modelId")) merged["modelId"] = readString(raw, "modelId", "");
+    if (containsKey(raw, "apiProtocol")) merged["apiProtocol"] = readString(raw, "apiProtocol", "chat_completions");
+    if (containsKey(raw, "temperature")) merged["temperature"] = readDouble(raw, "temperature", 0.7);
+    if (containsKey(raw, "maxContextSize")) merged["maxContextSize"] = readInt(raw, "maxContextSize", 0);
+    if (containsKey(raw, "reasoningEffort")) merged["reasoningEffort"] = readString(raw, "reasoningEffort", "");
+    if (containsKey(raw, "nativeWebSearchEnabled"))
+        merged["nativeWebSearchEnabled"] = readBool(raw, "nativeWebSearchEnabled", false);
+    if (containsKey(raw, "nativeWebSearchProvider"))
+        merged["nativeWebSearchProvider"] = readString(raw, "nativeWebSearchProvider", "auto");
+    if (containsKey(raw, "proxyVisionModelId"))
+        merged["proxyVisionModelId"] = readString(raw, "proxyVisionModelId", "");
+    if (containsKey(raw, "proxyVisionPrompt")) merged["proxyVisionPrompt"] = readString(raw, "proxyVisionPrompt", "");
+    if (containsKey(raw, "capabilities")) merged["capabilities"] = raw["capabilities"];
+    if (containsKey(raw, "apiKey")) {
+        const std::string key = readString(raw, "apiKey", "");
+        // 空字符串视为“不修改已存密钥”：旧资源库只能拿到脱敏数据；需要显式清空时传 clearApiKey=true
+        if (!key.empty() || !updating) merged["apiKey"] = key;
+    }
+    if (readBool(raw, "clearApiKey", false)) merged["apiKey"] = "";
+
+    if (containsKey(raw, "extraParams")) {
+        json        extraParams;
+        std::string extraParamsError;
+        if (!parseExtraParams(raw["extraParams"], extraParams, extraParamsError)) {
+            m_lastModelError = QString::fromStdString(extraParamsError);
+            warn("添加模型失败：{}", extraParamsError);
+            return false;
+        }
+        merged["extraParams"] = extraParams;
+    }
+
+    std::string       warning;
+    json              normalized = normalizeModel(merged, readString(merged, "id", "model"), warning);
+    const std::string modelId    = readString(normalized, "id", "");
+    if (readString(normalized, "name", "").empty()) {
+        m_lastModelError = QStringLiteral("模型名称不能为空");
+        return false;
+    }
+    if (readString(normalized, "endpoint", "").empty()) {
+        m_lastModelError = QStringLiteral("接口地址不能为空");
+        return false;
+    }
+    if (readString(normalized, "modelId", "").empty()) {
+        m_lastModelError = QStringLiteral("模型 ID 不能为空");
+        return false;
+    }
+    if (warning.empty()) m_modelWarnings.remove(QString::fromStdString(modelId));
+    else m_modelWarnings.insert(QString::fromStdString(modelId), QString::fromStdString(warning));
+
+    if (updating) *existing = normalized;
+    else models.push_back(normalized);
 
     // 若更新的是当前活动模型，立即重新应用配置
-    if (updated && m_modelsData.value("activeModelId", "") == id) {
-        applyModelConfig(newModel);
+    if (updating && readString(m_modelsData, "activeModelId", "") == modelId) {
+        applyModelConfig(normalized);
         emit apiEndpointChanged();
         emit apiKeyChanged();
         emit modelChanged();
@@ -3385,18 +3796,28 @@ bool ChatBot::addModel(const QString& modelJson) {
 
     saveModels();
     emit modelsChanged();
-    info("模型已{}: {}", updated ? "更新" : "添加", id);
+    info("模型已{}: {}", updating ? "更新" : "添加", modelId);
     return true;
 }
 
 bool ChatBot::removeModel(const QString& modelId) {
-    std::string id     = modelId.toStdString();
-    auto&       models = m_modelsData["models"];
+    m_lastModelError.clear();
+    const std::string id = modelId.toStdString();
+
+    auto& models = m_modelsData["models"];
+    if (!models.is_array()) {
+        m_lastModelError = QStringLiteral("模型列表不可用");
+        return false;
+    }
     for (auto it = models.begin(); it != models.end(); ++it) {
-        if ((*it)["id"] == id) {
-            models.erase(it);
-            if (m_modelsData["activeModelId"] == id && !models.empty()) {
-                m_modelsData["activeModelId"] = models[0]["id"];
+        if (!it->is_object() || readString(*it, "id", "") != id) continue;
+
+        models.erase(it);
+        m_modelWarnings.remove(modelId);
+        if (readString(m_modelsData, "activeModelId", "") == id) {
+            const std::string nextId      = models.empty() ? "" : readString(models[0], "id", "");
+            m_modelsData["activeModelId"] = nextId;
+            if (!models.empty()) {
                 applyModelConfig(models[0]);
                 emit apiEndpointChanged();
                 emit apiKeyChanged();
@@ -3404,57 +3825,67 @@ bool ChatBot::removeModel(const QString& modelId) {
                 emit apiProtocolChanged();
                 emit temperatureChanged();
             }
-            // 清理其他模型对被删除模型的视觉代理引用
-            for (auto& model : models) {
-                if (model.value("proxyVisionModelId", "") == id) model["proxyVisionModelId"] = "";
-            }
-            // 若当前活动模型的代理引用恰好是被删除的模型，通知 QML
-            if (m_proxyVisionModelId == modelId) {
-                m_proxyVisionModelId.clear();
-                emit proxyVisionSettingsChanged();
-            }
-            saveModels();
-            emit modelsChanged();
-            info("模型已删除: {}", id);
-            return true;
         }
+        // 清理其他模型对已删除模型的视觉代理引用
+        for (auto& model : models)
+            if (model.is_object() && readString(model, "proxyVisionModelId", "") == id)
+                model["proxyVisionModelId"] = "";
+        // 若当前活动模型的代理引用恰好是被删除的模型，通知 QML
+        if (m_proxyVisionModelId == modelId) {
+            m_proxyVisionModelId.clear();
+            emit proxyVisionSettingsChanged();
+        }
+        saveModels();
+        emit modelsChanged();
+        info("模型已删除: {}", id);
+        return true;
     }
+    m_lastModelError = QStringLiteral("未找到要删除的模型");
     warn("删除模型失败：未找到 id={}", id);
     return false;
 }
 
 bool ChatBot::setActiveModel(const QString& modelId) {
-    std::string id = modelId.toStdString();
+    m_lastModelError.clear();
+    const std::string id = modelId.toStdString();
     for (const auto& model : m_modelsData["models"]) {
-        if (model["id"] == id) {
-            m_modelsData["activeModelId"] = id;
-            applyModelConfig(model);
-            saveModels();
-            emit modelsChanged();
-            emit apiEndpointChanged();
-            emit apiKeyChanged();
-            emit modelChanged();
-            emit apiProtocolChanged();
-            emit temperatureChanged();
-            info("活动模型已切换为: {}", id);
-            return true;
-        }
+        if (!model.is_object() || readString(model, "id", "") != id) continue;
+
+        m_modelsData["activeModelId"] = id;
+        applyModelConfig(model);
+        saveModels();
+        emit modelsChanged();
+        emit apiEndpointChanged();
+        emit apiKeyChanged();
+        emit modelChanged();
+        emit apiProtocolChanged();
+        emit temperatureChanged();
+        info("活动模型已切换为: {}", id);
+        return true;
     }
+    m_lastModelError = QStringLiteral("未找到要切换的模型");
     warn("切换模型失败：未找到 id={}", id);
     return false;
 }
 
 QString ChatBot::getActiveModel() {
-    std::string activeId = m_modelsData.value("activeModelId", "");
-    for (const auto& model : m_modelsData["models"]) {
-        if (model["id"] == activeId) {
-            json result        = model;
-            result["isActive"] = true;
-            return QString::fromStdString(result.dump(2));
-        }
+    const std::string activeId = readString(m_modelsData, "activeModelId", "");
+    for (const auto& model : m_modelsData.value("models", json::array())) {
+        if (readString(model, "id", "") != activeId) continue;
+        json result = model;
+        result.erase("apiKey"); // 旧资源库只需要 id / 能力标志，不返回完整密钥
+        result["apiKeySet"] = !readString(model, "apiKey", "").empty();
+        result["isActive"]  = true;
+        return QString::fromStdString(result.dump(2));
     }
     return "{}";
 }
+
+QString ChatBot::getActiveModelId() { return QString::fromStdString(readString(m_modelsData, "activeModelId", "")); }
+
+QString ChatBot::getLastModelError() { return m_lastModelError; }
+
+int ChatBot::extraParamsMaxBytes() { return kModelExtraParamsMaxBytes; }
 
 bool ChatBot::loadModelsFile() {
     initModels();
@@ -3627,7 +4058,7 @@ bool ChatBot::switchSession(const QString& sessionId) {
 
     // 先收尾旧会话进行中的请求与工具调用
     if (!m_activeReplies.isEmpty() || !m_toolCallBatch.isEmpty() || !m_pendingShellExecs.isEmpty()
-        || !m_activeShellExecs.isEmpty()) {
+        || !m_activeShellExecs.isEmpty() || !m_queuedShellExecs.isEmpty()) {
         cancelRequest();
     }
 
@@ -3647,7 +4078,7 @@ QString ChatBot::createSession(const QString& title) {
     session.updatedAt = session.createdAt;
 
     if (!m_activeReplies.isEmpty() || !m_toolCallBatch.isEmpty() || !m_pendingShellExecs.isEmpty()
-        || !m_activeShellExecs.isEmpty()) {
+        || !m_activeShellExecs.isEmpty() || !m_queuedShellExecs.isEmpty()) {
         cancelRequest();
     }
 
@@ -3665,7 +4096,7 @@ bool ChatBot::deleteSession(const QString& sessionId) {
     // 删除当前会话前先收尾进行中的请求
     if (sessionId == m_currentSessionId
         && (!m_activeReplies.isEmpty() || !m_toolCallBatch.isEmpty() || !m_pendingShellExecs.isEmpty()
-            || !m_activeShellExecs.isEmpty())) {
+            || !m_activeShellExecs.isEmpty() || !m_queuedShellExecs.isEmpty())) {
         cancelRequest();
     }
 
@@ -3966,7 +4397,7 @@ void ChatBot::injectToolDefinitions(QJsonObject& requestBody) {
         }
     }
 
-    if (m_capToolCall && m_shellToolEnabled) {
+    if (m_capToolCall && m_shellMode != mod::shell::ToolMode::Off) {
         QJsonObject funcParam;
         funcParam["type"] = "object";
 
@@ -3981,10 +4412,18 @@ void ChatBot::injectToolDefinitions(QJsonObject& requestBody) {
         funcParam["required"]   = QJsonArray({"command"});
 
         QJsonObject func;
-        func["name"]        = "shell_exec";
-        func["description"] = "Execute a shell command on the user's Linux device. Requires user approval. "
-                              "Use for file operations, system queries, diagnostics, package management, etc.";
-        func["parameters"]  = funcParam;
+        func["name"] = "shell_exec";
+        if (m_shellMode == mod::shell::ToolMode::Automatic) {
+            func["description"] =
+                "Execute a shell command on the user's Linux device. Automatic mode only executes a strict "
+                "read-only web-fetch policy: curl (http/https public URLs only) piped into head/tail/grep/cut/tr/"
+                "sort/uniq/wc/cat reading stdin. Commands outside the policy are rejected. Use it to fetch web "
+                "pages after web_search; do not try file/*nix admin operations.";
+        } else {
+            func["description"] = "Execute a shell command on the user's Linux device. Requires user approval. "
+                                  "Use for file operations, system queries, diagnostics, package management, etc.";
+        }
+        func["parameters"] = funcParam;
 
         if (usesResponsesApi()) {
             func["type"] = "function";
@@ -4046,23 +4485,61 @@ void ChatBot::dispatchToolCalls(const QString& toolCallsJson) {
         const auto name = fn["name"].toString();
         const auto args = QJsonDocument::fromJson(fn["arguments"].toString().toUtf8());
         const bool search = name == "web_search" || name == "tavily_search" || name == "deepseek_search";
-        const bool shell = name == "shell_exec";
+        const bool shell    = name == "shell_exec";
         const auto argument = args.object().value(search ? "query" : "command");
-        QString failure;
+        QString    failure;
         if (invalidIds.contains(id) || !args.isObject() || !argument.isString()
-            || argument.toString().trimmed().isEmpty()) failure = "工具调用参数无效或不完整，本次没有执行。";
+            || argument.toString().trimmed().isEmpty())
+            failure = "工具调用参数无效或不完整，本次没有执行。";
         else if (!(search && searchToolAvailable()) && !(shell && m_capToolCall && m_shellToolEnabled))
             failure = "工具 " + name + " 当前不可用或未启用，本次没有执行。";
-        else if (shell && isCommandBlocked(argument.toString())) failure = "命令被安全策略拦截，本次没有执行。";
+        // Shell 命令一律先经过结构解析 + 策略判定（off 模式在上面已按“工具不可用”拦截）。
+        mod::shell::Decision shellDecision;
+        if (failure.isEmpty() && shell) {
+            shellDecision = mod::shell::evaluateCommand(argument.toString().toStdString(), shellPolicyConfig());
+            if (!shellDecision.allowed && !shellDecision.needsConfirm) {
+                failure = QString::fromStdString(shellDecision.reason);
+                warn(
+                    "Shell 策略拒绝 [{}], mode={}, code={}, reason={}",
+                    id.toStdString(),
+                    mod::shell::toolModeName(m_shellMode),
+                    mod::shell::decisionCodeName(shellDecision.code),
+                    shellDecision.reason
+                );
+            }
+        }
         if (!failure.isEmpty()) {
             updateTool(id, "error", failure, failure);
             submitToolResultBatched(id, name, failure);
             if (shell) emit shellCommandFinished(id, false, failure, fn["arguments"].toString());
         } else if (search) {
             executeWebSearch(id, argument.toString());
-        } else {
+        } else if (shellDecision.needsConfirm) {
+            // confirm 模式：交给用户确认（automatic 不会返回 needsConfirm）
             m_pendingShellExecs.append({id, argument.toString()});
             emit shellCommandPending(id, argument.toString());
+        } else {
+            // automatic：策略放行，直接入队；仍受并发/超时/输出上限/取消校验约束。
+            updateTool(
+                id,
+                "pending",
+                "自动执行（只读网页抓取）：" + QString::fromStdString(shellDecision.summary),
+                argument.toString()
+            );
+            QueuedShellExec request;
+            request.toolCallId = id;
+            request.command    = argument.toString();
+            request.sessionId  = m_currentSessionId;
+            request.batchId    = m_responseMessageId;
+            request.requestSeq = m_requestSeq;
+            request.automatic  = true;
+            info(
+                "Shell automatic 放行 [{}], code={}, summary={}",
+                id.toStdString(),
+                mod::shell::decisionCodeName(shellDecision.code),
+                shellDecision.summary
+            );
+            enqueueShellExec(request);
         }
     }
     // All unavailable calls still have results and a visible terminal state.
@@ -4309,66 +4786,269 @@ void ChatBot::requestDeepSeekSearch(const QString& toolCallId, const QString& qu
     });
 }
 
+
 // -----------------------------------------------------------------------
 // Shell Tool
 // -----------------------------------------------------------------------
 
+namespace {
+
+// 边读边截断：最多保留 cap 字节，其余读取后丢弃（QProcess 缓冲区仍会被 drain）。
+void appendShellOutput(QString& buffer, int& storedBytes, bool& truncated, int cap, const QByteArray& chunk) {
+    if (chunk.isEmpty()) return;
+    if (storedBytes >= cap) {
+        truncated = true;
+        return;
+    }
+    const int        remaining  = cap - storedBytes;
+    const QByteArray part       = chunk.size() <= remaining ? chunk : chunk.left(remaining);
+    buffer                     += QString::fromUtf8(part);
+    storedBytes                += part.size();
+    if (part.size() < chunk.size()) truncated = true;
+}
+
+int clampShellTimeoutMs(int value) {
+    if (value <= 0) return 0;
+    return std::min(value, 120 * 1000);
+}
+
+int clampShellMaxOutput(int value) {
+    if (value <= 0) return 4096;
+    return std::clamp(value, 256, 64 * 1024);
+}
+
+int clampShellConcurrent(int value) {
+    if (value <= 0) return 2;
+    return std::clamp(value, 1, 4);
+}
+
+QStringList defaultShellBlocklist() {
+    return QStringList{
+        "rm -rf /",
+        "rm -rf /*",
+        "mkfs",
+        "dd if=",
+        ":(){ :|:&",
+        "> /dev/sd",
+        "chmod -R 777 /",
+        "shutdown",
+        "reboot",
+        "init 0",
+        "init 6",
+        "halt",
+        "fdisk",
+        "mount -o remount"
+    };
+}
+
+// 配置读取 helper：缺失键、类型不匹配一律回退默认值；不使用 nlohmann 的 value()/at()
+// （旧配置缺少某个节时，value() 会抛异常把整个进程 abort）。
+bool shellJsonBool(const json& object, const char* key, bool fallback) {
+    if (!object.is_object()) return fallback;
+    const auto it = object.find(key);
+    if (it == object.end()) return fallback;
+    if (it->is_boolean()) return it->get<bool>();
+    if (it->is_number()) return it->get<double>() != 0.0;
+    if (it->is_string()) {
+        const std::string value = it->get<std::string>();
+        return value == "true" || value == "1";
+    }
+    return fallback;
+}
+
+int shellJsonInt(const json& object, const char* key, int fallback) {
+    if (!object.is_object()) return fallback;
+    const auto it = object.find(key);
+    if (it == object.end()) return fallback;
+    if (it->is_number_integer()) return it->get<int>();
+    if (it->is_number_unsigned()) return static_cast<int>(it->get<unsigned>());
+    if (it->is_number_float()) return static_cast<int>(it->get<double>());
+    if (it->is_string()) {
+        const std::string value = it->get<std::string>();
+        try {
+            return std::stoi(value);
+        } catch (...) {
+            return fallback;
+        }
+    }
+    return fallback;
+}
+
+} // namespace
+
 void ChatBot::initShellTool() {
     json aiCfg = mod::Config::getInstance().read("ai");
-    if (!aiCfg.contains("shell_tool") || !aiCfg["shell_tool"].is_object()) return;
 
-    const auto& st       = aiCfg["shell_tool"];
-    m_shellToolEnabled   = st.value("enabled", false);
-    m_shellToolTimeoutMs = st.value("timeout_ms", 10000);
-    m_shellToolMaxOutput = st.value("max_output_bytes", 4096);
+    // 旧配置/损坏配置可能没有 ai 节或 shell_tool 节：按 off 处理（fail closed），
+    // 全程不用 nlohmann value()/at()，避免缺节时抛异常导致进程 abort。
+    const auto failClosed = [this](const std::string& reason) {
+        const mod::shell::ToolMode previous = m_shellMode;
+        m_shellMode                         = mod::shell::ToolMode::Off;
+        m_shellToolEnabled                  = false;
+        m_shellToolTimeoutMs                = 10000;
+        m_shellToolMaxOutput                = 4096;
+        m_shellToolMaxConcurrent            = 2;
+        m_shellToolBlocklist                = defaultShellBlocklist();
+        if (previous != mod::shell::ToolMode::Off) abortAllShellExecs(QString::fromStdString(reason));
+        emit shellToolConfigChanged();
+        warn("{}", reason);
+    };
+    if (!aiCfg.is_object()) {
+        failClosed("Shell tool 配置缺失（ai 节不存在或格式错误），已按 off 处理");
+        return;
+    }
+    const auto sectionIt = aiCfg.find("shell_tool");
+    if (sectionIt == aiCfg.end() || !sectionIt->is_object()) {
+        failClosed("Shell tool 配置缺失（旧配置没有 shell_tool 节），已按 off 处理");
+        return;
+    }
+    const json& st = *sectionIt;
+
+    // mode 优先；缺失/非法时按旧 enabled 推导：true -> confirm（绝不自动开启 automatic）。
+    mod::shell::ToolMode mode     = mod::shell::ToolMode::Off;
+    bool                 haveMode = false;
+    const auto           modeIt   = st.find("mode");
+    if (modeIt != st.end() && modeIt->is_string()) {
+        haveMode = mod::shell::toolModeFromName(modeIt->get<std::string>(), mode);
+        if (!haveMode) warn("Shell tool mode 配置非法，按旧 enabled 兼容逻辑处理");
+    }
+    if (!haveMode) {
+        mode = shellJsonBool(st, "enabled", false) ? mod::shell::ToolMode::Confirm : mod::shell::ToolMode::Off;
+    }
+
+    const mod::shell::ToolMode previousMode = m_shellMode;
+    m_shellMode                             = mode;
+    m_shellToolEnabled                      = (mode != mod::shell::ToolMode::Off);
+    m_shellToolTimeoutMs                    = clampShellTimeoutMs(shellJsonInt(st, "timeout_ms", 10000));
+    m_shellToolMaxOutput                    = clampShellMaxOutput(shellJsonInt(st, "max_output_bytes", 4096));
+    m_shellToolMaxConcurrent                = clampShellConcurrent(shellJsonInt(st, "max_concurrent", 2));
 
     m_shellToolBlocklist.clear();
-    if (st.contains("blocklist") && st["blocklist"].is_array()) {
-        for (const auto& item : st["blocklist"]) {
+    const auto blocklistIt = st.find("blocklist");
+    if (blocklistIt != st.end() && blocklistIt->is_array()) {
+        for (const auto& item : *blocklistIt) {
             if (item.is_string()) m_shellToolBlocklist.append(QString::fromStdString(item.get<std::string>()));
         }
     } else {
-        m_shellToolBlocklist = QStringList{
-            "rm -rf /",
-            "rm -rf /*",
-            "mkfs",
-            "dd if=",
-            ":(){ :|:&",
-            "> /dev/sd",
-            "chmod -R 777 /",
-            "shutdown",
-            "reboot",
-            "init 0",
-            "init 6",
-            "halt",
-            "fdisk",
-            "mount -o remount"
-        };
+        m_shellToolBlocklist = defaultShellBlocklist();
     }
+
+    // 配置重载后模式可能变窄：取消不再允许的请求，避免用户以为已经关闭却继续执行。
+    if (previousMode != m_shellMode) {
+        if (m_shellMode == mod::shell::ToolMode::Off) {
+            abortAllShellExecs("Shell 工具已关闭，本次执行已取消");
+        } else if (previousMode == mod::shell::ToolMode::Automatic) {
+            abortAutomaticShellExecs("Shell 模式已切换，自动执行已取消");
+        }
+    }
+
     emit shellToolConfigChanged();
-    info("Shell tool 配置已加载, enabled={}", m_shellToolEnabled);
+    info(
+        "Shell tool 配置已加载, mode={}, timeout={}ms, max_output={}B, max_concurrent={}, blocklist={} 条",
+        mod::shell::toolModeName(m_shellMode),
+        m_shellToolTimeoutMs,
+        m_shellToolMaxOutput,
+        m_shellToolMaxConcurrent,
+        static_cast<int>(m_shellToolBlocklist.size())
+    );
+}
+
+void ChatBot::persistShellToolConfig() {
+    json aiCfg = mod::Config::getInstance().read("ai");
+    if (!aiCfg.is_object()) aiCfg = json::object();
+    const auto sectionIt = aiCfg.find("shell_tool");
+    if (sectionIt == aiCfg.end() || !sectionIt->is_object()) aiCfg["shell_tool"] = json::object();
+
+    json& shell               = aiCfg["shell_tool"];
+    shell["mode"]             = mod::shell::toolModeName(m_shellMode);
+    shell["enabled"]          = (m_shellMode != mod::shell::ToolMode::Off);
+    shell["timeout_ms"]       = m_shellToolTimeoutMs;
+    shell["max_output_bytes"] = m_shellToolMaxOutput;
+    shell["max_concurrent"]   = m_shellToolMaxConcurrent;
+    json bl                   = json::array();
+    for (const auto& pattern : m_shellToolBlocklist) bl.push_back(pattern.toStdString());
+    shell["blocklist"] = bl;
+    if (!mod::Config::getInstance().write("ai", aiCfg, true)) {
+        warn("Shell tool 配置写入失败（ai 配置节不可写），本次修改仅保留在内存中");
+    }
+}
+
+mod::shell::PolicyConfig ChatBot::shellPolicyConfig() const {
+    mod::shell::PolicyConfig config;
+    config.mode = m_shellMode;
+    config.blocklist.reserve(static_cast<std::size_t>(m_shellToolBlocklist.size()));
+    for (const auto& pattern : m_shellToolBlocklist) config.blocklist.push_back(pattern.toStdString());
+    return config;
+}
+
+QString ChatBot::auditShellCommand(const QString& command) {
+    const mod::shell::AuditReport report   = mod::shell::auditCommand(command.toStdString());
+    const mod::shell::Decision    decision = mod::shell::evaluateCommand(command.toStdString(), shellPolicyConfig());
+
+    auto toJsonArray = [](const std::vector<std::string>& values) {
+        QJsonArray array;
+        for (const auto& value : values) array.append(QString::fromStdString(value));
+        return array;
+    };
+
+    QJsonObject obj;
+    obj["policyVersion"] = QString::fromLatin1(mod::shell::policyVersion());
+    obj["mode"]          = getShellMode();
+    obj["ok"]            = report.ok;
+    obj["error"]         = QString::fromStdString(report.error);
+    obj["summary"]       = QString::fromStdString(report.summary);
+    obj["allowed"]       = decision.allowed;
+    obj["needsConfirm"]  = decision.needsConfirm;
+    obj["decisionCode"]  = QString::fromLatin1(mod::shell::decisionCodeName(decision.code));
+    obj["reason"]        = QString::fromStdString(decision.reason);
+    obj["commands"]      = toJsonArray(report.commands);
+    obj["warnings"]      = toJsonArray(report.warnings);
+    obj["features"]      = toJsonArray(report.features);
+    return QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
 }
 
 void ChatBot::setShellToolEnabled(bool v) {
-    if (m_shellToolEnabled == v) return;
-    m_shellToolEnabled = v;
+    // 旧接口只映射到 confirm：要 automatic 必须显式 setShellMode("automatic")。
+    setShellMode(v ? "confirm" : "off");
+}
 
-    json aiCfg = mod::Config::getInstance().read("ai");
-    if (aiCfg.is_null()) aiCfg = json::object();
-    if (!aiCfg.contains("shell_tool") || !aiCfg["shell_tool"].is_object()) aiCfg["shell_tool"] = json::object();
-    aiCfg["shell_tool"]["enabled"] = v;
-    mod::Config::getInstance().write("ai", aiCfg, true);
+void ChatBot::setShellMode(const QString& mode) {
+    mod::shell::ToolMode parsed = mod::shell::ToolMode::Off;
+    if (!mod::shell::toolModeFromName(mode.toStdString(), parsed)) {
+        warn("setShellMode: 非法模式 {}，已忽略", mode.toStdString());
+        return;
+    }
+    const mod::shell::ToolMode previous = m_shellMode;
+    if (previous == parsed) return;
+
+    m_shellMode        = parsed;
+    m_shellToolEnabled = (parsed != mod::shell::ToolMode::Off);
+    persistShellToolConfig();
+
+    if (parsed == mod::shell::ToolMode::Off) {
+        abortAllShellExecs("Shell 工具已关闭，本次执行已取消");
+    } else if (previous == mod::shell::ToolMode::Automatic) {
+        abortAutomaticShellExecs("Shell 模式已切换，自动执行已取消");
+    }
+
     emit shellToolConfigChanged();
+    info("Shell mode 已切换: {} -> {}", mod::shell::toolModeName(previous), mod::shell::toolModeName(parsed));
 }
 
 QString ChatBot::getShellToolConfig() {
     json obj;
+    obj["mode"]             = mod::shell::toolModeName(m_shellMode);
     obj["enabled"]          = m_shellToolEnabled;
     obj["timeout_ms"]       = m_shellToolTimeoutMs;
     obj["max_output_bytes"] = m_shellToolMaxOutput;
+    obj["max_concurrent"]   = m_shellToolMaxConcurrent;
+    obj["policy_version"]   = mod::shell::policyVersion();
     json bl                 = json::array();
-    for (const auto& s : m_shellToolBlocklist) bl.push_back(s.toStdString());
-    obj["blocklist"] = bl;
+    for (const auto& pattern : m_shellToolBlocklist) bl.push_back(pattern.toStdString());
+    obj["blocklist"]        = bl;
+    json automaticAllowlist = json::array();
+    for (const auto& name : mod::shell::automaticAllowedCommands()) automaticAllowlist.push_back(name);
+    obj["automatic_allowlist"] = automaticAllowlist;
     return QString::fromStdString(obj.dump(2));
 }
 
@@ -4376,52 +5056,61 @@ void ChatBot::setShellToolConfig(const QString& configJson) {
     QJsonDocument doc = QJsonDocument::fromJson(configJson.toUtf8());
     if (!doc.isObject()) return;
 
-    QJsonObject obj = doc.object();
-    if (obj.contains("enabled")) m_shellToolEnabled = obj["enabled"].toBool();
-    if (obj.contains("timeout_ms")) m_shellToolTimeoutMs = obj["timeout_ms"].toInt(10000);
-    if (obj.contains("max_output_bytes")) m_shellToolMaxOutput = obj["max_output_bytes"].toInt(4096);
+    const QJsonObject          obj      = doc.object();
+    const mod::shell::ToolMode previous = m_shellMode;
+
+    mod::shell::ToolMode newMode    = m_shellMode;
+    bool                 modeParsed = false;
+    if (obj.contains("mode") && obj["mode"].isString()) {
+        modeParsed = mod::shell::toolModeFromName(obj["mode"].toString().toStdString(), newMode);
+        if (!modeParsed) warn("setShellToolConfig: 非法 mode {}，保持原模式", obj["mode"].toString().toStdString());
+    } else if (obj.contains("enabled") && obj["enabled"].isBool()) {
+        // 旧版 QML 只提交 enabled：true 只映射到 confirm（安全回退）
+        newMode    = obj["enabled"].toBool() ? mod::shell::ToolMode::Confirm : mod::shell::ToolMode::Off;
+        modeParsed = true;
+    }
+    if (modeParsed) {
+        m_shellMode        = newMode;
+        m_shellToolEnabled = (newMode != mod::shell::ToolMode::Off);
+    }
+
+    if (obj.contains("timeout_ms")) m_shellToolTimeoutMs = clampShellTimeoutMs(obj["timeout_ms"].toInt(10000));
+    if (obj.contains("max_output_bytes")) {
+        m_shellToolMaxOutput = clampShellMaxOutput(obj["max_output_bytes"].toInt(4096));
+    }
+    if (obj.contains("max_concurrent")) m_shellToolMaxConcurrent = clampShellConcurrent(obj["max_concurrent"].toInt(2));
     if (obj.contains("blocklist") && obj["blocklist"].isArray()) {
         m_shellToolBlocklist.clear();
-        for (const auto& v : obj["blocklist"].toArray()) {
-            m_shellToolBlocklist.append(v.toString());
+        for (const auto& v : obj["blocklist"].toArray()) m_shellToolBlocklist.append(v.toString());
+    }
+
+    persistShellToolConfig();
+
+    if (previous != m_shellMode) {
+        if (m_shellMode == mod::shell::ToolMode::Off) {
+            abortAllShellExecs("Shell 工具已关闭，本次执行已取消");
+        } else if (previous == mod::shell::ToolMode::Automatic) {
+            abortAutomaticShellExecs("Shell 模式已切换，自动执行已取消");
         }
     }
 
-    json aiCfg = mod::Config::getInstance().read("ai");
-    if (aiCfg.is_null()) aiCfg = json::object();
-    if (!aiCfg.contains("shell_tool") || !aiCfg["shell_tool"].is_object()) aiCfg["shell_tool"] = json::object();
-    aiCfg["shell_tool"]["enabled"]          = m_shellToolEnabled;
-    aiCfg["shell_tool"]["timeout_ms"]       = m_shellToolTimeoutMs;
-    aiCfg["shell_tool"]["max_output_bytes"] = m_shellToolMaxOutput;
-    json bl                                 = json::array();
-    for (const auto& s : m_shellToolBlocklist) bl.push_back(s.toStdString());
-    aiCfg["shell_tool"]["blocklist"] = bl;
-    mod::Config::getInstance().write("ai", aiCfg, true);
     emit shellToolConfigChanged();
-    info("Shell tool 配置已保存");
-}
-
-bool ChatBot::isCommandBlocked(const QString& command) {
-    QString trimmed = command.trimmed();
-    for (const auto& pattern : m_shellToolBlocklist) {
-        if (trimmed.contains(pattern, Qt::CaseInsensitive)) return true;
-    }
-    return false;
-}
-
-QString ChatBot::truncateOutput(const QString& output, int maxBytes) {
-    if (output.toUtf8().size() <= maxBytes) return output;
-    QByteArray truncated = output.toUtf8().left(maxBytes);
-    return QString::fromUtf8(truncated) + "\n... [输出已截断]";
+    info("Shell tool 配置已保存, mode={}", mod::shell::toolModeName(m_shellMode));
 }
 
 void ChatBot::approveShellCommand(const QString& toolCallId) {
     for (int i = 0; i < m_pendingShellExecs.size(); ++i) {
-        if (m_pendingShellExecs[i].toolCallId == toolCallId) {
-            auto pending = m_pendingShellExecs.takeAt(i);
-            executeShellCommand(pending.toolCallId, pending.command);
-            return;
-        }
+        if (m_pendingShellExecs[i].toolCallId != toolCallId) continue;
+        const PendingShellExec pending = m_pendingShellExecs.takeAt(i);
+        QueuedShellExec        request;
+        request.toolCallId = pending.toolCallId;
+        request.command    = pending.command;
+        request.sessionId  = m_currentSessionId;
+        request.batchId    = m_responseMessageId;
+        request.requestSeq = m_requestSeq;
+        request.automatic  = false;
+        enqueueShellExec(request);
+        return;
     }
     warn("approveShellCommand: toolCallId 未找到: {}", toolCallId.toStdString());
 }
@@ -4440,123 +5129,191 @@ void ChatBot::denyShellCommand(const QString& toolCallId) {
     warn("denyShellCommand: toolCallId 未找到: {}", toolCallId.toStdString());
 }
 
-void ChatBot::executeShellCommand(const QString& toolCallId, const QString& command) {
-    // 如果该 toolCallId 已有活跃执行，先清理
-    if (m_activeShellExecs.contains(toolCallId)) {
-        warn("executeShellCommand: toolCallId {} 已有正在执行的命令，将被替换", toolCallId.toStdString());
-        cleanupShellExec(toolCallId);
+bool ChatBot::isShellRequestCurrent(const QueuedShellExec& request) const {
+    return request.requestSeq == m_requestSeq && request.sessionId == m_currentSessionId
+        && request.batchId == m_responseMessageId;
+}
+
+void ChatBot::enqueueShellExec(const QueuedShellExec& request) {
+    if (!isShellRequestCurrent(request)) {
+        info("Shell 请求已过期，未入队 [{}]", request.toolCallId.toStdString());
+        return;
+    }
+    if (m_activeShellExecs.size() >= m_shellToolMaxConcurrent) {
+        if (m_queuedShellExecs.size() >= m_shellToolQueueLimit) {
+            const QString reason = "Shell 并发/排队已满，命令未执行，请稍后重试";
+            updateTool(request.toolCallId, "error", reason, request.command);
+            submitToolResultBatched(request.toolCallId, "shell_exec", reason);
+            emit shellCommandFinished(request.toolCallId, false, reason, request.command);
+            warn("Shell 队列已满，拒绝 [{}]", request.toolCallId.toStdString());
+            return;
+        }
+        m_queuedShellExecs.append(request);
+        updateTool(request.toolCallId, "pending", "等待执行（并发限制）：" + request.command, request.command);
+        info("Shell 命令排队 [{}], queue={}", request.toolCallId.toStdString(), m_queuedShellExecs.size());
+        return;
+    }
+    startShellProcess(request);
+}
+
+void ChatBot::drainShellQueue() {
+    while (m_activeShellExecs.size() < m_shellToolMaxConcurrent && !m_queuedShellExecs.isEmpty()) {
+        const QueuedShellExec request = m_queuedShellExecs.takeFirst();
+        if (!isShellRequestCurrent(request)) {
+            info("Shell 排队请求已过期，丢弃 [{}]", request.toolCallId.toStdString());
+            continue;
+        }
+        startShellProcess(request);
+    }
+}
+
+void ChatBot::startShellProcess(const QueuedShellExec& request) {
+    if (!isShellRequestCurrent(request)) {
+        info("Shell 请求已过期，未启动 [{}]", request.toolCallId.toStdString());
+        return;
     }
 
-    info("启动异步 shell 命令: {}", command.toStdString());
-    emit shellCommandStarted(toolCallId, command);
-
     auto* exec       = new ActiveShellExec;
-    exec->toolCallId = toolCallId;
-    exec->command    = command;
-    exec->process    = new QProcess(this);
-    exec->process->setProgram("/bin/sh");
-    exec->process->setArguments({"-c", command});
+    exec->toolCallId = request.toolCallId;
+    exec->command    = request.command;
+    exec->sessionId  = request.sessionId;
+    exec->batchId    = request.batchId;
+    exec->requestSeq = request.requestSeq;
+    exec->automatic  = request.automatic;
+    // automatic 不得跳过超时：即使配置 timeout_ms=0，也给一个硬上限。
+    exec->timeoutMs = m_shellToolTimeoutMs > 0 ? m_shellToolTimeoutMs : (request.automatic ? 10000 : 0);
+    exec->process   = new QProcess(this);
+
+    // 用 setsid 让 /bin/sh 成为新进程组组长：超时/取消时可整组 kill，避免只杀 sh 留下 curl。
+    // Qt 5.15 没有 setChildProcessModifier，设备有 busybox setsid（/usr/bin/setsid）。
+    const bool useSetsid = QFile::exists("/usr/bin/setsid");
+    if (useSetsid) {
+        exec->process->setProgram("/usr/bin/setsid");
+        exec->process->setArguments({"/bin/sh", "-c", request.command});
+    } else {
+        exec->process->setProgram("/bin/sh");
+        exec->process->setArguments({"-c", request.command});
+    }
     exec->process->setProcessChannelMode(QProcess::SeparateChannels);
 
-    // 收集 stdout
-    connect(exec->process, &QProcess::readyReadStandardOutput, this, [this, toolCallId]() {
-        auto* e = m_activeShellExecs.value(toolCallId);
-        if (!e) return;
-        e->stdoutBuf += QString::fromUtf8(e->process->readAllStandardOutput());
-    });
+    // automatic：最小环境，避免继承代理/LD_*/ENV 等；confirm 保持旧行为（继承环境）。
+    if (request.automatic) {
+        QProcessEnvironment env;
+        env.insert("PATH", "/usr/bin:/bin:/sbin:/usr/sbin");
+        env.insert("HOME", "/nonexistent");
+        env.insert("CURL_HOME", "/nonexistent");
+        env.insert("TMPDIR", "/tmp");
+        env.insert("LC_ALL", "C");
+        env.insert("LANG", "C");
+        env.insert("SHELL", "/bin/sh");
+        exec->process->setProcessEnvironment(env);
+    }
 
-    // 收集 stderr
-    connect(exec->process, &QProcess::readyReadStandardError, this, [this, toolCallId]() {
-        auto* e = m_activeShellExecs.value(toolCallId);
+    connect(exec->process, &QProcess::readyReadStandardOutput, this, [this, id = request.toolCallId]() {
+        auto* e = m_activeShellExecs.value(id);
         if (!e) return;
-        e->stderrBuf += QString::fromUtf8(e->process->readAllStandardError());
+        appendShellOutput(
+            e->stdoutBuf,
+            e->stdoutBytes,
+            e->stdoutTruncated,
+            m_shellToolMaxOutput,
+            e->process->readAllStandardOutput()
+        );
     });
-
-    // 进程正常结束
+    connect(exec->process, &QProcess::readyReadStandardError, this, [this, id = request.toolCallId]() {
+        auto* e = m_activeShellExecs.value(id);
+        if (!e) return;
+        const int cap = std::max(512, m_shellToolMaxOutput / 2);
+        appendShellOutput(e->stderrBuf, e->stderrBytes, e->stderrTruncated, cap, e->process->readAllStandardError());
+    });
     connect(
         exec->process,
         QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
         this,
-        [this, toolCallId](int exitCode, QProcess::ExitStatus status) {
-            auto* e = m_activeShellExecs.value(toolCallId);
+        [this, id = request.toolCallId](int exitCode, QProcess::ExitStatus status) {
+            auto* e = m_activeShellExecs.value(id);
             if (!e) return;
-
-            // 停掉超时定时器
-            if (e->timer) {
-                e->timer->stop();
-                e->timer->deleteLater();
-                e->timer = nullptr;
-            }
-
-            QString stdoutStr = truncateOutput(e->stdoutBuf, m_shellToolMaxOutput);
-            QString stderrStr = truncateOutput(e->stderrBuf, m_shellToolMaxOutput / 2);
-
-            bool    crashed = (status != QProcess::NormalExit);
-            QString resultText;
+            const bool crashed = (status != QProcess::NormalExit);
+            const bool success = (exitCode == 0 && !crashed);
+            QString    resultText;
             resultText += QString("Exit code: %1\n").arg(exitCode);
             if (crashed) resultText += "（进程崩溃）\n";
-            if (!stdoutStr.isEmpty()) resultText += "stdout:\n" + stdoutStr + "\n";
-            if (!stderrStr.isEmpty()) resultText += "stderr:\n" + stderrStr + "\n";
-
-            bool    success = (exitCode == 0 && !crashed);
-            QString summary = success ? "执行成功" : crashed ? "进程崩溃" : QString("退出码: %1").arg(exitCode);
-
-            QString cmd = e->command;
-            cleanupShellExec(toolCallId);
-
-            submitToolResultBatched(toolCallId, "shell_exec", resultText);
-            emit shellCommandFinished(toolCallId, success, summary, resultText);
-            info("Shell 命令完成 [{}], exitCode={}, crashed={}", cmd.toStdString(), exitCode, crashed);
+            resultText            += shellResultText(*e);
+            const QString summary  = success ? "执行成功" : crashed ? "进程崩溃" : QString("退出码: %1").arg(exitCode);
+            finalizeShellExec(id, resultText, success, summary, exitCode);
         }
     );
 
-    // 进程启动失败
-    connect(exec->process, &QProcess::errorOccurred, this, [this, toolCallId](QProcess::ProcessError err) {
+    connect(exec->process, &QProcess::errorOccurred, this, [this, id = request.toolCallId](QProcess::ProcessError err) {
         if (err != QProcess::FailedToStart) return;
-        auto* e = m_activeShellExecs.value(toolCallId);
+        auto* e = m_activeShellExecs.value(id);
         if (!e) return;
-
-        if (e->timer) {
-            e->timer->stop();
-            e->timer->deleteLater();
-            e->timer = nullptr;
-        }
-
-        QString cmd = e->command;
-        cleanupShellExec(toolCallId);
-
-        submitToolResultBatched(toolCallId, "shell_exec", "命令启动失败，请检查命令是否正确。");
-        emit shellCommandFinished(toolCallId, false, "启动失败", cmd);
-        warn("Shell 命令启动失败 [{}]", cmd.toStdString());
+        finalizeShellExec(id, "命令启动失败，请检查命令是否正确。", false, "启动失败", -1);
     });
 
-    // 超时定时器
-    if (m_shellToolTimeoutMs > 0) {
+    m_activeShellExecs.insert(request.toolCallId, exec);
+    emit shellCommandStarted(request.toolCallId, request.command);
+    info(
+        "Shell 命令启动 [{}], automatic={}, setsid={}",
+        request.toolCallId.toStdString(),
+        request.automatic,
+        useSetsid
+    );
+    exec->process->start();
+
+    if (exec->timeoutMs > 0) {
         exec->timer = new QTimer(this);
         exec->timer->setSingleShot(true);
-        connect(exec->timer, &QTimer::timeout, this, [this, toolCallId]() {
-            auto* e = m_activeShellExecs.value(toolCallId);
+        connect(exec->timer, &QTimer::timeout, this, [this, id = request.toolCallId]() {
+            auto* e = m_activeShellExecs.value(id);
             if (!e) return;
-
-            warn("Shell 命令超时 [{}]: {}", toolCallId.toStdString(), e->command.toStdString());
-
-            QString resultText  = QString("命令超时（%1ms）。\n").arg(m_shellToolTimeoutMs);
-            resultText         += "stdout:\n" + e->stdoutBuf + "\n";
-            resultText         += "stderr:\n" + e->stderrBuf + "\n";
-
-            QString cmd = e->command;
-            cleanupShellExec(toolCallId);
-
-            submitToolResultBatched(toolCallId, "shell_exec", resultText);
-            emit shellCommandFinished(toolCallId, false, "执行超时", resultText);
-            warn("Shell 命令超时（进程已结束） [{}]", cmd.toStdString());
+            warn("Shell 命令超时 [{}]: {}", id.toStdString(), e->command.toStdString());
+            QString resultText  = QString("命令超时（%1ms）。\n").arg(e->timeoutMs);
+            resultText         += shellResultText(*e);
+            finalizeShellExec(id, resultText, false, "执行超时", -1);
         });
-        exec->timer->start(m_shellToolTimeoutMs);
+        exec->timer->start(exec->timeoutMs);
+    }
+}
+
+QString ChatBot::shellResultText(const ActiveShellExec& exec) const {
+    QString out;
+    if (!exec.stdoutBuf.isEmpty()) out += "stdout:\n" + exec.stdoutBuf + "\n";
+    if (exec.stdoutTruncated) out += "... [stdout 输出已截断]\n";
+    if (!exec.stderrBuf.isEmpty()) out += "stderr:\n" + exec.stderrBuf + "\n";
+    if (exec.stderrTruncated) out += "... [stderr 输出已截断]\n";
+    return out;
+}
+
+void ChatBot::finalizeShellExec(
+    const QString& toolCallId,
+    const QString& resultText,
+    bool           success,
+    const QString& summary,
+    int            exitCode
+) {
+    auto* e = m_activeShellExecs.value(toolCallId);
+    if (!e) return;
+
+    // cleanup 会 delete e，必须先取出会话/批次/请求序号。
+    const QString session = e->sessionId;
+    const QString batch   = e->batchId;
+    const QString command = e->command;
+    const int     seq     = e->requestSeq;
+
+    cleanupShellExec(toolCallId);
+
+    const bool current = (seq == m_requestSeq && session == m_currentSessionId && batch == m_responseMessageId);
+    if (current) {
+        submitToolResultBatched(toolCallId, "shell_exec", resultText);
+        emit shellCommandFinished(toolCallId, success, summary, resultText);
+        info("Shell 命令完成 [{}], exitCode={}, success={}", command.toStdString(), exitCode, success);
+    } else {
+        // 取消/切会话/请求过期：绝不把结果提交给模型。
+        info("Shell 结果因取消/会话切换/请求过期被丢弃 [{}]", toolCallId.toStdString());
     }
 
-    m_activeShellExecs.insert(toolCallId, exec);
-    exec->process->start();
-    info("Shell 命令已在后台启动 [toolCallId={}]: {}", toolCallId.toStdString(), command.toStdString());
+    drainShellQueue();
 }
 
 void ChatBot::cleanupShellExec(const QString& toolCallId) {
@@ -4569,16 +5326,71 @@ void ChatBot::cleanupShellExec(const QString& toolCallId) {
     }
 
     if (e->process) {
+        const qint64 pid = e->process->processId();
         e->process->disconnect(this);
         if (e->process->state() != QProcess::NotRunning) {
+            // setsid 包装后 sh 是进程组组长：整组 kill，避免留下 curl/head 等子进程。
+            if (pid > 0) ::kill(static_cast<pid_t>(-pid), SIGKILL);
             e->process->kill();
-            e->process->waitForFinished(200);
+            e->process->waitForFinished(300);
         }
         e->process->deleteLater();
     }
 
     delete e;
 }
+
+void ChatBot::abortAllShellExecs(const QString& reason) {
+    const auto activeKeys = m_activeShellExecs.keys();
+    for (const auto& key : activeKeys) {
+        auto* e = m_activeShellExecs.value(key);
+        if (!e) continue;
+        const QString command = e->command;
+        cleanupShellExec(key);
+        updateTool(key, "cancelled", reason, command);
+        submitToolResultBatched(key, "shell_exec", reason);
+        emit shellCommandFinished(key, false, reason, command);
+    }
+
+    while (!m_pendingShellExecs.isEmpty()) {
+        const PendingShellExec pending = m_pendingShellExecs.takeFirst();
+        updateTool(pending.toolCallId, "cancelled", reason, pending.command);
+        submitToolResultBatched(pending.toolCallId, "shell_exec", reason);
+        emit shellCommandFinished(pending.toolCallId, false, reason, pending.command);
+    }
+
+    while (!m_queuedShellExecs.isEmpty()) {
+        const QueuedShellExec request = m_queuedShellExecs.takeFirst();
+        updateTool(request.toolCallId, "cancelled", reason, request.command);
+        submitToolResultBatched(request.toolCallId, "shell_exec", reason);
+        emit shellCommandFinished(request.toolCallId, false, reason, request.command);
+    }
+}
+
+void ChatBot::abortAutomaticShellExecs(const QString& reason) {
+    const auto activeKeys = m_activeShellExecs.keys();
+    for (const auto& key : activeKeys) {
+        auto* e = m_activeShellExecs.value(key);
+        if (!e || !e->automatic) continue;
+        const QString command = e->command;
+        cleanupShellExec(key);
+        updateTool(key, "cancelled", reason, command);
+        submitToolResultBatched(key, "shell_exec", reason);
+        emit shellCommandFinished(key, false, reason, command);
+    }
+
+    for (int i = m_queuedShellExecs.size() - 1; i >= 0; --i) {
+        if (!m_queuedShellExecs[i].automatic) continue;
+        const QueuedShellExec request = m_queuedShellExecs.takeAt(i);
+        updateTool(request.toolCallId, "cancelled", reason, request.command);
+        submitToolResultBatched(request.toolCallId, "shell_exec", reason);
+        emit shellCommandFinished(request.toolCallId, false, reason, request.command);
+    }
+
+    // 取消 automatic 的运行中命令后腾出了并发槽位：继续启动仍有效的 confirm 排队请求。
+    drainShellQueue();
+}
+
 
 // -----------------------------------------------------------------------
 // 数学公式渲染

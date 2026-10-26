@@ -380,6 +380,27 @@ void MediaSession::releaseFor(const QString& pluginId) {
     }
 }
 
+void MediaSession::requestTogglePlayPause() {
+    if (!mActive) {
+        return;
+    }
+    emit toggleRequested();
+}
+
+void MediaSession::requestNext() {
+    if (!mActive) {
+        return;
+    }
+    emit nextRequested();
+}
+
+void MediaSession::requestPrevious() {
+    if (!mActive) {
+        return;
+    }
+    emit prevRequested();
+}
+
 void MediaSession::setLyrics(const QString& mainLyric, const QString& transLyric) {
     if (mMainLyric == mainLyric && mTransLyric == transLyric) {
         return;

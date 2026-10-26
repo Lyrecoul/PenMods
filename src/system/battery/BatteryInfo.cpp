@@ -125,6 +125,19 @@ void BatteryInfo::update() {
 
 uint32 BatteryInfo::getAutoSuspendDuration() const { return mAutoSuspendDuration; }
 
+bool BatteryInfo::isOnExternalPower() const {
+    return readFileNoLast("/sys/class/power_supply/usb/online") == "1"
+        || readFileNoLast("/sys/class/power_supply/ac/online") == "1";
+}
+
+bool BatteryInfo::isCharging() const {
+    const auto status = readFileNoLast("/sys/class/power_supply/battery/status");
+    if (status == "Charging") {
+        return true;
+    }
+    return isOnExternalPower() && status != "Discharging";
+}
+
 QString BatteryInfo::getAutoSuspendDurationStr() const {
     if (mAutoSuspendDuration == 0) {
         return "永不";

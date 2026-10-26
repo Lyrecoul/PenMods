@@ -58,6 +58,12 @@ public:
     /// 一次性设置歌词；传空串表示没有歌词。
     Q_INVOKABLE void setLyrics(const QString& mainLyric, const QString& transLyric);
 
+    /// 外部输入（耳机线控等）触发的控制请求：与下拉快捷面板发出的信号走同一条路。
+    /// 仅在 active() 为 true 时有意义（调用方 HeadsetControls 会先判断）。
+    void requestTogglePlayPause();
+    void requestNext();
+    void requestPrevious();
+
     /// 插件被禁用/卸载时由 PluginManager 调用，避免会话悬挂。
     void releaseFor(const QString& pluginId);
 

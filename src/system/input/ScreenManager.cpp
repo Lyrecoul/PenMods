@@ -8,6 +8,8 @@
 #include "system/input/InputDaemon.h"
 #include "system/sound/AudioDaemon.h"
 
+#include "system/battery/BatteryInfo.h"
+
 #include "base/YEnum.h"
 
 #include "common/Event.h"
@@ -16,6 +18,7 @@
 #include <QDebug>
 #include <QMouseEvent>
 #include <QQmlContext>
+#include <QTimer>
 
 namespace mod {
 
@@ -147,20 +150,40 @@ bool ScreenManager::eventFilter(QObject* watched, QEvent* event) {
 }
 
 void ScreenManager::onScreenOn() {
-    info("screen on: reset inactivity shutdown timer");
     mScreenOn = true;
+    InputDaemon::getInstance().onScreenStateChanged(true);
+    info(
+        "screen on：charging={} external_power={}（重置关机计时；audio_lock={}）",
+        BatteryInfo::getInstance().isCharging(),
+        BatteryInfo::getInstance().isOnExternalPower(),
+        mAudioLockActive
+    );
     if (mResumePending) {
-        // 补做 rtSetAutoScreenOff 延迟的那次 resume（灭屏时调厂商接口会立刻把屏幕点亮）。
-        mResumePending = false;
-        info("屏幕已亮，补做延迟的 start_auto_screen_off");
-        InputDaemon::getInstance().resume();
+        // 补做 rtSetAutoScreenOff 延迟的那次 resume。厂商 onScreenOn 还在执行时不能立刻
+        // 发 SIGUSR2：daemon 退出 freeze 会处理积压的输入事件并执行 [Idle] reset
+        // （screen_onoff on），正是过渡期“误调会点亮屏幕的函数”的窗口。推迟到本轮
+        // 事件循环之后再补做。
+        info("屏幕已亮，推迟到事件循环末尾补做 start_auto_screen_off");
+        QTimer::singleShot(0, this, [this]() {
+            if (!mResumePending || !mScreenOn) {
+                return;
+            }
+            mResumePending = false;
+            info("补做延迟的 start_auto_screen_off");
+            InputDaemon::getInstance().resume("deferred-screen-on");
+        });
     }
     resetInactivityTimer();
 }
 
 void ScreenManager::onScreenOff() {
-    info("screen off: reset inactivity shutdown timer");
     mScreenOn = false;
+    InputDaemon::getInstance().onScreenStateChanged(false);
+    info(
+        "screen off：charging={} external_power={}（重置关机计时）",
+        BatteryInfo::getInstance().isCharging(),
+        BatteryInfo::getInstance().isOnExternalPower()
+    );
     resetInactivityTimer();
 }
 
@@ -253,9 +276,19 @@ void ScreenManager::onAudioDaemonStateChanged() {
     // system_suspend idle action of input-event-daemon). Suspend powers down
     // the radio, so Bluetooth playback would not resume after a wake-up.
     bool shouldLock = mIntelSleepAudioLock && audioActive;
+    if (shouldLock != mAudioLockActive) {
+        info(
+            "audio lock {}：state={} charging={} screen_on={} suspend_override={}",
+            shouldLock ? "armed" : "cleared",
+            static_cast<int>(AudioDaemon::getInstance().state()),
+            BatteryInfo::getInstance().isCharging(),
+            mScreenOn,
+            shouldLock
+        );
+    }
     if (shouldLock && !mAudioLockActive) {
         mAudioLockActive = true;
-        // setSystemSuspendOverride() rewrites the daemon config and restarts
+        // setSystemSuspendOverride() rewrites the daemon config and may restart
         // input-event-daemon. The host pause is delivered with SIGUSR1 to the
         // running process (plus a /tmp marker), and a freshly started daemon
         // starts unpaused, so re-apply the screen pause after the restart.
@@ -271,18 +304,32 @@ void ScreenManager::onAudioDaemonStateChanged() {
 void ScreenManager::rtSetAutoScreenOff(bool val) {
     if (!val) {
         mResumePending = false;
-        InputDaemon::getInstance().pause();
+        info(
+            "pause auto screen off：screen_on={} charging={} playState={} lrc={} inPlayer={} audioLock={}",
+            mScreenOn,
+            BatteryInfo::getInstance().isCharging(),
+            static_cast<int>(mPlayState),
+            mLrcShowing,
+            mInPlayerPage,
+            mAudioLockActive
+        );
+        InputDaemon::getInstance().pause("rtSetAutoScreenOff(false)");
         return;
     }
     if (!mScreenOn) {
-        // 屏幕灭着时调厂商的 start_auto_screen_off() 正是实测"按电源键熄屏后马上又亮"的位置，
-        // 所以先记一笔，等 onScreenOn 再补做。
+        // 屏幕灭着时调厂商的 start_auto_screen_off()（SIGUSR2）会让 daemon 处理积压
+        // 输入并执行 [Idle] reset，实测就是“按电源键熄屏后马上又亮”的位置；所以先
+        // 记一笔，等 onScreenOn 再补做。
         mResumePending = true;
-        info("屏幕未亮，延迟 start_auto_screen_off");
+        info(
+            "屏幕未亮，延迟 start_auto_screen_off（charging={} playState={}）",
+            BatteryInfo::getInstance().isCharging(),
+            static_cast<int>(mPlayState)
+        );
         return;
     }
     mResumePending = false;
-    InputDaemon::getInstance().resume();
+    InputDaemon::getInstance().resume("rtSetAutoScreenOff(true)");
 }
 
 } // namespace mod

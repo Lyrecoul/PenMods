@@ -94,6 +94,12 @@ Config::Config() : Logger("Config") {
             {"suspend_duration", 600},
             {"performance_mode", 0}
         }},
+        // Type-C 耳机线控：默认开启“检测到明确媒体键设备才动作”，插拔/异常安全；
+        // false 可完全关闭（不打开任何 /dev/input 设备）。
+        {"headset", {
+            {"enabled", true},
+            {"auto_detect", true}
+        }},
         {"locker", {
             {"enabled", false},
             {"password", "abcd"},
@@ -201,9 +207,13 @@ Config::Config() : Logger("Config") {
                 {"enabled",      false}
             }},
             {"shell_tool", {
+                // off | confirm | automatic。默认 off；旧配置只有 enabled 时按
+                // enabled=true -> confirm 兼容，绝不会自动升级为 automatic。
+                {"mode", "off"},
                 {"enabled",   false},
                 {"timeout_ms", 10000},
                 {"max_output_bytes", 4096},
+                {"max_concurrent", 2},
                 {"blocklist", json::array()}
             }},
             {"math_render", {

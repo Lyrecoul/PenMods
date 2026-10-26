@@ -44,6 +44,16 @@ public:
 
     QString getCurrent() const;
 
+    // 只读诊断（供 InputDaemon/ScreenManager 日志使用）。
+    //
+    // 本机 ac 的 online 与 status 会自相矛盾（实测 Exam_V0：usb online=1、ac online=0，
+    // 但 ac status 仍报 Charging，battery status=Full），所以：
+    //   - 外部供电 = usb online 或 ac online 为 1；
+    //   - 充电 = battery status 为 Charging，或“接了外部供电且没有在放电”。
+    // 只用于记录证据，不参与任何休眠/灭屏决策（不能靠“充电时禁用休眠”规避问题）。
+    bool isOnExternalPower() const;
+    bool isCharging() const;
+
     QString getAutoSuspendDurationStr() const;
 
     void setStatus(const QString&);

@@ -28,8 +28,13 @@ namespace mod {
  * “EV_KEY 含 KEY_PLAYPAUSE”且 “bus == BUS_USB”。实测 `/dev/input/event6` 还会被其它虚拟
  * 设备复用（penmods-injector），所以只认 capabilities + bus。
  *
- * 音量键 114/115 **绝不处理**：厂商 /usr/bin/dig_headset_sevice 已经在消费它们（调
- * dig_hp_volume），PenMods 再处理会一次跳两步；这里只 debug 记录。
+ * 音量键 114/115：厂商 /usr/bin/dig_headset_sevice 虽然会在插入时启动（probe 快照证实），
+ * 但它用 `evtest > FIFO` 且没有 stdbuf，stdout 是块缓冲 —— 父 shell 的 `while read` 在
+ * evtest 退出/缓冲满之前收不到任何行，所以短按几次音量在实测中不生效（dig_hp_volume 保持
+ * 32 不变）。因此 PenMods 接管 114/115，调 YSettingManager::spkVolume()/setSpkVolume()：
+ * 其内部 set_spk_volume 会按 `playback_dev_ctrl show` 的当前输出路径（spk/hp/dig_hp/bt）
+ * 选正确的卡/控件，数字耳机（card1）也被覆盖。可用 `headset.handle_volume=false` 关闭；
+ * 若未来厂商修复脚本，可再切回由厂商处理。
  *
  * 设备热插拔用 2s 轮询（不监听 event0 也能发现新设备/拔出），拔出即关闭 notifier。
  * 默认启用，可通过配置 `headset.enabled=false` 关闭（Config 默认值里暂无 headset 段，
@@ -86,6 +91,9 @@ private:
     // 释放沿计数 → 窗口结束后按 1/2/3 击派发。
     void _onPlayPauseClick();
 
+    // 音量键：按下沿立即执行（不做双击语义），步长 kVolumeStep。
+    void _onVolumeKey(bool up);
+
     void _flushClickWindow();
 
     void _dispatchTogglePlayPause();
@@ -94,8 +102,10 @@ private:
 
     void _dispatchPrevious();
 
-    bool mEnabled      = false;
-    bool mTimerStarted = false;
+    bool mEnabled       = false;
+    bool mHandleVolume  = true;
+    bool mTimerStarted  = false;
+    bool mVolumeLogOnce = false;
 
     QTimer mScanTimer;
     QTimer mClickTimer;

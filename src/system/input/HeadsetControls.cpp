@@ -10,6 +10,7 @@
 #include "base/YPointer.h"
 
 #include "common/Event.h"
+#include "common/Utils.h"
 
 #include "media/MediaSession.h"
 
@@ -35,6 +36,8 @@ namespace {
 constexpr int kScanIntervalMs = 2000;
 // 单击要等窗口结束才能确定不是双击/三击；380ms 是 Lead 指定的 350–400ms 区间。
 constexpr int kClickWindowMs = 380;
+// 每次按键的 0-100 音量步长（厂商数字耳机脚本内部用 20，偏粗；这里取 5 便于细调）。
+constexpr int kVolumeStep = 5;
 
 template <size_t N>
 bool testBit(const std::array<unsigned long, N>& bits, int code) {
@@ -103,15 +106,22 @@ void HeadsetControls::_loadConfig() {
         if (section.is_object()) {
             cfg = section;
         }
-        mEnabled = cfg.value("enabled", true);
+        mEnabled      = cfg.value("enabled", true);
+        mHandleVolume = cfg.value("handle_volume", true);
     } catch (const std::exception& e) {
         warn("耳机线控读取配置异常（{}），按默认启用处理", e.what());
-        mEnabled = true;
+        mEnabled      = true;
+        mHandleVolume = true;
     } catch (...) {
         warn("耳机线控读取配置未知异常，按默认启用处理");
-        mEnabled = true;
+        mEnabled      = true;
+        mHandleVolume = true;
     }
-    info("耳机线控配置：enabled={}（默认启用；headset.enabled=false 可关闭）", mEnabled);
+    info(
+        "耳机线控配置：enabled={} handle_volume={}（默认启用；headset.enabled=false / handle_volume=false 可关闭）",
+        mEnabled,
+        mHandleVolume
+    );
 }
 
 bool HeadsetControls::_probeDevice(const std::string& path, DeviceInfo* out) const {
@@ -289,9 +299,18 @@ void HeadsetControls::_onReadable(OpenDevice* device) {
                             _onPlayPauseClick();
                         }
                     } else if (ev.code == KEY_VOLUMEUP || ev.code == KEY_VOLUMEDOWN) {
-                        // 厂商 /usr/bin/dig_headset_sevice 已在消费 114/115（dig_hp_volume），
-                        // PenMods 再处理会一次跳两步；只记录。
-                        debug("耳机线控：收到厂商已消费的音量键 code={} value={}（PenMods 不处理）", ev.code, ev.value);
+                        // 厂商 dig_headset_sevice 的 evtest 输出是块缓冲、短按不生效（见头文件注释），
+                        // 由 PenMods 接管；按“按下沿”动作一次（value=2 的自动重复忽略）。
+                        if (mHandleVolume && ev.value == 1) {
+                            _onVolumeKey(ev.code == KEY_VOLUMEUP);
+                        } else {
+                            debug(
+                                "耳机线控：音量键 code={} value={}（handle_volume={}）",
+                                ev.code,
+                                ev.value,
+                                mHandleVolume
+                            );
+                        }
                     } else {
                         // 未知键（例如 KEY_VOICECOMMAND=582）只记录，不动作。
                         debug("耳机线控：未知按键 code={} value={}，忽略", ev.code, ev.value);
@@ -318,6 +337,42 @@ void HeadsetControls::_onPlayPauseClick() {
     }
     mClickTimer.start(kClickWindowMs);
     debug("耳机线控：PLAYPAUSE 释放，窗口内累计 {} 击", mClickCount);
+}
+
+void HeadsetControls::_onVolumeKey(bool up) {
+    auto* settingManager = YPointer<YSettingManager>::getInstance();
+    if (settingManager == nullptr) {
+        warn("耳机线控：YSettingManager 尚未就绪，忽略音量键");
+        return;
+    }
+    if (!mVolumeLogOnce) {
+        mVolumeLogOnce = true;
+        // 记录厂商脚本是否在跑，供真机日志判断“是否双调”：厂商脚本的 evtest 输出块缓冲，
+        // 正常短按不生效；若未来厂商修复，可把 headset.handle_volume 置 false。
+        // 注意：厂商脚本以 `sh /usr/bin/dig_headset_sevice` 运行，`pidof dig_headset_sevice`
+        // 匹配不到脚本名，必须用 ps 看完整命令行。
+        const std::string vendor =
+            exec("ps w | grep -F 'dig_headset_sevice' | grep -v grep | head -n 1");
+        info(
+            "耳机线控：接管音量键（step={}）；厂商 dig_headset_sevice={}",
+            kVolumeStep,
+            vendor.empty() ? std::string("not running") : vendor
+        );
+    }
+    const int current = PEN_CALL(int, "_ZN15YSettingManager9spkVolumeEv", void*)(settingManager);
+    int       next    = current + (up ? kVolumeStep : -kVolumeStep);
+    if (next < 0) {
+        next = 0;
+    } else if (next > 100) {
+        next = 100;
+    }
+    info(
+        "耳机线控：音量{} {} → {}（YSettingManager::setSpkVolume，按当前输出路径选卡）",
+        up ? "+" : "-",
+        current,
+        next
+    );
+    PEN_CALL(void, "_ZN15YSettingManager12setSpkVolumeEi", void*, int)(settingManager, next);
 }
 
 void HeadsetControls::_flushClickWindow() {

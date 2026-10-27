@@ -128,6 +128,9 @@ public:
     // 基础接口
     Q_INVOKABLE void    sendMessage(const QString& message, const QString& fileRefs = QString());
     Q_INVOKABLE void    sendMessageWithMedia(const QString& message, const QString& mediaParts);
+    // #21-3 附件边界常量：QML 预检与 C++ 保持同一来源，避免两处硬编码漂移。
+    Q_INVOKABLE int     maxImageBytes() const;
+    Q_INVOKABLE int     maxMediaJsonBytes() const;
     Q_INVOKABLE bool    isAvailable();
     Q_INVOKABLE void    reloadConfig();
     Q_INVOKABLE void    sanitizeConfig();
@@ -141,9 +144,16 @@ public:
     // 带媒体的编辑：mediaParts 是编辑后仍在的图片（[{type,url,localPath,name,mimeType}]，
     // url 可为空、只给 localPath）。独立函数而非默认参数：QML 按实参个数分派会解析失败。
     Q_INVOKABLE void editMessageWithMedia(int index, const QString& newContent, const QString& mediaParts);
+    // #21-3：按完整附件列表全量替换（图片 + 文件 + 音频，可增删）；新 QML 优先用它。
+    // parts JSON 字段与 sendMessageWithMedia 一致；空数组 = 清空全部附件。
+    Q_INVOKABLE void editMessageWithParts(int index, const QString& newContent, const QString& parts);
     Q_INVOKABLE void deleteMessage(int index);
     Q_INVOKABLE void regenerateMessage(int index);
     Q_INVOKABLE void cancelRequest();
+    // 重置 AI 服务（进程内 ChatBot，不新建单例）：取消在途网络请求/Shell/pending tool calls，
+    // 清空流式临时状态，重置 requestSeq/取消标志，并重读 AI 配置；保留会话历史与已保存消息。
+    // 返回 false 表示配置重读失败（其余状态仍已清理）；主线程同步但只做内存/本地文件操作，不阻塞 UI。
+    Q_INVOKABLE bool resetService();
     Q_INVOKABLE void resetApiCacheStats();
 
     // Tool Call 接口
@@ -322,6 +332,7 @@ private:
     QSet<QString>          m_markdownRequests;
     QList<QNetworkReply*>  m_activeReplies;
     bool                   m_cancelled        = false;
+    bool                   m_resetting        = false; // resetService 防重入
     bool                   m_streamEndEmitted = false;
     int                    m_requestSeq       = 0;
     QString                m_responseMessageId;
@@ -399,6 +410,8 @@ private:
     bool       usesResponsesApi() const;
     QJsonArray messagesToResponsesInput(const QJsonArray& messages) const;
     void       abortActiveReplies();
+    // 重读 ai 配置（供 reloadConfig/resetService 复用；不新增 connect，不构造第二个 ChatBot）
+    void applyAiConfigReload();
 
     QString m_currentStreamBuffer;
     QString m_currentReasoningBuffer;
@@ -462,6 +475,21 @@ private:
     // 视觉代理路径专用：原图落盘成会话附件（仅本地查看，不发给主模型）
     QVector<MessagePart> persistUserImages(const QVector<MessagePart>& parts, const QString& sessionId);
     QVariantList         attachmentVariants(const QVector<MessagePart>& parts) const;
+
+    // #21-3 多附件：解析 mediaParts JSON（image_url/file/input_audio），校验类型/大小并按内容去重。
+    // 返回空 + error 非空 = 拒绝（调用方 emit errorOccurred 后 return）。
+    // hasReplacementAttachments = JSON 里带 file/input_audio 条目（编辑时走“附件全量替换”）。
+    QVector<MessagePart>
+    parseAttachmentParts(const QString& mediaParts, QString* error, bool* hasReplacementAttachments) const;
+    // 收集一个会话所有消息 parts 里引用的附件绝对路径（用于删除消息后的孤儿清理）。
+    QSet<QString> referencedAttachmentPaths(const SessionData& session) const;
+    // editMessageWithMedia / editMessageWithParts 共用：落盘图片、重建 parts、写历史并重新请求。
+    void
+    applyEditedMessage(int index, const QString& newContent, const QVector<MessagePart>& editedParts, bool fullReplace);
+    // 删除该会话 attachments 目录里不再被引用的附件文件。
+    void pruneSessionAttachments(const QString& sessionId);
+    // 后台预热历史图片 data URL 缓存（避免构造请求时在 UI 线程读盘 + base64）。
+    void                 warmAttachmentCache(const SessionData& session);
     void                 dispatchToolCalls(const QString& toolCallsJson);
     void                 executeWebSearch(const QString& toolCallId, const QString& query);
     void                 executeTavilySearch(const QString& toolCallId, const QString& query);

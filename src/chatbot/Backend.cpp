@@ -20,11 +20,13 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QHttpMultiPart>
 #include <QHttpPart>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMimeDatabase>
 #include <QMutexLocker>
 #include <QNetworkReply>
 #include <QPointer>
@@ -49,6 +51,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <exception>
 #include <set>
 
 namespace mod::chatbot {
@@ -281,6 +284,13 @@ ChatBot::~ChatBot() {
 // -----------------------------------------------------------------------
 
 void ChatBot::reloadConfig() {
+    applyAiConfigReload();
+    info("配置已重载");
+    showToast("配置已重载");
+}
+
+// 仅重读 ai 配置并刷新内存状态；不创建任何新连接/单例，供 reloadConfig 与 resetService 复用。
+void ChatBot::applyAiConfigReload() {
     auto& config = mod::Config::getInstance();
     config.reload();
 
@@ -312,8 +322,6 @@ void ChatBot::reloadConfig() {
     emit defaultPromptChanged();
     emit modelsChanged();
     emit promptsChanged();
-    info("配置已重载");
-    showToast("配置已重载");
 }
 
 void ChatBot::sanitizeConfig() {
@@ -836,6 +844,8 @@ void ChatBot::initSessions() {
         m_currentSessionId = createSession("新对话");
     }
     if (historySanitized) saveSessions();
+    // #21-3：后台预热当前会话历史图片的 data URL 缓存，避免首次请求在 UI 线程读大图。
+    if (m_sessions.contains(m_currentSessionId)) warmAttachmentCache(m_sessions[m_currentSessionId]);
 }
 
 bool ChatBot::isAvailable() { return !m_apiKey.isEmpty(); }
@@ -843,6 +853,16 @@ bool ChatBot::isAvailable() { return !m_apiKey.isEmpty(); }
 namespace {
 
 constexpr qint64 MAX_FILE_CONTEXT_BYTES = 1024 * 1024;
+
+// 允许作为文本附件引用的扩展名（与 ChatAssistant.qml 的 isTextFile 保持一致）。
+// 其它二进制附件明确拒绝，避免把二进制塞进文本上下文。
+bool isTextAttachmentName(const QString& name) {
+    static const QStringList kExtensions = {"txt", "md",  "markdown", "json", "py",   "js",   "ts",
+                                            "qml", "cpp", "h",        "c",    "java", "html", "htm",
+                                            "css", "xml", "yaml",     "yml",  "ini",  "log",  "csv"};
+    const QString            suffix      = QFileInfo(name).suffix().toLower();
+    return !suffix.isEmpty() && kExtensions.contains(suffix);
+}
 
 QString buildFileContext(const QVector<MessagePart>& parts, QStringList* failedFiles = nullptr) {
     QString context;
@@ -943,6 +963,197 @@ void ChatBot::sendMessage(const QString& message, const QString& fileRefs) {
 }
 
 // -----------------------------------------------------------------------
+// #21-3 多附件：解析 / 校验 / 去重 / 清理
+// -----------------------------------------------------------------------
+
+int ChatBot::maxImageBytes() const { return static_cast<int>(AttachmentManager::kMaxImageBytes); }
+int ChatBot::maxMediaJsonBytes() const { return static_cast<int>(AttachmentManager::kMaxMediaJsonBytes); }
+
+// 把 QML 传来的 mediaParts JSON 解析成有序 MessagePart 列表：
+//   - image_url: 支持 data URL / http(s) URL / 仅 localPath（不要求在 QML 里读文件转 base64）；
+//   - file: 文本附件，必须可读且扩展名在白名单内（二进制附件明确拒绝）；
+//   - input_audio: base64 data + format；
+// 校验单图 9 MiB、总媒体 12 MiB；按 canonical localPath 去重；保持原顺序。
+QVector<MessagePart>
+ChatBot::parseAttachmentParts(const QString& mediaParts, QString* error, bool* hasReplacementAttachments) const {
+    QVector<MessagePart> parts;
+    if (error) error->clear();
+    if (hasReplacementAttachments) *hasReplacementAttachments = false;
+
+    const QString trimmed = mediaParts.trimmed();
+    if (trimmed.isEmpty() || trimmed == "[]") return parts;
+    if (trimmed.size() > AttachmentManager::kMaxMediaJsonBytes) {
+        if (error) *error = QStringLiteral("媒体附件总大小超出上限（12 MiB），请减少附件后再试");
+        return {};
+    }
+
+    QJsonParseError     parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(trimmed.toUtf8(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isArray()) {
+        if (error) *error = QStringLiteral("附件数据格式错误");
+        return {};
+    }
+
+    qint64        mediaDataChars = 0;
+    QSet<QString> seenPaths;
+    QStringList   unsupportedNames;
+
+    for (const auto& val : doc.array()) {
+        const QJsonObject obj  = val.toObject();
+        const QString     type = obj["type"].toString();
+
+        if (type == "image_url") {
+            MessagePart part;
+            part.type      = "image_url";
+            part.url       = obj["url"].toString();
+            part.localPath = obj["localPath"].toString();
+            part.name      = obj["name"].toString();
+            part.mimeType  = obj["mimeType"].toString();
+
+            if (part.url.startsWith("data:", Qt::CaseInsensitive)) {
+                const int     separator = part.url.indexOf(',');
+                const QString header    = separator > 5 ? part.url.mid(5, separator - 5) : QString();
+                const QString mime      = header.section(';', 0, 0).toLower();
+                if (mime != "image/jpeg" && mime != "image/png" && mime != "image/webp" && mime != "image/gif") {
+                    if (error)
+                        *error = QStringLiteral("不支持的图片格式：%1").arg(part.name.isEmpty() ? mime : part.name);
+                    return {};
+                }
+                if (part.mimeType.isEmpty()) part.mimeType = mime;
+                if (separator > 5) {
+                    // base64 长度估算二进制大小（不在 UI 线程解码大图；落盘时还会精确检查）。
+                    const qint64 base64Chars = part.url.size() - separator - 1;
+                    const qint64 approxBytes = (base64Chars / 4) * 3;
+                    if (approxBytes > AttachmentManager::kMaxImageBytes) {
+                        if (error)
+                            *error = QStringLiteral("图片过大（单张上限 9 MiB）：%1")
+                                         .arg(part.name.isEmpty() ? QStringLiteral("图片") : part.name);
+                        return {};
+                    }
+                    part.size = approxBytes;
+                }
+                mediaDataChars += part.url.size();
+            } else if (part.url.isEmpty() && !part.localPath.isEmpty()) {
+                const QFileInfo info(part.localPath);
+                if (!info.isAbsolute() || !info.isFile() || !info.isReadable()) {
+                    if (error) *error = QStringLiteral("图片附件不可读：%1").arg(info.fileName());
+                    return {};
+                }
+                if (info.size() <= 0 || info.size() > AttachmentManager::kMaxImageBytes) {
+                    if (error) *error = QStringLiteral("图片过大（单张上限 9 MiB）：%1").arg(info.fileName());
+                    return {};
+                }
+                if (part.mimeType.isEmpty())
+                    part.mimeType =
+                        QMimeDatabase().mimeTypeForFile(part.localPath, QMimeDatabase::MatchExtension).name();
+                if (!part.mimeType.startsWith("image/")) {
+                    if (error) *error = QStringLiteral("不支持的图片格式：%1").arg(info.fileName());
+                    return {};
+                }
+                if (part.name.isEmpty()) part.name = info.fileName();
+                part.size = info.size();
+                const QString canonical =
+                    info.canonicalFilePath().isEmpty() ? info.absoluteFilePath() : info.canonicalFilePath();
+                if (seenPaths.contains(canonical)) continue;
+                seenPaths.insert(canonical);
+            } else if (part.url.isEmpty()) {
+                continue; // 没有数据也没有路径：忽略这个空图
+            } else if (part.name.isEmpty()) {
+                part.name = part.url.section('/', -1);
+            }
+            if (mediaDataChars > AttachmentManager::kMaxMediaJsonBytes) {
+                if (error) *error = QStringLiteral("媒体附件总大小超出上限（12 MiB），请减少附件后再试");
+                return {};
+            }
+            parts.append(part);
+        } else if (type == "file") {
+            MessagePart part;
+            part.type      = "file";
+            part.localPath = obj["localPath"].toString();
+            part.name      = obj["name"].toString();
+            part.mimeType  = obj["mimeType"].toString("text/plain");
+            part.language  = obj["language"].toString();
+            if (part.localPath.isEmpty()) continue;
+            const QFileInfo info(part.localPath);
+            if (!info.isAbsolute() || !info.isFile() || !info.isReadable()) {
+                if (error)
+                    *error = QStringLiteral("附件不可读：%1").arg(part.name.isEmpty() ? info.fileName() : part.name);
+                return {};
+            }
+            if (part.name.isEmpty()) part.name = info.fileName();
+            if (!isTextAttachmentName(part.name)) {
+                unsupportedNames.append(part.name);
+                continue;
+            }
+            const QString canonical =
+                info.canonicalFilePath().isEmpty() ? info.absoluteFilePath() : info.canonicalFilePath();
+            if (seenPaths.contains(canonical)) continue;
+            seenPaths.insert(canonical);
+            part.size = info.size();
+            if (hasReplacementAttachments) *hasReplacementAttachments = true;
+            parts.append(part);
+        } else if (type == "input_audio") {
+            MessagePart part;
+            part.type   = "input_audio";
+            part.data   = obj["data"].toString();
+            part.format = obj["format"].toString("mp3");
+            part.name   = obj["name"].toString("音频");
+            if (part.data.isEmpty()) continue;
+            mediaDataChars += part.data.size();
+            if (hasReplacementAttachments) *hasReplacementAttachments = true;
+            parts.append(part);
+        } else if (type == "text") {
+            MessagePart part;
+            part.type = "text";
+            part.text = obj["text"].toString();
+            if (part.text.isEmpty()) continue;
+            parts.append(part);
+        } else {
+            unsupportedNames.append(type);
+        }
+    }
+
+    if (!unsupportedNames.isEmpty()) {
+        if (error) *error = QStringLiteral("不支持的附件类型：%1").arg(unsupportedNames.mid(0, 3).join("、"));
+        return {};
+    }
+    return parts;
+}
+
+// 收集一个会话所有消息 parts 里引用的附件绝对路径（删除消息后的孤儿清理用）。
+QSet<QString> ChatBot::referencedAttachmentPaths(const SessionData& session) const {
+    QSet<QString> paths;
+    for (const auto& msg : session.messages) {
+        for (const auto& part : msg.parts) {
+            if (part.localPath.isEmpty()) continue;
+            const QFileInfo info(part.localPath);
+            if (!info.isAbsolute()) continue;
+            paths.insert(info.absoluteFilePath());
+        }
+    }
+    return paths;
+}
+
+void ChatBot::pruneSessionAttachments(const QString& sessionId) {
+    if (!m_sessions.contains(sessionId)) return;
+    AttachmentManager::pruneSession(
+        QFileInfo(sessionsFilePath()).absolutePath(),
+        sessionId,
+        referencedAttachmentPaths(m_sessions[sessionId])
+    );
+}
+
+void ChatBot::warmAttachmentCache(const SessionData& session) {
+    QVector<MessagePart> imageParts;
+    for (const auto& msg : session.messages) {
+        for (const auto& part : msg.parts) {
+            if (part.type == "image_url" && !part.localPath.isEmpty() && part.url.isEmpty()) imageParts.append(part);
+        }
+    }
+    if (!imageParts.isEmpty()) AttachmentManager::warmCache(imageParts);
+}
+
+// -----------------------------------------------------------------------
 // sendMessageWithMedia（多模态：图片 / 音频）
 // mediaParts: 图片 {type,url} / 音频 {type,data,format}
 // -----------------------------------------------------------------------
@@ -950,42 +1161,26 @@ void ChatBot::sendMessage(const QString& message, const QString& fileRefs) {
 void ChatBot::sendMessageWithMedia(const QString& message, const QString& mediaParts) {
     m_cancelled = false;
 
-    static constexpr int MAX_MEDIA_JSON_SIZE = 12 * 1024 * 1024;
-    if (mediaParts.size() > MAX_MEDIA_JSON_SIZE) {
-        emit errorOccurred("图片数据过大，请裁剪或减少拼接范围后重试");
+    QString              parseError;
+    bool                 hasReplacementAttachments = false;
+    QVector<MessagePart> parts = parseAttachmentParts(mediaParts, &parseError, &hasReplacementAttachments);
+    Q_UNUSED(hasReplacementAttachments);
+    if (!parseError.isEmpty()) {
+        emit errorOccurred(parseError);
         return;
     }
 
-    QVector<MessagePart> parts;
-
-    QJsonDocument doc = QJsonDocument::fromJson(mediaParts.toUtf8());
-    if (doc.isArray()) {
-        for (const auto& val : doc.array()) {
-            QJsonObject obj = val.toObject();
-            MessagePart part;
-            part.type = obj["type"].toString();
-            if (part.type == "image_url") {
-                part.url = obj["url"].toString();
-                if (part.url.isEmpty()) continue;
-            } else if (part.type == "input_audio") {
-                part.data   = obj["data"].toString();
-                part.format = obj["format"].toString("mp3");
-                if (part.data.isEmpty()) continue;
-            } else if (part.type == "text") {
-                part.text = obj["text"].toString();
-                if (part.text.isEmpty()) continue;
-            } else if (part.type == "file") {
-                part.localPath = obj["localPath"].toString();
-                part.name      = obj["name"].toString(QFileInfo(part.localPath).fileName());
-                part.mimeType  = obj["mimeType"].toString("text/plain");
-                part.language  = obj["language"].toString();
-                part.size      = static_cast<qint64>(obj["size"].toDouble(QFileInfo(part.localPath).size()));
-                if (part.localPath.isEmpty()) continue;
-            } else {
-                continue;
+    // 音频能力/协议兜底：不支持音频的模型、或 Responses API（该协议不支持 input_audio）丢弃音频并提示。
+    int droppedAudio = 0;
+    if (!m_capAudio || usesResponsesApi()) {
+        for (int i = parts.size() - 1; i >= 0; --i) {
+            if (parts[i].type == "input_audio") {
+                parts.remove(i);
+                ++droppedAudio;
             }
-            parts.append(part);
         }
+        if (droppedAudio > 0)
+            showToast(QString("当前模型不支持音频，已忽略 %1 个音频附件").arg(droppedAudio).toStdString());
     }
 
     QStringList   failedFiles;
@@ -1050,8 +1245,6 @@ void ChatBot::finishMediaMessage(
     QJsonArray apiMessages = buildApiMessages(m_sessions[sessionId].messages, effectiveMessage, parts);
 
     // 内嵌图片先落盘为附件，不写入历史
-    const bool hadImage =
-        std::any_of(parts.cbegin(), parts.cend(), [](const MessagePart& part) { return part.type == "image_url"; });
     QVector<MessagePart> historyParts   = parts;
     const QString        attachmentRoot = QFileInfo(sessionsFilePath()).absolutePath();
     for (auto& part : historyParts) {
@@ -1078,9 +1271,20 @@ void ChatBot::finishMediaMessage(
     // 会消失（发给模型时由 messageToJson 按"活动模型不支持视觉"跳过）。
     for (const auto& part : persistUserImages(localOnlyParts, sessionId)) historyParts.append(part);
 
+    const bool finalHasImage = std::any_of(historyParts.cbegin(), historyParts.cend(), [](const MessagePart& part) {
+        return part.type == "image_url";
+    });
+
     MessageData userMsg;
-    userMsg.role    = "user";
-    userMsg.content = message.isEmpty() && hadImage ? "[图片]" : message;
+    userMsg.role = "user";
+    // 空正文的占位：有图 "[图片]"；只有文件/音频 "请阅读附件内容"（与 QML 侧占位一致，行签名靠它比对）。
+    if (message.isEmpty()) {
+        if (finalHasImage) userMsg.content = QStringLiteral("[图片]");
+        else if (!historyParts.isEmpty()) userMsg.content = QStringLiteral("请阅读附件内容");
+        else userMsg.content = message;
+    } else {
+        userMsg.content = message;
+    }
     userMsg.parts   = historyParts;
     if (!effectiveMessage.isEmpty()) {
         if (historyParts.isEmpty()) {
@@ -1159,7 +1363,7 @@ void ChatBot::callVisionProxy(
         QJsonArray contentArray;
         for (const auto& p : parts) {
             if (p.type == "image_url") {
-                QString base64Data = p.url;
+                QString base64Data = AttachmentManager::requestUrl(p);
                 QString mediaType  = "image/jpeg";
                 if (base64Data.startsWith("data:image/jpeg;base64,")) base64Data = base64Data.mid(23);
                 else if (base64Data.startsWith("data:image/png;base64,")) {
@@ -1192,7 +1396,9 @@ void ChatBot::callVisionProxy(
                 QJsonObject imgObj;
                 imgObj["type"] = "image_url";
                 QJsonObject imgUrl;
-                imgUrl["url"]       = p.url;
+                const QString imageUrl = AttachmentManager::requestUrl(p);
+                if (imageUrl.isEmpty()) continue;
+                imgUrl["url"]       = imageUrl;
                 imgObj["image_url"] = imgUrl;
                 contentArray.append(imgObj);
             }
@@ -2835,9 +3041,38 @@ void ChatBot::editMessage(int index, const QString& newContent) {
     editMessageWithMedia(index, newContent, QStringLiteral("[]"));
 }
 
-// 带媒体的编辑：只按编辑后的图片集合重建图片，文件/音频 part 原样保留（编辑界面只回填图片，
-// 整体清空会把附件永久删掉）。验证：sessions.json 里该条 user 消息仍有 localPath、不含 data:image。
+// 带媒体的编辑（兼容旧资源库）：mediaParts 只含 image_url 时保持旧语义——只重建图片、保留
+// 原文件/音频 part；若 JSON 里带 file/input_audio 条目则按全量替换处理。
 void ChatBot::editMessageWithMedia(int index, const QString& newContent, const QString& mediaParts) {
+    QString              parseError;
+    bool                 fullReplace = false;
+    QVector<MessagePart> edited      = parseAttachmentParts(mediaParts, &parseError, &fullReplace);
+    if (!parseError.isEmpty()) {
+        emit errorOccurred(parseError);
+        return;
+    }
+    applyEditedMessage(index, newContent, edited, fullReplace);
+}
+
+// #21-3：编辑时按“完整附件列表”全量替换（可增删图片/文件/音频）；空数组 = 清空全部附件。
+void ChatBot::editMessageWithParts(int index, const QString& newContent, const QString& partsJson) {
+    QString              parseError;
+    bool                 hasNonImageAttachments = false;
+    QVector<MessagePart> edited                 = parseAttachmentParts(partsJson, &parseError, &hasNonImageAttachments);
+    Q_UNUSED(hasNonImageAttachments);
+    if (!parseError.isEmpty()) {
+        emit errorOccurred(parseError);
+        return;
+    }
+    applyEditedMessage(index, newContent, edited, true);
+}
+
+void ChatBot::applyEditedMessage(
+    int                         index,
+    const QString&              newContent,
+    const QVector<MessagePart>& editedParts,
+    bool                        fullReplace
+) {
     auto& msgs = currentMessages();
     if (index < 0 || index >= msgs.size()) return;
 
@@ -2846,56 +3081,43 @@ void ChatBot::editMessageWithMedia(int index, const QString& newContent, const Q
         return;
     }
 
-    static constexpr int MAX_MEDIA_JSON_SIZE = 12 * 1024 * 1024;
-    if (mediaParts.size() > MAX_MEDIA_JSON_SIZE) {
-        emit errorOccurred("图片数据过大，请裁剪或减少拼接范围后重试");
-        return;
-    }
-
-    // user 消息的 parts 形如 [text(用户正文), text(附件内容上下文), file/input_audio…, image…]：
-    // 只换用户正文那一条，其余必须留着，否则"改几个字"会把附件内容从模型视野里删掉。
     QVector<MessagePart> parts;
-    bool                 droppedUserText = false;
-    for (const auto& part : msgs[index].parts) {
-        if (part.type == "image_url") continue; // 图片由编辑界面传来的集合决定
-        if (part.type == "text" && !droppedUserText && part.text == msgs[index].content) {
-            droppedUserText = true;
-            continue;
+    if (fullReplace) {
+        // 全量替换：解析结果里的 image/file/audio 都在；text 条目（附件内容上下文）在下面按文件重算。
+        for (const auto& part : editedParts) {
+            if (part.type != "text") parts.append(part);
         }
-        parts.append(part);
-    }
-
-    QJsonDocument doc = QJsonDocument::fromJson(mediaParts.toUtf8());
-    if (doc.isArray()) {
-        for (const auto& val : doc.array()) {
-            const QJsonObject obj = val.toObject();
-            if (obj["type"].toString() != "image_url") continue;
-
-            MessagePart part;
-            part.type      = "image_url";
-            part.url       = obj["url"].toString();
-            part.localPath = obj["localPath"].toString();
-            part.name      = obj["name"].toString();
-            part.mimeType  = obj["mimeType"].toString();
-            // url 与 localPath 都空 = 图已不可用（文件被删/格式不支持），丢弃而不是发空图。
-            if (part.url.isEmpty() && part.localPath.isEmpty()) continue;
+        QStringList   failedFiles;
+        const QString fileContext = buildFileContext(parts, &failedFiles);
+        if (!failedFiles.isEmpty()) {
+            warn("编辑附件未发送给模型: {}", failedFiles.join("、").toStdString());
+            showToast(QString("%1 个附件未发送，请检查权限或大小").arg(failedFiles.size()).toStdString());
+        }
+        if (!fileContext.isEmpty()) {
+            MessagePart contextPart;
+            contextPart.type = "text";
+            contextPart.text = fileContext;
+            parts.prepend(contextPart);
+        }
+    } else {
+        // 旧语义：保留原行里的非图片部分（附件内容上下文 + 文件/音频），只替换用户正文与图片。
+        bool droppedUserText = false;
+        for (const auto& part : msgs[index].parts) {
+            if (part.type == "image_url") continue; // 图片由编辑界面传来的集合决定
+            if (part.type == "text" && !droppedUserText && part.text == msgs[index].content) {
+                droppedUserText = true;
+                continue;
+            }
             parts.append(part);
         }
+        for (const auto& part : editedParts) {
+            if (part.type == "image_url") parts.append(part);
+        }
     }
 
-    const bool hadImage =
-        std::any_of(parts.cbegin(), parts.cend(), [](const MessagePart& part) { return part.type == "image_url"; });
-    // 兜底校验（QML 侧已保证"文字和图片至少留一个"）：不能用 parts.isEmpty() 判断 —— 保留的
-    // file 部分会让 parts 非空，文字为空时仍会发出 content 为空的消息。
-    if (newContent.trimmed().isEmpty() && !hadImage) {
-        emit errorOccurred("没有可发送的文字或媒体内容");
-        return;
-    }
-
-    // 内嵌 base64 不落库（messageDataToJson 跳过 data: 图片），所以落盘后必须清掉 url。
-    QVector<MessagePart> historyParts   = parts;
-    const QString        attachmentRoot = QFileInfo(sessionsFilePath()).absolutePath();
-    for (auto& part : historyParts) {
+    // 图片落盘：data URL → 本会话附件目录；只带 localPath 的原样保留。
+    const QString attachmentRoot = QFileInfo(sessionsFilePath()).absolutePath();
+    for (auto& part : parts) {
         if (part.type != "image_url" || !part.url.startsWith("data:", Qt::CaseInsensitive)) continue;
         QString attachmentError;
         if (!AttachmentManager::persistImage(attachmentRoot, m_currentSessionId, part, &attachmentError)) {
@@ -2904,21 +3126,36 @@ void ChatBot::editMessageWithMedia(int index, const QString& newContent, const Q
         }
         part.url.clear();
     }
-    historyParts.erase(
+    parts.erase(
         std::remove_if(
-            historyParts.begin(),
-            historyParts.end(),
+            parts.begin(),
+            parts.end(),
             [](const MessagePart& part) {
                 return part.type == "image_url" && part.url.isEmpty() && part.localPath.isEmpty();
             }
         ),
-        historyParts.end()
+        parts.end()
     );
 
+    const bool hadImage =
+        std::any_of(parts.cbegin(), parts.cend(), [](const MessagePart& part) { return part.type == "image_url"; });
+    const bool hasAnyAttachment = std::any_of(parts.cbegin(), parts.cend(), [](const MessagePart& part) {
+        return part.type == "image_url" || part.type == "file" || part.type == "input_audio";
+    });
+    // 文字与附件都空：拒绝（编辑里“全删”等于删除消息，不走该接口）。
+    if (newContent.trimmed().isEmpty() && !hasAnyAttachment) {
+        emit errorOccurred("没有可发送的文字或媒体内容");
+        return;
+    }
+
     auto& target = msgs[index];
-    // 文字为空但图片还在：落库成 "[图片]"，与 finishMediaMessage 的取值保持一致。
-    target.content = newContent.isEmpty() && hadImage ? QStringLiteral("[图片]") : newContent;
-    target.parts   = historyParts;
+    if (newContent.isEmpty()) {
+        // 空正文占位与 finishMediaMessage / QML 保持一致，行签名靠它比对。
+        target.content = hadImage ? QStringLiteral("[图片]") : QStringLiteral("请阅读附件内容");
+    } else {
+        target.content = newContent;
+    }
+    target.parts = parts;
     if (!newContent.isEmpty() && !target.parts.isEmpty()) {
         MessagePart textPart;
         textPart.type = "text";
@@ -2930,8 +3167,10 @@ void ChatBot::editMessageWithMedia(int index, const QString& newContent, const Q
     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
     saveSessions();
     emit messagesChanged();
+    // 图片被删/替换后，旧附件文件（sha256 命名）不再被任何消息引用 → 清理孤儿文件。
+    pruneSessionAttachments(m_currentSessionId);
 
-    // 只在编辑用户消息时重新请求（不依赖上面那条校验；历史最后一条是 assistant 时接口会报错）。
+    // 编辑用户消息后重新请求。
     if (msgs[index].role != "user") return;
 
     QJsonArray  apiMessages;
@@ -2950,6 +3189,8 @@ void ChatBot::truncateHistory(int index) {
     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
     saveSessions();
     emit messagesChanged();
+    // 被截断消息的附件不再被引用 → 清理本会话孤儿附件（#21-3）。
+    pruneSessionAttachments(m_currentSessionId);
 }
 
 void ChatBot::deleteMessage(int index) {
@@ -2959,6 +3200,8 @@ void ChatBot::deleteMessage(int index) {
     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
     saveSessions();
     emit messagesChanged();
+    // 删除消息后清理不再被引用的附件文件（#21-3）。
+    pruneSessionAttachments(m_currentSessionId);
 }
 
 void ChatBot::regenerateMessage(int index) {
@@ -2985,6 +3228,8 @@ void ChatBot::regenerateMessage(int index) {
     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
     saveSessions();
     emit messagesChanged();
+    // 重新生成会截断后续回答（含生成的图片）→ 清理不再被引用的附件（#21-3）。
+    pruneSessionAttachments(m_currentSessionId);
 
     QJsonArray  apiMessages;
     QJsonObject sysMsg;
@@ -3008,6 +3253,8 @@ void ChatBot::clearHistory() {
     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
     saveSessions();
     emit messagesChanged();
+    // 清空历史后本会话附件目录里已无引用 → 全部清理（#21-3）。
+    pruneSessionAttachments(m_currentSessionId);
 }
 
 // 中止 shell 调用，只发信号不写历史
@@ -3047,6 +3294,75 @@ void ChatBot::cancelRequest() {
     resolvePendingToolCalls("本次请求已中断，该工具调用已取消。");
 
     emit requestCancelled();
+}
+
+bool ChatBot::resetService() {
+    if (m_resetting) {
+        warn("resetService: 正在重置中，忽略重复调用");
+        return false;
+    }
+    m_resetting = true;
+    info("开始重置 AI 服务");
+
+    // 1) 先让所有在途网络/工具/Shell 回调失效：递增 requestSeq，并打开 cancelled 标志。
+    m_cancelled = true;
+    ++m_requestSeq;
+
+    // 2) 取消活动网络请求（abortActiveReplies 内部先取副本/清表，再 disconnect→abort→deleteLater，
+    //    不会在迭代中 re-enter finished 回调）。
+    abortActiveReplies();
+
+    // 3) pending tool call 落终态（只更新 toolStates/UI；不把 tool 结果写进历史）。
+    //    publishTool 内部会在需要时保存一次会话，这里不再额外 saveSessions。
+    finishOutstandingTools("cancelled", "AI 服务已重置");
+
+    // 4) 终止 Shell（活动/排队/待确认全部取消）；其结果提交因 requestSeq/批次已变会被丢弃。
+    abortAllShellExecs("AI 服务已重置，Shell 执行已取消");
+
+    // 5) 只 persist 一次已流出的部分回答；必须在清空流式缓冲之前（否则部分内容丢失）。
+    persistPartialResponse();
+
+    // 6) 清空流式/工具调用的临时状态；不 touch m_sessions/currentMessages（保留历史与已保存消息）。
+    m_toolCallBatch.clear();
+    m_toolFlushScheduled = false;
+    m_currentStreamBuffer.clear();
+    m_currentReasoningBuffer.clear();
+    m_embeddedContentBuffer.clear();
+    m_embeddedReasoningActive = false;
+    m_responseBuffer.clear();
+    m_toolCallsBuffer.clear();
+    m_responseToolItemIndexes.clear();
+    m_serverToolCallActive = false;
+    m_serverToolCallName.clear();
+    m_responseToolStates.clear();
+    m_responseMessageId.clear();
+    m_responseSessionId.clear();
+    m_streamEndEmitted = false;
+    m_cancelled        = false;
+    m_lastModelError.clear();
+
+    // 7) 重读 AI 配置：复用 reloadConfig 的路径（applyAiConfigReload），不新增信号连接、不新建单例。
+    bool ok = true;
+    try {
+        applyAiConfigReload();
+    } catch (const std::exception& error) {
+        ok = false;
+        warn("resetService: 重新读取 AI 配置失败: {}", error.what());
+    } catch (...) {
+        ok = false;
+        warn("resetService: 重新读取 AI 配置失败（未知异常）");
+    }
+
+    m_resetting = false;
+    emit messagesChanged();
+    if (ok) {
+        info("AI 服务已重置（会话历史保留）");
+        showToast("AI 服务已重置");
+        emit requestCancelled(); // 让页面退出“生成中/等待中”状态
+    } else {
+        showToast("重置失败：配置读取异常，请检查后重试");
+    }
+    return ok;
 }
 
 void ChatBot::saveMessages() {
@@ -4066,6 +4382,8 @@ bool ChatBot::switchSession(const QString& sessionId) {
     saveSessions();
     emit messagesChanged();
     emit sessionSwitched(sessionId);
+    // #21-3：切会话后后台预热该会话历史图片缓存。
+    warmAttachmentCache(m_sessions[sessionId]);
     info("已切换到会话: {}", sessionId.toStdString());
     return true;
 }

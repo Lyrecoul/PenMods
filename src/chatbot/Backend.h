@@ -21,8 +21,8 @@
 #include <QSet>
 #include <QThreadPool>
 #include <QTimer>
-#include <QVector>
 #include <QUuid>
+#include <QVector>
 
 #include <nlohmann/json.hpp>
 using json = nlohmann::json;
@@ -324,6 +324,8 @@ private:
 
 public:
     ~ChatBot();
+    // Explicit shutdown/restart boundary; waits for queued saves and commits the latest state.
+    bool finishSessionSaves();
 
 private:
     QNetworkAccessManager* m_networkManager;
@@ -383,10 +385,18 @@ private:
     QString                    m_currentSessionId;
     QString                    m_sessionsPath;
     QTimer*                    m_saveTimer = nullptr;
+    QThreadPool                m_sessionSavePool;
+    // Only the save worker accesses the last successfully committed snapshot.
+    QMap<QString, SessionData> m_persistedSessions;
+    QMap<QString, QString>     m_sessionFiles;
+    bool                       m_sessionsDirty      = false;
+    bool                       m_sessionSaveRunning = false;
+    bool                       m_sessionStoreReadFailed = false;
 
     void    initSessions();
     void    saveSessions();
     void    flushSessions();
+    bool    writeSessions(const QMap<QString, SessionData>& sessions, const QString& activeId, const QString& path);
     QString sessionsFilePath();
     void    ensureCurrentSession();
 

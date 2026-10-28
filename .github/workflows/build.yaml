@@ -95,6 +95,9 @@ jobs:
         with:
           submodules: recursive
 
+      - name: 校验共享调色板与对比度
+        run: python3 scripts/generate_palette.py --check
+
       # 内嵌 CA 包没有任何吊销检查（issue #18）：黑名单里的根或 hash 与 PEM 错位时直接失败；
       # certifi 跟 Mozilla 最快，比对只报 warning，提示该跑 scripts/update_ca_bundle.sh 了。
       - name: 校验内嵌 CA 证书包

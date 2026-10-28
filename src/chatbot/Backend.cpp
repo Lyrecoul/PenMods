@@ -18,6 +18,7 @@
 #include "shell/ShellCommandPolicy.h"
 
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -228,6 +229,8 @@ ChatBot::ChatBot()
   m_responseBuffer("") {
     m_markdownPool.setMaxThreadCount(1);
     m_markdownPool.setExpiryTimeout(10000);
+    m_sessionSavePool.setMaxThreadCount(1);
+    m_sessionSavePool.setExpiryTimeout(10000);
     m_saveTimer = new QTimer(this);
     m_saveTimer->setSingleShot(true);
     m_saveTimer->setInterval(800);
@@ -237,7 +240,7 @@ ChatBot::ChatBot()
             QCoreApplication::instance(),
             &QCoreApplication::aboutToQuit,
             this,
-            &ChatBot::flushSessions,
+            &ChatBot::finishSessionSaves,
             Qt::UniqueConnection
         );
     });
@@ -286,8 +289,7 @@ ChatBot::ChatBot()
 }
 
 ChatBot::~ChatBot() {
-    if (m_saveTimer->isActive()) m_saveTimer->stop();
-    flushSessions();
+    finishSessionSaves();
     // 清理排队/待确认/正在执行的 shell 命令；进程组 kill 在 cleanupShellExec 中处理。
     m_pendingShellExecs.clear();
     m_queuedShellExecs.clear();
@@ -444,7 +446,8 @@ QJsonArray ChatBot::buildApiMessages(
 
     // history
     for (const auto& msg : history) {
-        if (msg.role == "assistant" && msg.content.isEmpty() && msg.toolCallsJson.isEmpty() && msg.parts.isEmpty()) continue;
+        if (msg.role == "assistant" && msg.content.isEmpty() && msg.toolCallsJson.isEmpty() && msg.parts.isEmpty())
+            continue;
         messages.append(messageToJson(msg));
     }
 
@@ -477,7 +480,8 @@ QJsonArray ChatBot::buildApiMessagesFromHistory() {
     sysMsg["content"] = m_defaultPrompt;
     apiMessages.append(sysMsg);
     for (const auto& msg : currentMessages()) {
-        if (msg.role == "assistant" && msg.content.isEmpty() && msg.toolCallsJson.isEmpty() && msg.parts.isEmpty()) continue;
+        if (msg.role == "assistant" && msg.content.isEmpty() && msg.toolCallsJson.isEmpty() && msg.parts.isEmpty())
+            continue;
         apiMessages.append(messageToJson(msg));
     }
     normalizeToolMessageSequence(apiMessages);
@@ -717,48 +721,105 @@ static bool normalizeHistoryMessages(QVector<MessageData>& messages, int* droppe
 // -----------------------------------------------------------------------
 
 void ChatBot::saveSessions() {
-    // Startup sanitization runs before QCoreApplication and has no timer dispatcher yet.
-    if (!QCoreApplication::instance()) {
-        flushSessions();
-        return;
-    }
+    m_sessionsDirty = true;
+    // Before QCoreApplication exists, there is no timer dispatcher.
+    if (!QCoreApplication::instance()) return;
     m_saveTimer->start();
 }
 
 void ChatBot::flushSessions() {
     m_saveTimer->stop();
-    json root;
-    root["activeSessionId"] = m_currentSessionId.toStdString();
-    json sessionsArr        = json::array();
+    if (!m_sessionsDirty || m_sessionSaveRunning) return;
+    m_sessionsDirty      = false;
+    m_sessionSaveRunning = true;
+    // Qt containers are implicitly shared: no JSON conversion or history walk on the UI thread.
+    const auto snapshot = m_sessions;
+    const auto activeId = m_currentSessionId;
+    const auto path     = sessionsFilePath();
+    m_sessionSavePool.start(new MarkdownTask([this, snapshot, activeId, path] {
+        const bool ok = writeSessions(snapshot, activeId, path);
+        QMetaObject::invokeMethod(
+            this,
+            [this, ok] {
+                m_sessionSaveRunning = false;
+                if (!ok) m_sessionsDirty = true;
+                if (m_sessionsDirty) m_saveTimer->start();
+            },
+            Qt::QueuedConnection
+        );
+    }));
+}
 
-    for (auto it = m_sessions.constBegin(); it != m_sessions.constEnd(); ++it) {
-        const SessionData& session = it.value();
-        json               sessionObj;
-        sessionObj["id"]        = session.id.toStdString();
-        sessionObj["title"]     = session.title.toStdString();
-        sessionObj["createdAt"] = session.createdAt.toStdString();
-        sessionObj["updatedAt"] = session.updatedAt.toStdString();
+bool ChatBot::finishSessionSaves() {
+    m_saveTimer->stop();
+    m_sessionSavePool.waitForDone();
+    // Completion callbacks need the event loop; shutdown drains synchronously instead.
+    m_sessionSaveRunning = false;
+    // Retry the latest snapshot even if a worker failed before its queued completion was delivered.
+    const bool ok = writeSessions(m_sessions, m_currentSessionId, sessionsFilePath());
+    if (ok) m_sessionsDirty = false;
+    return ok;
+}
 
-        json messagesArr = json::array();
-        for (const auto& msg : session.messages) {
-            messagesArr.push_back(messageDataToJson(msg));
+bool ChatBot::writeSessions(const QMap<QString, SessionData>& sessions, const QString& activeId, const QString& path) {
+    if (m_sessionStoreReadFailed) return false;
+    try {
+        const QString directory = path + ".d";
+        if (!QDir().mkpath(directory)) return false;
+        auto writeJson = [](const QString& name, const std::string& payload) {
+            QSaveFile file(name);
+            return file.open(QIODevice::WriteOnly)
+                && file.write(payload.data(), static_cast<qint64>(payload.size()))
+                       == static_cast<qint64>(payload.size())
+                && file.commit();
+        };
+        json root;
+        root["activeSessionId"] = activeId.toStdString();
+        root["sessions"]        = json::array();
+        QMap<QString, QString> files;
+        for (auto it = sessions.constBegin(); it != sessions.constEnd(); ++it) {
+            const auto& session   = it.value();
+            const auto  old       = m_persistedSessions.constFind(it.key());
+            QString     name      = m_sessionFiles.value(it.key());
+            const bool  unchanged = old != m_persistedSessions.constEnd() && old->title == session.title
+                                 && old->createdAt == session.createdAt && old->updatedAt == session.updatedAt
+                                 && old->messages.size() == session.messages.size()
+                                 && old->messages.constData() == session.messages.constData();
+            if (!unchanged || name.isEmpty()) {
+                json data = {
+                    {"id",        session.id.toStdString()       },
+                    {"title",     session.title.toStdString()    },
+                    {"createdAt", session.createdAt.toStdString()},
+                    {"updatedAt", session.updatedAt.toStdString()},
+                    {"messages",  json::array()                  }
+                };
+                for (const auto& message : session.messages) data["messages"].push_back(messageDataToJson(message));
+                const auto payload = data.dump();
+                name =
+                    QString::fromLatin1(
+                        QCryptographicHash::hash(QByteArray::fromStdString(payload), QCryptographicHash::Sha256).toHex()
+                    )
+                    + ".json";
+                // Immutable content-addressed files keep the old index valid until the new index commits.
+                if (!QFile::exists(directory + "/" + name) && !writeJson(directory + "/" + name, payload)) return false;
+            }
+            files.insert(it.key(), name);
+            root["sessions"].push_back({
+                {"file", name.toStdString()}
+            });
         }
-        sessionObj["messages"] = messagesArr;
-        sessionsArr.push_back(sessionObj);
-    }
-    root["sessions"] = sessionsArr;
-
-    // QSaveFile 先写临时文件再改名，否则写盘期间掉电/被杀会把 sessions.json 截断成半个文件，
-    // 下次启动解析失败 → 全部会话丢失。
-    QSaveFile file(sessionsFilePath());
-    if (file.open(QIODevice::WriteOnly)) {
-        const std::string payload = root.dump(4);
-        file.write(payload.c_str(), static_cast<qint64>(payload.size()));
-        if (!file.commit()) {
-            error("提交 sessions.json 失败: {}", sessionsFilePath().toStdString());
+        if (!writeJson(directory + "/index.json", root.dump())) return false;
+        const auto names = files.values();
+        const QSet<QString> liveFiles(names.constBegin(), names.constEnd());
+        for (const auto& name : QDir(directory).entryList({"*.json"}, QDir::Files)) {
+            if (name != "index.json" && !liveFiles.contains(name)) QFile::remove(directory + "/" + name);
         }
-    } else {
-        error("无法写入 sessions.json: {}", sessionsFilePath().toStdString());
+        m_persistedSessions = sessions;
+        m_sessionFiles      = files;
+        return true;
+    } catch (const std::exception& e) {
+        error("保存会话失败: {}", e.what());
+        return false;
     }
 }
 
@@ -767,16 +828,28 @@ void ChatBot::flushSessions() {
 // -----------------------------------------------------------------------
 
 void ChatBot::initSessions() {
-    bool  historySanitized = false;
-    auto  path             = sessionsFilePath();
-    QFile file(path);
+    bool          historySanitized = false;
+    auto          path             = sessionsFilePath();
+    const QString directory        = path + ".d";
+    const bool    splitStore       = QFile::exists(directory + "/index.json");
+    QFile         file(splitStore ? directory + "/index.json" : path);
     if (file.exists() && file.open(QIODevice::ReadOnly)) {
         try {
             json root = json::parse(file.readAll().toStdString());
             file.close();
 
             if (root.contains("sessions") && root["sessions"].is_array()) {
-                for (const auto& sessionObj : root["sessions"]) {
+                for (const auto& entry : root["sessions"]) {
+                    json sessionObj = entry;
+                    if (splitStore) {
+                        const QString name = QString::fromStdString(entry.at("file").get<std::string>());
+                        if (!QRegularExpression("^[0-9a-f]{64}\\.json$").match(name).hasMatch())
+                            throw std::runtime_error("invalid session file name");
+                        QFile sessionFile(directory + "/" + name);
+                        if (!sessionFile.open(QIODevice::ReadOnly))
+                            throw std::runtime_error("cannot read session file");
+                        sessionObj = json::parse(sessionFile.readAll().toStdString());
+                    }
                     SessionData session;
                     session.id        = QString::fromStdString(sessionObj.value("id", ""));
                     session.title     = QString::fromStdString(sessionObj.value("title", "未命名对话"));
@@ -861,7 +934,9 @@ void ChatBot::initSessions() {
 
             info("已加载 {} 个会话", m_sessions.size());
         } catch (const std::exception& e) {
-            warn("sessions.json 解析失败: {}, 使用默认配置", e.what());
+            // Never replace a damaged split store with the subset loaded before the error.
+            m_sessionStoreReadFailed = splitStore;
+            warn("会话加载失败: {}{}", e.what(), splitStore ? "，已暂停保存以保护原始记录" : "，使用默认配置");
         }
     }
 
@@ -869,6 +944,11 @@ void ChatBot::initSessions() {
     if (!m_sessions.contains(m_currentSessionId)) {
         m_currentSessionId = createSession("新对话");
     }
+    // Migrate the legacy file without modifying it; the first successful index commit activates the new store.
+    m_sessionsDirty = true;
+    connect(&Event::getInstance(), &Event::beforeUiInitialization, this, [this](QQuickView&, QQmlContext*) {
+        if (m_sessionsDirty) m_saveTimer->start();
+    });
     if (historySanitized) saveSessions();
     // #21-3：后台预热当前会话历史图片的 data URL 缓存，避免首次请求在 UI 线程读大图。
     if (m_sessions.contains(m_currentSessionId)) warmAttachmentCache(m_sessions[m_currentSessionId]);

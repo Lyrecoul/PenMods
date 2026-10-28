@@ -141,8 +141,8 @@ bool Mod::restartApplication() {
     }
 
     // 先落盘再重启。Config 的每次 write() 都是立即整文件写盘，没有需要额外 flush 的缓存；
-    // AI 助手在每次消息变更后已用 QSaveFile 原子写 sessions.json，cancelRequest() 会把
-    // 正在流式输出的半截回答 persistPartialResponse() 并再次 saveSessions()，
+    // cancelRequest() 会把正在流式输出的半截回答加入待保存快照；
+    // 延迟回调在结束进程前等待后台保存并提交最新状态，
     // 同时终止在途请求，避免重启后旧回调把结果写进新进程的历史。
     chatbot::ChatBot::getInstance().cancelRequest();
 
@@ -156,6 +156,13 @@ bool Mod::restartApplication() {
 }
 
 void Mod::_performApplicationRestart() {
+    if (!chatbot::ChatBot::getInstance().finishSessionSaves()) {
+        spdlog::error("Application restart cancelled: failed to save chat history");
+        mApplicationRestartPending = false;
+        emit applicationRestartPendingChanged();
+        showToast("聊天记录保存失败，已取消重启", "#E9900C");
+        return;
+    }
     // sync 必须在 kill 之前完成，而且 shell 不能随本进程一起死：QProcess::startDetached
     // 启动的子进程会被 init 收养，本进程收到 SIGTERM 后命令仍会跑完。
     const bool started = QProcess::startDetached("/bin/sh", QStringList{"-c", "sync; killall YoudaoDictPen"});

@@ -620,9 +620,8 @@ Releasing touches three places: the version in this repo, a release tag here, an
   is templated at configure time into `build/config/Version.h` (`VERSION_MAJOR/MINOR/ALTER`).
 - `VERSION_STRING` becomes `X.Y.Z` (`Mod::getVersionStr()`, and the updater's `mSelfVersion`), while `VERSION_CONFIG`
   is the digits concatenated (e.g. `2.3.0` → `230`) and drives config migration in `src/mod/Config.cpp`.
-- `BUILD_INFO_STRING` prints a literal `[BUILD_CHANNEL]`: the template only substitutes `VERSION_*`/`MODE`/`GIT_COMMIT`,
-  so `VERSION_TO_STRING(BUILD_CHANNEL)` stringifies the macro name instead of its value. Do not rely on it to tell a
-  channel/`--target-channel` build apart.
+- `BUILD_INFO_STRING` includes the uppercase `--target-channel` value (`DEV`, `CANARY`, `BETA`, `STABLE`).
+  `xmake.lua` supplies `BUILD_CHANNEL` to `Version.h.in` as a string; concatenate it directly rather than stringifying it.
 
 ### 1. Bump and tag this repo
 

@@ -8,6 +8,7 @@
 #define VERSION_MINOR       ${VERSION_MINOR}
 #define VERSION_ALTER       ${VERSION_ALTER}
 
+#define BUILD_CHANNEL       "${BUILD_CHANNEL}"
 #define BUILD_MODE          "${MODE}"
 #define BUILD_COMMIT_SHA    "${GIT_COMMIT}"
 
@@ -20,7 +21,7 @@
     "." VERSION_TO_STRING(VERSION_ALTER) \
 
 #define BUILD_INFO_STRING                    \
-    "[" VERSION_TO_STRING(BUILD_CHANNEL) "]" \
+    "[" BUILD_CHANNEL "]"                    \
     " " VERSION_STRING                       \
     "+" BUILD_COMMIT_SHA                     \
     "-" BUILD_MODE   

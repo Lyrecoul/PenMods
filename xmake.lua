@@ -66,6 +66,7 @@ set_warnings('all')
 set_exceptions('cxx')
 
 set_configdir('$(builddir)/config')
+set_configvar('BUILD_CHANNEL', (get_config('target-channel') or 'dev'):upper())
 add_configfiles('src/mod/Version.h.in')
 
 if is_mode('debug') or get_config('force-debug-log') then

@@ -17,6 +17,7 @@
 #include "mod/Mod.h"
 #include "shell/ShellCommandPolicy.h"
 
+#include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -227,6 +228,19 @@ ChatBot::ChatBot()
   m_responseBuffer("") {
     m_markdownPool.setMaxThreadCount(1);
     m_markdownPool.setExpiryTimeout(10000);
+    m_saveTimer = new QTimer(this);
+    m_saveTimer->setSingleShot(true);
+    m_saveTimer->setInterval(800);
+    connect(m_saveTimer, &QTimer::timeout, this, &ChatBot::flushSessions);
+    connect(&Event::getInstance(), &Event::beforeUiInitialization, this, [this](QQuickView&, QQmlContext*) {
+        connect(
+            QCoreApplication::instance(),
+            &QCoreApplication::aboutToQuit,
+            this,
+            &ChatBot::flushSessions,
+            Qt::UniqueConnection
+        );
+    });
     info("ChatBot 初始化完成");
 
     auto& config = mod::Config::getInstance();
@@ -272,6 +286,8 @@ ChatBot::ChatBot()
 }
 
 ChatBot::~ChatBot() {
+    if (m_saveTimer->isActive()) m_saveTimer->stop();
+    flushSessions();
     // 清理排队/待确认/正在执行的 shell 命令；进程组 kill 在 cleanupShellExec 中处理。
     m_pendingShellExecs.clear();
     m_queuedShellExecs.clear();
@@ -701,6 +717,16 @@ static bool normalizeHistoryMessages(QVector<MessageData>& messages, int* droppe
 // -----------------------------------------------------------------------
 
 void ChatBot::saveSessions() {
+    // Startup sanitization runs before QCoreApplication and has no timer dispatcher yet.
+    if (!QCoreApplication::instance()) {
+        flushSessions();
+        return;
+    }
+    m_saveTimer->start();
+}
+
+void ChatBot::flushSessions() {
+    m_saveTimer->stop();
     json root;
     root["activeSessionId"] = m_currentSessionId.toStdString();
     json sessionsArr        = json::array();

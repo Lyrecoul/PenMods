@@ -382,9 +382,11 @@ private:
     QMap<QString, SessionData> m_sessions;
     QString                    m_currentSessionId;
     QString                    m_sessionsPath;
+    QTimer*                    m_saveTimer = nullptr;
 
     void    initSessions();
     void    saveSessions();
+    void    flushSessions();
     QString sessionsFilePath();
     void    ensureCurrentSession();
 

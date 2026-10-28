@@ -86,8 +86,7 @@ bool isMountPoint(const std::string& path) {
  */
 
 InputDaemon::InputDaemon() : Logger("InputDaemon") {
-    // task-9：耳机线控探测（默认关闭/仅检测到明确媒体键设备时启用，当前只识别不动作）。
-    // 从这里实例化可以避免改动 task-9 写范围之外的 src/mod/Mod.cpp。
+    // USB/蓝牙耳机媒体键监听，等 UI 就绪后才启动。
     HeadsetControls::getInstance();
     connect(&Event::getInstance(), &Event::uiCompleted, this, &InputDaemon::onUiCompleted);
 }

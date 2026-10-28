@@ -48,8 +48,6 @@ bool testBit(const std::array<unsigned long, N>& bits, int code) {
     return (bits[word] >> (static_cast<size_t>(code) % (8 * sizeof(unsigned long)))) & 1UL;
 }
 
-// 数字耳机（USB 输入设备）才会带 KEY_PLAYPAUSE；模拟耳机只有 SW_HEADPHONE_INSERT。
-bool isUsbBus(unsigned short bustype) { return bustype == BUS_USB; }
 
 } // namespace
 
@@ -164,14 +162,19 @@ bool HeadsetControls::_probeDevice(const std::string& path, DeviceInfo* out) con
     out->product          = id.product;
     out->headphoneSwitch  = swOk && testBit(swBits, SW_HEADPHONE_INSERT);
     out->playPause        = keyOk && testBit(keyBits, KEY_PLAYPAUSE);
+    out->play             = keyOk && (testBit(keyBits, KEY_PLAY) || testBit(keyBits, KEY_PLAYCD));
+    out->pause            = keyOk && (testBit(keyBits, KEY_PAUSE) || testBit(keyBits, KEY_PAUSECD));
+    out->next             = keyOk && testBit(keyBits, KEY_NEXTSONG);
+    out->previous         = keyOk && testBit(keyBits, KEY_PREVIOUSSONG);
     out->vendorVolumeKeys = keyOk && (testBit(keyBits, KEY_VOLUMEUP) || testBit(keyBits, KEY_VOLUMEDOWN));
     return true;
 }
 
 bool HeadsetControls::_isHeadphoneMediaDevice(const DeviceInfo& device) const {
-    // 只认“USB 总线 + 含 KEY_PLAYPAUSE”的设备：不硬编码 event 编号，也不依赖名称
-    // （event6 会被 penmods-injector 等虚拟设备复用）。
-    return isUsbBus(device.bustype) && device.playPause;
+    // USB 保持原有门槛；蓝牙也接受只暴露独立播放/暂停或切歌键的设备。
+    return (device.bustype == BUS_USB && device.playPause)
+        || (device.bustype == BUS_BLUETOOTH
+            && (device.playPause || device.play || device.pause || device.next || device.previous));
 }
 
 void HeadsetControls::_scan(const char* reason) {
@@ -192,8 +195,9 @@ void HeadsetControls::_scan(const char* reason) {
         std::string signature;
         for (const auto& d : devices) {
             signature += d.path + "|" + d.name + "|" + std::to_string(d.bustype) + "|" + std::to_string(d.vendor) + "|"
-                       + std::to_string(d.product) + "|" + (d.playPause ? "P" : "-") + (d.headphoneSwitch ? "S" : "-")
-                       + (d.vendorVolumeKeys ? "V" : "-") + ";";
+                       + std::to_string(d.product) + "|" + (d.playPause ? "P" : "-") + (d.play ? "p" : "-")
+                       + (d.pause ? "A" : "-") + (d.next ? "N" : "-") + (d.previous ? "B" : "-")
+                       + (d.headphoneSwitch ? "S" : "-") + (d.vendorVolumeKeys ? "V" : "-") + ";";
         }
         if (signature == mLastSignature) {
             mDevices = std::move(devices);
@@ -208,7 +212,7 @@ void HeadsetControls::_scan(const char* reason) {
                 found = true;
                 info(
                     "耳机线控设备：{} name=\"{}\" phys=\"{}\" bus=0x{:04x} vendor=0x{:04x} product=0x{:04x} "
-                    "play_pause={} vendor_volume_keys={}",
+                    "play_pause={} play={} pause={} next={} previous={} vendor_volume_keys={}",
                     d.path,
                     d.name,
                     d.phys,
@@ -216,12 +220,16 @@ void HeadsetControls::_scan(const char* reason) {
                     d.vendor,
                     d.product,
                     d.playPause,
+                    d.play,
+                    d.pause,
+                    d.next,
+                    d.previous,
                     d.vendorVolumeKeys
                 );
             }
         }
         if (!found) {
-            debug("耳机线控扫描（{}）：当前没有 USB+PLAYPAUSE 设备", reason);
+            debug("耳机线控扫描（{}）：当前没有 USB/蓝牙媒体键设备", reason);
         }
         _openDevices();
     } catch (const std::exception& e) {
@@ -232,6 +240,9 @@ void HeadsetControls::_scan(const char* reason) {
 }
 
 void HeadsetControls::_closeDevices() {
+    // 不让已拔出的 USB 耳机留下待执行的连击。
+    mClickTimer.stop();
+    mClickCount = 0;
     for (auto* device : mOpenDevices) {
         if (device->notifier != nullptr) {
             device->notifier->setEnabled(false);
@@ -283,10 +294,15 @@ void HeadsetControls::_onReadable(OpenDevice* device) {
                     return;
                 }
                 warn("耳机线控：读取 {} 失败（{}），关闭监听并在稍后重扫", device->info.path, std::strerror(errno));
+                device->notifier->setEnabled(false);
+                mLastSignature.clear();
                 QTimer::singleShot(0, this, [this]() { refresh("device-read-error"); });
                 return;
             }
             if (n == 0) {
+                device->notifier->setEnabled(false);
+                mLastSignature.clear();
+                QTimer::singleShot(0, this, [this]() { refresh("device-eof"); });
                 return;
             }
             const size_t count = static_cast<size_t>(n) / sizeof(struct input_event);
@@ -294,9 +310,24 @@ void HeadsetControls::_onReadable(OpenDevice* device) {
                 const struct input_event& ev = events[i];
                 if (ev.type == EV_KEY) {
                     if (ev.code == KEY_PLAYPAUSE) {
-                        // 采样显示单击/双击/三击都只发 KEY_PLAYPAUSE，用释放沿计数。
+                        // 蓝牙手势由耳机解析，不能把两条播放暂停命令合并成“下一曲”。
+                        // USB 保持原有释放沿连击语义。
                         if (ev.value == 0) {
-                            _onPlayPauseClick();
+                            if (device->info.bustype == BUS_BLUETOOTH) {
+                                _dispatchTogglePlayPause();
+                            } else {
+                                _onPlayPauseClick();
+                            }
+                        }
+                    } else if (
+                        ev.code == KEY_PLAY || ev.code == KEY_PLAYCD || ev.code == KEY_PAUSE || ev.code == KEY_PAUSECD
+                    ) {
+                        if (ev.value == 1) {
+                            (ev.code == KEY_PLAY || ev.code == KEY_PLAYCD) ? _dispatchPlay() : _dispatchPause();
+                        }
+                    } else if (ev.code == KEY_NEXTSONG || ev.code == KEY_PREVIOUSSONG) {
+                        if (ev.value == 1) {
+                            ev.code == KEY_NEXTSONG ? _dispatchNext() : _dispatchPrevious();
                         }
                     } else if (ev.code == KEY_VOLUMEUP || ev.code == KEY_VOLUMEDOWN) {
                         // 厂商 dig_headset_sevice 的 evtest 输出是块缓冲、短按不生效（见头文件注释），
@@ -351,8 +382,7 @@ void HeadsetControls::_onVolumeKey(bool up) {
         // 正常短按不生效；若未来厂商修复，可把 headset.handle_volume 置 false。
         // 注意：厂商脚本以 `sh /usr/bin/dig_headset_sevice` 运行，`pidof dig_headset_sevice`
         // 匹配不到脚本名，必须用 ps 看完整命令行。
-        const std::string vendor =
-            exec("ps w | grep -F 'dig_headset_sevice' | grep -v grep | head -n 1");
+        const std::string vendor = exec("ps w | grep -F 'dig_headset_sevice' | grep -v grep | head -n 1");
         info(
             "耳机线控：接管音量键（step={}）；厂商 dig_headset_sevice={}",
             kVolumeStep,
@@ -399,29 +429,51 @@ void HeadsetControls::_flushClickWindow() {
 void HeadsetControls::_dispatchTogglePlayPause() {
     auto& session = MediaSession::getInstance();
     if (session.active()) {
-        info("耳机线控：单击 → 播放/暂停（MediaSession 插件会话 {}）", session.ownerPluginId().toStdString());
+        info("耳机线控：播放/暂停（MediaSession 插件会话 {}）", session.ownerPluginId().toStdString());
         session.requestTogglePlayPause();
         return;
     }
     auto*      manager = YPointer<YMediaPlayerManager>::getInstance();
     const auto state   = PEN_CALL(PlayState, "_ZNK19YMediaPlayerManager9playStateEv", void*)(manager);
     if (state == PlayState::PLAYING) {
-        info("耳机线控：单击 → 暂停（宿主播放器）");
+        info("耳机线控：暂停（宿主播放器）");
         PEN_CALL(void, "_ZN19YMediaPlayerManager14onClickedPauseEv", void*)(manager);
     } else {
-        info("耳机线控：单击 → 播放（宿主播放器）");
+        info("耳机线控：播放（宿主播放器）");
         PEN_CALL(void, "_ZN19YMediaPlayerManager13onClickedPlayEv", void*)(manager);
     }
+}
+
+void HeadsetControls::_dispatchPlay() {
+    auto& session = MediaSession::getInstance();
+    if (session.active()) {
+        info("耳机线控：播放（MediaSession 插件会话 {}）", session.ownerPluginId().toStdString());
+        session.requestPlay();
+        return;
+    }
+    info("耳机线控：播放（宿主播放器）");
+    PEN_CALL(void, "_ZN19YMediaPlayerManager13onClickedPlayEv", void*)(YPointer<YMediaPlayerManager>::getInstance());
+}
+
+void HeadsetControls::_dispatchPause() {
+    auto& session = MediaSession::getInstance();
+    if (session.active()) {
+        info("耳机线控：暂停（MediaSession 插件会话 {}）", session.ownerPluginId().toStdString());
+        session.requestPause();
+        return;
+    }
+    info("耳机线控：暂停（宿主播放器）");
+    PEN_CALL(void, "_ZN19YMediaPlayerManager14onClickedPauseEv", void*)(YPointer<YMediaPlayerManager>::getInstance());
 }
 
 void HeadsetControls::_dispatchNext() {
     auto& session = MediaSession::getInstance();
     if (session.active()) {
-        info("耳机线控：双击 → 下一曲（MediaSession 插件会话 {}）", session.ownerPluginId().toStdString());
+        info("耳机线控：下一曲（MediaSession 插件会话 {}）", session.ownerPluginId().toStdString());
         session.requestNext();
         return;
     }
-    info("耳机线控：双击 → 下一曲（宿主播放器）");
+    info("耳机线控：下一曲（宿主播放器）");
     PEN_CALL(uint64, "_ZN19YMediaPlayerManager13onClickedNextEb", void*, bool)
     (YPointer<YMediaPlayerManager>::getInstance(), true);
 }
@@ -429,11 +481,11 @@ void HeadsetControls::_dispatchNext() {
 void HeadsetControls::_dispatchPrevious() {
     auto& session = MediaSession::getInstance();
     if (session.active()) {
-        info("耳机线控：三击 → 上一曲（MediaSession 插件会话 {}）", session.ownerPluginId().toStdString());
+        info("耳机线控：上一曲（MediaSession 插件会话 {}）", session.ownerPluginId().toStdString());
         session.requestPrevious();
         return;
     }
-    info("耳机线控：三击 → 上一曲（宿主播放器）");
+    info("耳机线控：上一曲（宿主播放器）");
     PEN_CALL(uint64, "_ZN19YMediaPlayerManager13onClickedPrevEb", void*, bool)
     (YPointer<YMediaPlayerManager>::getInstance(), true);
 }

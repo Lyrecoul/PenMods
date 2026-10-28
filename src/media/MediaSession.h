@@ -60,6 +60,8 @@ public:
 
     /// 外部输入（耳机线控等）触发的控制请求：与下拉快捷面板发出的信号走同一条路。
     /// 仅在 active() 为 true 时有意义（调用方 HeadsetControls 会先判断）。
+    void requestPlay();
+    void requestPause();
     void requestTogglePlayPause();
     void requestNext();
     void requestPrevious();

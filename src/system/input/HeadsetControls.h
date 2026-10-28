@@ -25,8 +25,12 @@ namespace mod {
  * 该设备没有 NEXT/PREV 键；模拟耳机只有 SW_HEADPHONE_INSERT，没有按键源。
  *
  * 设备识别：**不硬编码 event 编号、不依赖名称** —— 用 EVIOCGBIT 判断
- * “EV_KEY 含 KEY_PLAYPAUSE”且 “bus == BUS_USB”。实测 `/dev/input/event6` 还会被其它虚拟
+ * “含媒体键”且 “bus == BUS_USB 或 BUS_BLUETOOTH”。实测 `/dev/input/event6` 还会被其它虚拟
  * 设备复用（penmods-injector），所以只认 capabilities + bus。
+ * USB 仍要求 KEY_PLAYPAUSE；蓝牙接受 KEY_PLAYPAUSE、KEY_PLAY/PLAYCD、KEY_PAUSE/PAUSECD、
+ * KEY_NEXTSONG、KEY_PREVIOUSSONG。蓝牙耳机自行解析手势，每条命令立即执行，不套 USB 连击窗口。
+ * YDP02X + REDMI Buds 8 Pro 已确认创建 BUS_BLUETOOTH 输入设备，提供独立播放/暂停和切歌键。
+ * 这覆盖固件映射到 Linux input 的蓝牙控制；不提供 LE Audio 或另行注册 D-Bus AVRCP 播放器。
  *
  * 音量键 114/115：厂商 /usr/bin/dig_headset_sevice 虽然会在插入时启动（probe 快照证实），
  * 但它用 `evtest > FIFO` 且没有 stdbuf，stdout 是块缓冲 —— 父 shell 的 `while read` 在
@@ -37,8 +41,8 @@ namespace mod {
  * 若未来厂商修复脚本，可再切回由厂商处理。
  *
  * 设备热插拔用 2s 轮询（不监听 event0 也能发现新设备/拔出），拔出即关闭 notifier。
- * 默认启用，可通过配置 `headset.enabled=false` 关闭（Config 默认值里暂无 headset 段，
- * 读取时缺失返回 null，必须 is_object() 兜底 —— 此处曾因对 null 调 value() 导致启动 SIGABRT）。
+ * 默认启用，可通过配置 `headset.enabled=false` 关闭。
+ * 配置缺失时保留 is_object() 兜底，避免对 null 调 value() 导致启动 SIGABRT。
  *
  * 所有入口（uiCompleted 槽、QSocketNotifier、QTimer）都做异常兜底，异常不得逃出 Qt 事件派发。
  */
@@ -55,7 +59,11 @@ public:
         unsigned short product          = 0;
         bool           headphoneSwitch  = false; ///< EV_SW 含 SW_HEADPHONE_INSERT
         bool           playPause        = false; ///< EV_KEY 含 KEY_PLAYPAUSE
-        bool           vendorVolumeKeys = false; ///< EV_KEY 含 114/115（厂商消费，不处理）
+        bool           vendorVolumeKeys = false; ///< KEY_VOLUMEUP/KEY_VOLUMEDOWN
+        bool           play             = false;
+        bool           pause            = false;
+        bool           next             = false;
+        bool           previous         = false;
     };
 
     void onUiCompleted();
@@ -79,7 +87,7 @@ private:
 
     bool _probeDevice(const std::string& path, DeviceInfo* out) const;
 
-    /// 明确的耳机媒体键设备：USB 总线 + KEY_PLAYPAUSE（不看名称/event 号）。
+    /// USB/蓝牙媒体键设备（不看名称/event 号）。
     bool _isHeadphoneMediaDevice(const DeviceInfo& device) const;
 
     void _openDevices();
@@ -97,6 +105,10 @@ private:
     void _flushClickWindow();
 
     void _dispatchTogglePlayPause();
+
+    void _dispatchPlay();
+
+    void _dispatchPause();
 
     void _dispatchNext();
 

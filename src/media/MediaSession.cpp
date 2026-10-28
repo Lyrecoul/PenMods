@@ -380,6 +380,18 @@ void MediaSession::releaseFor(const QString& pluginId) {
     }
 }
 
+void MediaSession::requestPlay() {
+    if (mActive) {
+        emit playRequested();
+    }
+}
+
+void MediaSession::requestPause() {
+    if (mActive) {
+        emit pauseRequested();
+    }
+}
+
 void MediaSession::requestTogglePlayPause() {
     if (!mActive) {
         return;

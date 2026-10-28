@@ -309,6 +309,7 @@ void HeadsetControls::_onReadable(OpenDevice* device) {
             for (size_t i = 0; i < count; ++i) {
                 const struct input_event& ev = events[i];
                 if (ev.type == EV_KEY) {
+                    debug("耳机输入：device={} code={} value={}", device->info.path, ev.code, ev.value);
                     if (ev.code == KEY_PLAYPAUSE) {
                         // 蓝牙手势由耳机解析，不能把两条播放暂停命令合并成“下一曲”。
                         // USB 保持原有释放沿连击语义。

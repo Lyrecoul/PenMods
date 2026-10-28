@@ -14,6 +14,8 @@
 #include "common/util/System.h"
 #include "mod/Config.h"
 
+#include "media/MediaSession.h"
+
 #include "system/sound/AudioDaemon.h"
 #include "system/input/ScreenManager.h"
 
@@ -683,6 +685,8 @@ void MusicPlayer::stop() {
     mCurrentPlaying.mIsEnd = true;
     auto state = PlayState::STOPPED;
     *(uint32*)(*((uint64*)manager + 4) + 100) = 0;
+    // 清除状态/曲目并不会停止解码器，必须先通知 YSoundCenter 停掉实际音频。
+    PEN_CALL(void, "_ZN12YSoundCenter9forceStopEv", void*)(YPointer<YSoundCenter>::getInstance());
     PEN_CALL(void*, "_ZN19YMediaPlayerManager12setPlayStateERKN12YEnumWrapper10Play_StateE", void*, void*)
     (manager, &state);
     PEN_CALL(void*, "_ZN19YMediaPlayerManager8wipeDataEv", void*)(manager);
@@ -722,6 +726,24 @@ void MusicPlayer::releaseAudioAfterHide() {
 
 using MusicPlayer = mod::filemanager::MusicPlayer;
 
+namespace {
+
+// 音乐主动起播时也必须撤销视频/插件会话，否则声音与媒体控制归属会分离。
+void releaseSessionForHostPlayback() {
+    auto& session = mod::MediaSession::getInstance();
+    if (!session.active()) return;
+    const auto owner = session.ownerPluginId();
+    emit       session.stopRequested();
+    session.end(owner);
+}
+
+} // namespace
+
+PEN_HOOK(void*, _ZN13YMediaManager9playAudioERK18YColumnMediaEntityb, void* self, const void* entity, bool play) {
+    if (play) releaseSessionForHostPlayback();
+    return origin(self, entity, play);
+}
+
 PEN_HOOK(void*, _ZN13YMediaManager10clickMediaEi, void* a1, void* a2) {
     MusicPlayer::mIsTakeOver = false;
     return origin(a1, a2);
@@ -737,6 +759,7 @@ PEN_HOOK(void, _ZN19YMediaPlayerManager13setCurrentPosERKx, void* self, int64_t 
 }
 
 PEN_HOOK(void, _ZN19YMediaPlayerManager13onClickedPlayEv, void* self) {
+    releaseSessionForHostPlayback();
     origin(self);
     if (MusicPlayer::mIsTakeOver) {
         MusicPlayer::getInstance().onPlaybackResumedAfterScan();

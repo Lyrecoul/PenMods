@@ -291,6 +291,7 @@ PEN_HOOK(bool, license_verify) { return true; }
 #include "system/input/ScreenManager.h"
 #include "system/sound/ASound.h"
 #include "system/sound/AudioDaemon.h"
+#include "system/sound/VolumeGuard.h"
 
 #include "torch/Torch.h"
 
@@ -389,6 +390,7 @@ __attribute__((constructor)) static void BeforeMain() {
     INSTANCE(ScreenManager);
     INSTANCE(ASound);
     INSTANCE(AudioDaemon);
+    INSTANCE(VolumeGuard);
 
     // torch
     INSTANCE(Torch);

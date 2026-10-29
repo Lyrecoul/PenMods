@@ -95,6 +95,14 @@ Config::Config() : Logger("Config") {
             {"suspend_duration", 600},
             {"performance_mode", 0}
         }},
+        // 各输出路径使用独立的百分比上限，未知输出取最严格的上限。
+        {"volume_guard", {
+            {"enabled", true},
+            {"speaker", 70},
+            {"analog_headphone", 50},
+            {"usb_headphone", 50},
+            {"bluetooth", 50}
+        }},
         // Type-C 耳机线控：默认开启“检测到明确媒体键设备才动作”，插拔/异常安全；
         // enabled=false 可完全关闭（不打开任何 /dev/input 设备）；
         // handle_volume=false 只关音量接管（厂商脚本修复后可用），播放/暂停等仍保留。

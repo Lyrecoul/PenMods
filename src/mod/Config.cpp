@@ -26,6 +26,7 @@ Config::Config() : Logger("Config") {
 
     mData = {
         {"version", VERSION_CONFIG},
+        {"updater", {{"manifest_url", ""}, {"github_proxy", ""}}},
         {"column_db", {
              {"patch", true}
         }},

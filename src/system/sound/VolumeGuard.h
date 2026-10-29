@@ -24,6 +24,8 @@ public:
     int              clamp(int value, int output) const;
     int              currentOutput() const { return mOutput.load(); }
     static int       parseOutput(const QString& output);
+    void             noteVolumeWrite();
+    int              measuredVolume() const;
 
 signals:
     void settingsChanged();
@@ -35,6 +37,10 @@ private:
     void                            save();
     void                            refresh();
     void                            enforce();
+    void                            synchronize(int measured);
+    std::atomic<int>                mMeasured{-1};
+    std::atomic<qint64>             mLastWrite{0};
+    std::atomic<qint64>             mLastMeasurement{0};
     std::atomic<bool>               mEnabled{true};
     std::array<std::atomic<int>, 4> mLimits{
         {70, 50, 50, 50}

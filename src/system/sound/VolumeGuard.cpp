@@ -9,8 +9,10 @@
 #include <QFile>
 #include <QProcess>
 #include <QQmlContext>
+#include <QRegularExpression>
 #include <QTimer>
 #include <algorithm>
+#include <chrono>
 
 namespace mod {
 namespace {
@@ -24,6 +26,51 @@ constexpr const char* kProbe =
     "elif grep -q '^ble=client$' /data/cfg/sys_config.conf "
     "&& hcitool con 2>/dev/null | grep -q 'ACL'; then echo bt; "
     "elif [ -r /sys/kernel/debug/gpio ] && [ -r /data/cfg/sys_config.conf ]; then echo spk; fi";
+qint64 monotonicMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// Read the same mixer controls the vendor writes. BlueALSA exposes raw 0..127
+// values; USB and analog controls report their own min/max rather than a shared range.
+QString stateProbe() {
+    return QStringLiteral(
+               "route=$(%1); echo \"$route\"; case \"$route\" in "
+               "bt) amixer -Dbluealsa scontents;; "
+               "hp) amixer cget name='MasterAHP Volume';; "
+               "spk) amixer cget name='Master Playback Volume';; "
+               "dig_hp) control=$(amixer -c1 controls | awk -F, '/Playback Volume/ {print $1; exit}'); "
+               "[ -n \"$control\" ] && amixer -c1 cget \"$control\";; esac"
+    )
+        .arg(kProbe);
+}
+
+int mixerPercent(int output, const QString& text) {
+    int minimum = 0;
+    int maximum = 127;
+    if (output == 3) {
+        const QRegularExpression channel(QStringLiteral("(?:Front (?:Left|Right)|Mono): Playback (\\d+)"));
+        auto                     matches = channel.globalMatch(text);
+        int                      loudest = -1;
+        while (matches.hasNext()) loudest = std::max(loudest, matches.next().captured(1).toInt());
+        if (loudest < 0 || loudest > maximum) return -1;
+        return (loudest * 100 + maximum / 2) / maximum;
+    }
+    const auto range    = QRegularExpression(QStringLiteral("min=(-?\\d+),max=(-?\\d+)")).match(text);
+    const auto channels = QRegularExpression(QStringLiteral(": values=([0-9, -]+)")).match(text);
+    if (!range.hasMatch() || !channels.hasMatch()) return -1;
+    minimum = range.captured(1).toInt();
+    maximum = range.captured(2).toInt();
+    if (maximum <= minimum) return -1;
+    int loudest = minimum;
+    for (const auto& channel : channels.captured(1).split(',')) {
+        bool      ok    = false;
+        const int value = channel.trimmed().toInt(&ok);
+        if (!ok || value < minimum || value > maximum) return -1;
+        loudest = std::max(loudest, value);
+    }
+    return static_cast<int>((qint64(loudest - minimum) * 100 + (maximum - minimum) / 2) / (maximum - minimum));
+}
 } // namespace
 
 VolumeGuard::VolumeGuard() {
@@ -88,8 +135,9 @@ void VolumeGuard::setLimit(int output, int value) {
 
 void VolumeGuard::refresh() {
     // The vendor probe runs shell tools; never wait for it on the UI thread.
-    auto* process = new QProcess(this);
-    auto* timeout = new QTimer(process);
+    const qint64 started = monotonicMs();
+    auto*        process = new QProcess(this);
+    auto*        timeout = new QTimer(process);
     timeout->setSingleShot(true);
     connect(timeout, &QTimer::timeout, process, &QProcess::kill);
     const auto finish = [this, process]() {
@@ -100,15 +148,21 @@ void VolumeGuard::refresh() {
         process,
         QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
         this,
-        [this, process, finish](int code, QProcess::ExitStatus status) {
-            const int output = code == 0 && status == QProcess::NormalExit
-                                 ? parseOutput(QString::fromUtf8(process->readAllStandardOutput()))
-                                 : -1;
+        [this, process, finish, started](int code, QProcess::ExitStatus status) {
+            const auto state = QString::fromUtf8(process->readAllStandardOutput());
+            const int  output =
+                code == 0 && status == QProcess::NormalExit ? parseOutput(state.section('\n', 0, 0)) : -1;
             if (mOutput.exchange(output) != output) {
+                mMeasured = -1;
                 emit outputChanged();
                 spdlog::info("VolumeGuard: output={}, limit={}", output, currentLimit());
             }
-            enforce();
+            // A request or worker write during this read invalidates the sample.
+            // Allow queued hardware writes to settle before reconciling the UI.
+            if (output >= 0 && started > mLastWrite.load() && monotonicMs() - mLastWrite.load() > 700) {
+                synchronize(mixerPercent(output, state));
+                enforce();
+            }
             finish();
         }
     );
@@ -119,36 +173,67 @@ void VolumeGuard::refresh() {
             finish();
         }
     });
-    process->start("/bin/sh", {"-c", kProbe});
+    process->start("/bin/sh", {"-c", stateProbe()});
     timeout->start(2000);
+}
+
+void VolumeGuard::noteVolumeWrite() {
+    mLastWrite = monotonicMs();
+    mMeasured  = -1;
+}
+
+int VolumeGuard::measuredVolume() const {
+    return monotonicMs() - mLastMeasurement.load() < 2500 ? mMeasured.load() : -1;
+}
+
+void VolumeGuard::synchronize(int measured) {
+    if (measured < 0) {
+        mMeasured = -1;
+        return;
+    }
+    mMeasured        = measured;
+    mLastMeasurement = monotonicMs();
+    if (measured > currentLimit()) return; // enforce() must lower the mixer first.
+    auto* setting = YPointer<YSettingManager>::getInstance();
+    if (!setting) return;
+    const int displayed = PEN_CALL(int, "_ZN15YSettingManager9spkVolumeEv", void*)(setting);
+    // Refresh through the host's read/notify API: no setter, mixer write, or
+    // flash write. The get_spk_volume hook supplies this measured value.
+    if (displayed != measured) PEN_CALL(void, "_ZN15YSettingManager18updateVolumeAndLcdEv", void*)(setting);
 }
 
 void VolumeGuard::enforce() {
     const int output = currentOutput();
     if (!mReady || !enabled() || output < 0) return;
-    // Route activation can restore a saved mixer value without calling setSpkVolume.
-    QFile file("/data/cfg/sys_config.conf");
-    if (!file.open(QIODevice::ReadOnly)) return;
-    for (const auto& line : file.readAll().split('\n')) {
-        const auto parts = line.trimmed().split('=');
-        if (parts.size() != 2 || parts[0] != kVolumeKeys[output]) continue;
-        bool      ok    = false;
-        const int saved = parts[1].toInt(&ok);
-        if (!ok || saved <= currentLimit()) return;
-        const int cap     = currentLimit();
-        auto*     setting = YPointer<YSettingManager>::getInstance();
-        PEN_CALL(void, "_ZN15YSettingManager12setSpkVolumeEi", void*, int)(setting, cap);
-        // The setting setter returns early if its cached value already equals cap.
-        PEN_CALL(void, "_ZN14YDeviceManager12setSpkVolumeEi", void*, int)
-        (PEN_CALL(void*, "_ZN10YSingletonI14YDeviceManagerE8instanceEv")(), cap);
-        spdlog::info("VolumeGuard: reduced output={} volume={} to {}", output, saved, cap);
-        return;
+    int volume = measuredVolume();
+    // Fall back to the vendor's saved value only when the mixer is unavailable.
+    if (volume < 0) {
+        QFile file("/data/cfg/sys_config.conf");
+        if (!file.open(QIODevice::ReadOnly)) return;
+        for (const auto& line : file.readAll().split('\n')) {
+            const auto parts = line.trimmed().split('=');
+            if (parts.size() != 2 || parts[0] != kVolumeKeys[output]) continue;
+            bool      ok    = false;
+            const int saved = parts[1].toInt(&ok);
+            if (ok && saved >= 0 && saved <= 100) volume = saved;
+            break;
+        }
     }
+    const int cap = currentLimit();
+    if (volume <= cap) return;
+    auto* setting = YPointer<YSettingManager>::getInstance();
+    if (!setting) return;
+    PEN_CALL(void, "_ZN15YSettingManager12setSpkVolumeEi", void*, int)(setting, cap);
+    // The setting setter returns early if its cached value already equals cap.
+    PEN_CALL(void, "_ZN14YDeviceManager12setSpkVolumeEi", void*, int)
+    (PEN_CALL(void*, "_ZN10YSingletonI14YDeviceManagerE8instanceEv")(), cap);
+    spdlog::info("VolumeGuard: reduced output={} volume={} to {}", output, volume, cap);
 }
 } // namespace mod
 
 PEN_HOOK(void, _ZN15YSettingManager12setSpkVolumeEi, void* self, int value) {
     auto& guard = mod::VolumeGuard::getInstance();
+    guard.noteVolumeWrite();
     origin(self, guard.clamp(value, guard.currentOutput()));
 }
 
@@ -157,5 +242,17 @@ PEN_HOOK(void, _ZN15YSettingManager12setSpkVolumeEi, void* self, int value) {
 PEN_HOOK(int, set_spk_volume, int value) {
     auto&     guard  = mod::VolumeGuard::getInstance();
     const int output = mod::VolumeGuard::parseOutput(QString::fromStdString(mod::exec(mod::kProbe)));
-    return origin(guard.clamp(value, output));
+    guard.noteVolumeWrite();
+    const int result = origin(guard.clamp(value, output));
+    guard.noteVolumeWrite();
+    return result;
+}
+
+PEN_HOOK(int, get_spk_volume, int* value) {
+    const int measured = mod::VolumeGuard::getInstance().measuredVolume();
+    if (value && measured >= 0) {
+        *value = measured;
+        return 0;
+    }
+    return origin(value);
 }

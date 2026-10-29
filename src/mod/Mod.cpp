@@ -17,6 +17,7 @@
 #include "common/Utils.h"
 #include "common/util/System.h"
 
+#include "helper/BluetoothStorage.h"
 #include "helper/CaCertificates.h"
 
 #include "Version.h"
@@ -365,6 +366,7 @@ __attribute__((constructor)) static void BeforeMain() {
 
     // helper
     INSTANCE(AntiEmbs);
+    INSTANCE(BluetoothStorage);
     INSTANCE(CaCertificates);
     INSTANCE(DeveloperSettings);
     INSTANCE(FontCache);

@@ -39,9 +39,11 @@ inline constexpr std::size_t kMaxNesting        = 4;    // 展开/嵌套解析�
 // ---------------------------------------------------------------------------
 
 enum class ToolMode {
-    Off,       // 工具不提供给模型
-    Confirm,   // 现有行为：每条命令由用户确认
-    Automatic, // 自动执行，但必须通过只读网页抓取策略
+    Off,        // 工具不提供给模型
+    Confirm,    // 现有行为：每条命令由用户确认
+    Automatic,  // 自动执行，但必须通过只读网页抓取策略
+    Restricted, // 无逐条确认，以非特权 UID 执行（不是沙盒）
+    Full,       // 无逐条确认，以应用权限执行
 };
 
 const char* toolModeName(ToolMode mode); // "off" / "confirm" / "automatic"

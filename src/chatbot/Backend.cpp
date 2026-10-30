@@ -16,6 +16,7 @@
 #include "mod/Config.h"
 #include "mod/Mod.h"
 #include "shell/ShellCommandPolicy.h"
+#include "shell/ShellPrivileges.h"
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -38,6 +39,7 @@
 #include <QRegularExpression>
 #include <QRunnable>
 #include <QSaveFile>
+#include <QTemporaryDir>
 #include <QTextDocument>
 #include <QTextStream>
 #include <QTimer>
@@ -4843,6 +4845,15 @@ void ChatBot::injectToolDefinitions(QJsonObject& requestBody) {
                 "read-only web-fetch policy: curl (http/https public URLs only) piped into head/tail/grep/cut/tr/"
                 "sort/uniq/wc/cat reading stdin. Commands outside the policy are rejected. Use it to fetch web "
                 "pages after web_search; do not try file/*nix admin operations.";
+        } else if (m_shellMode == mod::shell::ToolMode::Restricted) {
+            func["description"] = "Execute /bin/sh commands without per-command approval as unprivileged UID 65533. "
+                                  "Working directory persists until app restart. No privilege escalation. "
+                                  "Network and world-readable/writable files remain accessible. This is not a sandbox. "
+                                  "Blocklist, timeout and output limits apply.";
+        } else if (m_shellMode == mod::shell::ToolMode::Full) {
+            func["description"] = "Execute /bin/sh commands without per-command approval with full application "
+                                  "privileges (root on this device). Use only for the user requested task. "
+                                  "Blocklist, timeout and output limits still apply.";
         } else {
             func["description"] = "Execute a shell command on the user's Linux device. Requires user approval. "
                                   "Use for file operations, system queries, diagnostics, package management, etc.";
@@ -4939,15 +4950,15 @@ void ChatBot::dispatchToolCalls(const QString& toolCallsJson) {
         } else if (search) {
             executeWebSearch(id, argument.toString());
         } else if (shellDecision.needsConfirm) {
-            // confirm 模式：交给用户确认（automatic 不会返回 needsConfirm）
+            // 只有 confirm 模式逐条询问；其余开启模式直接执行或拒绝。
             m_pendingShellExecs.append({id, argument.toString()});
             emit shellCommandPending(id, argument.toString());
         } else {
-            // automatic：策略放行，直接入队；仍受并发/超时/输出上限/取消校验约束。
+            // 无需逐条确认：策略放行后入队，仍受并发/超时/输出/取消约束。
             updateTool(
                 id,
                 "pending",
-                "自动执行（只读网页抓取）：" + QString::fromStdString(shellDecision.summary),
+                "自动执行（" + getShellMode() + "）：" + QString::fromStdString(shellDecision.summary),
                 argument.toString()
             );
             QueuedShellExec request;
@@ -5361,8 +5372,8 @@ void ChatBot::initShellTool() {
     if (previousMode != m_shellMode) {
         if (m_shellMode == mod::shell::ToolMode::Off) {
             abortAllShellExecs("Shell 工具已关闭，本次执行已取消");
-        } else if (previousMode == mod::shell::ToolMode::Automatic) {
-            abortAutomaticShellExecs("Shell 模式已切换，自动执行已取消");
+        } else {
+            abortAllShellExecs("Shell 模式已切换，本次执行已取消");
         }
     }
 
@@ -5451,8 +5462,8 @@ void ChatBot::setShellMode(const QString& mode) {
 
     if (parsed == mod::shell::ToolMode::Off) {
         abortAllShellExecs("Shell 工具已关闭，本次执行已取消");
-    } else if (previous == mod::shell::ToolMode::Automatic) {
-        abortAutomaticShellExecs("Shell 模式已切换，自动执行已取消");
+    } else {
+        abortAllShellExecs("Shell 模式已切换，本次执行已取消");
     }
 
     emit shellToolConfigChanged();
@@ -5513,8 +5524,8 @@ void ChatBot::setShellToolConfig(const QString& configJson) {
     if (previous != m_shellMode) {
         if (m_shellMode == mod::shell::ToolMode::Off) {
             abortAllShellExecs("Shell 工具已关闭，本次执行已取消");
-        } else if (previous == mod::shell::ToolMode::Automatic) {
-            abortAutomaticShellExecs("Shell 模式已切换，自动执行已取消");
+        } else {
+            abortAllShellExecs("Shell 模式已切换，本次执行已取消");
         }
     }
 
@@ -5591,6 +5602,34 @@ void ChatBot::drainShellQueue() {
     }
 }
 
+namespace {
+class RestrictedShellProcess final : public QProcess {
+public:
+    using QProcess::QProcess;
+
+protected:
+    void setupChildProcess() override {
+        if (!mod::shell::restrictShellPrivileges()) _exit(126);
+    }
+};
+
+// Root-owned parent prevents an unprivileged command from replacing the workspace.
+QString restrictedShellWorkspace() {
+    static QTemporaryDir parent(QDir::tempPath() + "/penmods-ai-XXXXXX");
+    static const QString work = [&]() -> QString {
+        if (!parent.isValid()) return {};
+        const QByteArray base    = QFile::encodeName(parent.path());
+        const QString    path    = parent.path() + "/work";
+        const QByteArray encoded = QFile::encodeName(path);
+        if (chmod(base.constData(), 0711) != 0 || mkdir(encoded.constData(), 0700) != 0
+            || chown(encoded.constData(), 65533, 65533) != 0)
+            return {};
+        return path;
+    }();
+    return work;
+}
+} // namespace
+
 void ChatBot::startShellProcess(const QueuedShellExec& request) {
     if (!isShellRequestCurrent(request)) {
         info("Shell 请求已过期，未启动 [{}]", request.toolCallId.toStdString());
@@ -5605,8 +5644,21 @@ void ChatBot::startShellProcess(const QueuedShellExec& request) {
     exec->requestSeq = request.requestSeq;
     exec->automatic  = request.automatic;
     // automatic 不得跳过超时：即使配置 timeout_ms=0，也给一个硬上限。
-    exec->timeoutMs = m_shellToolTimeoutMs > 0 ? m_shellToolTimeoutMs : (request.automatic ? 10000 : 0);
-    exec->process   = new QProcess(this);
+    exec->timeoutMs       = m_shellToolTimeoutMs > 0 ? m_shellToolTimeoutMs : (request.automatic ? 10000 : 0);
+    const bool restricted = m_shellMode == mod::shell::ToolMode::Restricted;
+    exec->process         = restricted ? new RestrictedShellProcess(this) : new QProcess(this);
+    if (restricted) {
+        const QString workspace = restrictedShellWorkspace();
+        if (workspace.isEmpty()) {
+            exec->process->deleteLater();
+            delete exec;
+            const QString reason = "受限工作目录创建失败，命令未执行";
+            submitToolResultBatched(request.toolCallId, "shell_exec", reason);
+            emit shellCommandFinished(request.toolCallId, false, reason, request.command);
+            return;
+        }
+        exec->process->setWorkingDirectory(workspace);
+    }
 
     // 用 setsid 让 /bin/sh 成为新进程组组长：超时/取消时可整组 kill，避免只杀 sh 留下 curl。
     // Qt 5.15 没有 setChildProcessModifier，设备有 busybox setsid（/usr/bin/setsid）。
@@ -5620,11 +5672,11 @@ void ChatBot::startShellProcess(const QueuedShellExec& request) {
     }
     exec->process->setProcessChannelMode(QProcess::SeparateChannels);
 
-    // automatic：最小环境，避免继承代理/LD_*/ENV 等；confirm 保持旧行为（继承环境）。
+    // 所有免确认模式使用最小环境，避免继承代理/LD_*/ENV；confirm 继承环境。
     if (request.automatic) {
         QProcessEnvironment env;
         env.insert("PATH", "/usr/bin:/bin:/sbin:/usr/sbin");
-        env.insert("HOME", "/nonexistent");
+        env.insert("HOME", restricted ? restrictedShellWorkspace() : "/nonexistent");
         env.insert("CURL_HOME", "/nonexistent");
         env.insert("TMPDIR", "/tmp");
         env.insert("LC_ALL", "C");

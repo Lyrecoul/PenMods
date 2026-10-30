@@ -113,7 +113,8 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
     Q_PROPERTY(bool tavilyConfigured READ getTavilyConfigured NOTIFY tavilyConfigChanged)
 
     Q_PROPERTY(bool shellToolEnabled READ getShellToolEnabled WRITE setShellToolEnabled NOTIFY shellToolConfigChanged)
-    // off | confirm | automatic；旧 shellToolEnabled 仍兼容（true 映射为 confirm，绝不自动开启 automatic）
+    // off | confirm | automatic | restricted | full；旧 shellToolEnabled 仍兼容（true 映射为 confirm，绝不自动开启
+    // automatic）
     Q_PROPERTY(QString shellMode READ getShellMode WRITE setShellMode NOTIFY shellToolConfigChanged)
 
     Q_PROPERTY(

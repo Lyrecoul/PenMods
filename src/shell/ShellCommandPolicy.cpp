@@ -2108,6 +2108,10 @@ const char* toolModeName(ToolMode mode) {
         return "confirm";
     case ToolMode::Automatic:
         return "automatic";
+    case ToolMode::Restricted:
+        return "restricted";
+    case ToolMode::Full:
+        return "full";
     }
     return "off";
 }
@@ -2124,6 +2128,14 @@ bool toolModeFromName(const std::string& name, ToolMode& out) {
     }
     if (normalized == "automatic") {
         out = ToolMode::Automatic;
+        return true;
+    }
+    if (normalized == "restricted") {
+        out = ToolMode::Restricted;
+        return true;
+    }
+    if (normalized == "full") {
+        out = ToolMode::Full;
         return true;
     }
     return false;
@@ -2263,6 +2275,16 @@ Decision evaluateCommand(const std::string& command, const PolicyConfig& config)
         }
     }
 
+    // 这两种模式依靠用户选择的执行权限，不把保守解析器当作隔离机制。
+    if (config.mode == ToolMode::Full || config.mode == ToolMode::Restricted) {
+        Decision decision;
+        decision.allowed = true;
+        decision.code    = DecisionCode::AllowedAutomatic;
+        decision.reason  = "按所选权限自动执行";
+        decision.summary = trimmed;
+        return decision;
+    }
+
     const ParseResult parsed = parseCommand(trimmed);
     if (parsed.ok && parsed.list.items.empty()) {
         return makeDeny(DecisionCode::DeniedEmpty, "命令为空，已拒绝");
@@ -2334,6 +2356,6 @@ std::vector<std::string> automaticAllowedCommands() {
     return {"cat", "curl", "cut", "grep", "head", "sort", "tail", "tr", "uniq", "wc"};
 }
 
-const char* policyVersion() { return "1"; }
+const char* policyVersion() { return "2"; }
 
 } // namespace mod::shell

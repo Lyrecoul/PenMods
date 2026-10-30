@@ -32,10 +32,23 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <functional>
 
 namespace mod {
 
 namespace {
+
+// 不用 QRunnable::create(std::function)：系统 Qt 使用 libstdc++，mod 使用 libc++，
+// 该导出函数的 std::function 参数 ABI 不兼容。回调仅在 mod 内部构造和执行。
+class ScanTask final : public QRunnable {
+public:
+    explicit ScanTask(std::function<void()> callback) : mCallback(std::move(callback)) {}
+
+    void run() override { mCallback(); }
+
+private:
+    std::function<void()> mCallback;
+};
 
 constexpr int kScanIntervalMs = 2000;
 // 单击要等窗口结束才能确定不是双击/三击；380ms 是 Lead 指定的 350–400ms 区间。
@@ -188,7 +201,7 @@ void HeadsetControls::_scan(const char* reason) {
     mScanInProgress                      = true;
     const std::string         scanReason = reason ? reason : "unknown";
     QPointer<HeadsetControls> self(this);
-    QThreadPool::globalInstance()->start(QRunnable::create([self, scanReason]() {
+    QThreadPool::globalInstance()->start(new ScanTask([self, scanReason]() {
         std::vector<DeviceInfo> devices;
         try {
             devices = _enumerateDevices();

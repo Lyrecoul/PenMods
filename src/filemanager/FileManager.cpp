@@ -18,17 +18,17 @@
 #include <QDateTime>
 #include <QFile>
 #include <QHash>
+#include <QMutexLocker>
 #include <QProcess>
 #include <QQmlContext>
 #include <QSet>
+#include <QThread>
 #include <QTimer>
 #include <QUrl>
-#include <QThread>
-#include <QMutexLocker>
 
+#include <errno.h>
 #include <sys/inotify.h>
 #include <unistd.h>
-#include <errno.h>
 
 namespace mod::filemanager {
 
@@ -49,6 +49,15 @@ FileManager::FileManager() : QAbstractListModel(), Logger("FileManager") {
 
     // 初始化路径历史，设置初始路径为根目录
     mPathHistory.push_back(mRoot);
+
+    mRefreshTimer = new QTimer(this);
+    mRefreshTimer->setSingleShot(true);
+    mRefreshTimer->setInterval(350);
+    connect(this, &FileManager::directoryChanged, mRefreshTimer, qOverload<>(&QTimer::start));
+    connect(mRefreshTimer, &QTimer::timeout, this, [this]() {
+        reload();
+        if (mCurrentPath == mCurrentPlayingPath) refreshPlayList();
+    });
 
     setupInotify();
     connect(&Event::getInstance(), &Event::uiCompleted, [this]() {
@@ -197,6 +206,7 @@ QString FileManager::getCurrentPathString() const { return mCurrentPath.path(); 
 
 bool FileManager::changeDir(const QString& dir) {
     if (dir.isEmpty()) {
+        emit directoryAboutToChange(true);
         // 返回根目录
         mPathHistory.clear();
         mPathHistory.push_back(mRoot);
@@ -204,6 +214,7 @@ bool FileManager::changeDir(const QString& dir) {
     } else if (dir == "..") {
         // 返回上级目录
         if (mPathHistory.size() > 1) {
+            emit directoryAboutToChange(true);
             mPathHistory.pop_back(); // 弹出当前路径
             QString prevPath = mPathHistory.back(); // 获取上一级路径
             mCurrentPath.setPath(prevPath);
@@ -237,20 +248,53 @@ bool FileManager::changeDir(const QString& dir) {
             return false;
         }
 
+        emit directoryAboutToChange(false);
         // 更新路径历史
         mCurrentPath.setPath(nextPath);
         mPathHistory.push_back(nextPath);
     }
 
-    // 更新 inotify 监视
+    finishDirectoryChange();
+    return true;
+}
+
+void FileManager::finishDirectoryChange() {
+    mRefreshTimer->stop();
     QMutexLocker locker(&mInotifyMutex);
     addInotifyWatch(mCurrentPath.path());
-
-    emit currentTitleChanged();
     reset();
     _initCurrentDir();
     loadMore();
+    emit currentTitleChanged();
+    emit directoryLoaded();
+}
+
+bool FileManager::navigateToAncestor(int depth) {
+    if (depth < 0 || depth >= static_cast<int>(mPathHistory.size()) - 1) return false;
+    if (!QDir(mPathHistory[depth]).exists()) return false;
+    emit directoryAboutToChange(true);
+    mPathHistory.resize(depth + 1);
+    mCurrentPath.setPath(mPathHistory.back());
+    finishDirectoryChange();
     return true;
+}
+
+QStringList FileManager::getBreadcrumbs() const {
+    QStringList result;
+    for (size_t i = 0; i < mPathHistory.size(); ++i)
+        result.append(i == 0 ? QStringLiteral("根目录") : QFileInfo(mPathHistory[i]).fileName());
+    return result;
+}
+
+QString FileManager::fileNameAt(int row) const {
+    return row >= 0 && row < mProxyCount ? mEntities[row]->fileName() : QString();
+}
+
+int FileManager::indexOfFile(const QString& name) const {
+    for (int i = 0; i < mProxyCount; ++i) {
+        if (mEntities[i]->fileName() == name) return i;
+    }
+    return -1;
 }
 
 bool FileManager::canCdUp() const {
@@ -263,6 +307,7 @@ void FileManager::loadMore() { loadMore(1500); }
 void FileManager::loadMore(int amount) {
     // Do not use 'isHasMore()' here!
     auto finalCount = std::min(mProxyCount + amount, (int)mEntities.size());
+    if (finalCount <= mProxyCount) return;
     beginInsertRows(QModelIndex(), mProxyCount, finalCount - 1);
     mProxyCount = finalCount; // safe: limited by MAX_FILES.
     endInsertRows();
@@ -270,10 +315,13 @@ void FileManager::loadMore(int amount) {
 }
 
 void FileManager::reload() {
-    // 重新加载当前目录，但不改变路径历史
+    emit refreshing();
+    const int loadedCount = std::max(mProxyCount, 1500);
     reset();
+    mCurrentPath.refresh();
     _initCurrentDir();
-    loadMore();
+    loadMore(loadedCount);
+    emit refreshed();
 }
 
 void FileManager::reset() {
@@ -295,7 +343,7 @@ void FileManager::remove(const QString& fileName) {
             continue;
         }
 
-        QString filePath = mCurrentPath.absoluteFilePath(fileName);
+        QString   filePath = mCurrentPath.absoluteFilePath(fileName);
         QFileInfo fileInfo(filePath);
 
         if (fileInfo.isSymLink()) {
@@ -306,10 +354,13 @@ void FileManager::remove(const QString& fileName) {
         } else {
             mCurrentPath.remove(fileName);
         }
+        const bool visibleRow = idx < mProxyCount;
+        if (visibleRow) beginRemoveRows(QModelIndex(), idx, idx);
         mEntities.erase(mEntities.begin() + idx);
-        beginRemoveRows(QModelIndex(), idx, idx);
-        mProxyCount--;
-        endRemoveRows();
+        if (visibleRow) {
+            mProxyCount--;
+            endRemoveRows();
+        }
         markSuspendDirChangedNotifier();
         emit hasMoreChanged();
         break;
@@ -551,7 +602,7 @@ void FileManager::_initCurrentDir() {
                 const QString lrcBase = lrc.completeBaseName();
                 if (lrcBase == baseName) {
                     bestScore  = 1.0;
-                    bestMatch  = lrc.absoluteFilePath();
+                    bestMatch = lrc.absoluteFilePath();
                     break;
                 }
                 double score = fuzzyLrcMatch(baseName, lrcBase);
@@ -643,7 +694,7 @@ void FileManager::refreshPlayList() {
 }
 
 void FileManager::executeFile(const QString& fileName) {
-    QString filePath = mCurrentPath.absoluteFilePath(fileName);
+    QString   filePath = mCurrentPath.absoluteFilePath(fileName);
     QFileInfo fileInfo(filePath);
 
     // 如果是软链接，获取目标文件路径
@@ -847,14 +898,7 @@ void FileManager::inotifyLoop() {
 
                     if (event->mask & (IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_MODIFY)) {
                         // 发出目录更改信号
-                        QMetaObject::invokeMethod(this, [this]() {
-                            emit directoryChanged();
-
-                            // 如果当前播放路径发生变化，刷新播放列表
-                            if (mCurrentPath == mCurrentPlayingPath) {
-                                refreshPlayList();
-                            }
-                        }, Qt::QueuedConnection);
+                        QMetaObject::invokeMethod(this, [this]() { emit directoryChanged(); }, Qt::QueuedConnection);
                     }
 
                     i += sizeof(struct inotify_event) + event->len;

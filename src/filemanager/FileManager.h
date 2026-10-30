@@ -13,14 +13,16 @@
 #include <QAbstractListModel>
 #include <QDir>
 #include <QFileInfo>
-#include <QThread>
 #include <QMutex>
+#include <QThread>
+#include <QTimer>
 
 namespace mod::filemanager {
 
 class FileManager : public QAbstractListModel, public Singleton<FileManager>, private Logger {
     Q_OBJECT
 
+    Q_PROPERTY(QStringList breadcrumbs READ getBreadcrumbs NOTIFY currentTitleChanged);
     Q_PROPERTY(QString currentTitle READ getCurrentTitle NOTIFY currentTitleChanged);
     Q_PROPERTY(int order READ getOrder WRITE setOrder NOTIFY orderChanged);
     Q_PROPERTY(bool orderReversed READ getOrderReversed WRITE setOrderReversed NOTIFY orderReversedChanged);
@@ -48,6 +50,10 @@ public:
     Q_INVOKABLE QString getCurrentPathString() const;
 
     Q_INVOKABLE bool changeDir(const QString& dir);
+    Q_INVOKABLE bool    navigateToAncestor(int depth);
+    QStringList         getBreadcrumbs() const;
+    Q_INVOKABLE QString fileNameAt(int row) const;
+    Q_INVOKABLE int     indexOfFile(const QString& name) const;
 
     Q_INVOKABLE [[nodiscard]] bool canCdUp() const;
 
@@ -93,7 +99,7 @@ public:
     [[nodiscard]] bool getHidePairedLyrics() const;
 
     void setHidePairedLyrics(bool);
-    
+
     [[nodiscard]] bool getShowHiddenFiles() const;
 
     void setShowHiddenFiles(bool);
@@ -111,6 +117,10 @@ signals:
     void orderReversedChanged();
 
     void directoryChanged();
+    void directoryAboutToChange(bool backwards);
+    void directoryLoaded();
+    void refreshing();
+    void refreshed();
 
     void hasMoreChanged();
 
@@ -119,7 +129,7 @@ signals:
     // MusicPlayer
 
     void hidePairedLyricsChanged();
-    
+
     void showHiddenFilesChanged();
 
 private:
@@ -128,7 +138,15 @@ private:
 
     // FileManager
 
-    enum class UserRoles { FileName = Qt::UserRole + 1, IsDirectory, SizeString, ExtensionName, ExtensionIcon, IsExecutable, IsSymLink };
+    enum class UserRoles {
+        FileName = Qt::UserRole + 1,
+        IsDirectory,
+        SizeString,
+        ExtensionName,
+        ExtensionIcon,
+        IsExecutable,
+        IsSymLink
+    };
 
     // Natural language comparison function for semantic sorting
     static bool naturalCompare(const QString &a, const QString &b);
@@ -156,6 +174,8 @@ private:
     std::vector<QString>                    mPathHistory;
 
     void _initCurrentDir();
+    void    finishDirectoryChange();
+    QTimer* mRefreshTimer{nullptr};
 
     // Inotify functions
     void setupInotify();

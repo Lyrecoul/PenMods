@@ -172,7 +172,7 @@ void ChatBot::recordApiUsage(const QJsonObject& usage) {
     emit apiCacheStatsChanged();
 }
 
-void ChatBot::parseMarkdownAsync(const QString& markdown, const QString& requestId) {
+void ChatBot::parseMarkdownAsync(const QString& markdown, const QString& requestId, bool html) {
     if (requestId.isEmpty()) return;
     {
         QMutexLocker lock(&m_markdownRequestsMutex);
@@ -181,7 +181,7 @@ void ChatBot::parseMarkdownAsync(const QString& markdown, const QString& request
 
     QPointer<ChatBot> guard(this);
     m_markdownPool.start(
-        makeMarkdownTask([guard, markdown, requestId]() {
+        makeMarkdownTask([guard, markdown, requestId, html]() {
             if (!guard) return;
             {
                 QMutexLocker lock(&guard->m_markdownRequestsMutex);
@@ -189,7 +189,8 @@ void ChatBot::parseMarkdownAsync(const QString& markdown, const QString& request
             }
 
             const QString blocksJson =
-                QString::fromUtf8(QJsonDocument(MarkdownParser::parse(markdown)).toJson(QJsonDocument::Compact));
+                html ? guard->markdownToHtml(markdown)
+                     : QString::fromUtf8(QJsonDocument(MarkdownParser::parse(markdown)).toJson(QJsonDocument::Compact));
             if (!guard) return;
             {
                 QMutexLocker lock(&guard->m_markdownRequestsMutex);
@@ -197,8 +198,10 @@ void ChatBot::parseMarkdownAsync(const QString& markdown, const QString& request
             }
             QMetaObject::invokeMethod(
                 guard.data(),
-                [guard, requestId, blocksJson]() {
-                    if (guard) emit guard->markdownParsed(requestId, blocksJson);
+                [guard, requestId, blocksJson, html]() {
+                    if (!guard) return;
+                    if (html) emit guard->markdownHtmlParsed(requestId, blocksJson);
+                    else emit guard->markdownParsed(requestId, blocksJson);
                 },
                 Qt::QueuedConnection
             );

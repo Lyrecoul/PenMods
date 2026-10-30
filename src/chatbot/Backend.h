@@ -138,7 +138,7 @@ public:
     Q_INVOKABLE void    clearHistory();
     Q_INVOKABLE void    saveMessages();
     Q_INVOKABLE QString markdownToHtml(const QString& markdown);
-    Q_INVOKABLE void    parseMarkdownAsync(const QString& markdown, const QString& requestId);
+    Q_INVOKABLE void    parseMarkdownAsync(const QString& markdown, const QString& requestId, bool html = false);
     Q_INVOKABLE void    cancelMarkdownParse(const QString& requestId);
     Q_INVOKABLE void    truncateHistory(int index);
     Q_INVOKABLE void    editMessage(int index, const QString& newContent);
@@ -276,6 +276,7 @@ signals:
     void streamChunk(const QString& content);
     void reasoningChunk(const QString& content);
     void markdownParsed(const QString& requestId, const QString& blocksJson);
+    void markdownHtmlParsed(const QString& requestId, const QString& html);
     void streamEnd();
     void errorOccurred(const QString& error);
     void requestCancelled();

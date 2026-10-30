@@ -17,8 +17,12 @@
 #include "mod/Config.h"
 
 #include <QDir>
+#include <QMetaObject>
+#include <QPointer>
+#include <QRunnable>
 #include <QSocketNotifier>
 #include <QStringList>
+#include <QThreadPool>
 
 #include <fcntl.h>
 #include <linux/input.h>
@@ -122,7 +126,7 @@ void HeadsetControls::_loadConfig() {
     );
 }
 
-bool HeadsetControls::_probeDevice(const std::string& path, DeviceInfo* out) const {
+bool HeadsetControls::_probeDevice(const std::string& path, DeviceInfo* out) {
     const int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
         return false;
@@ -178,20 +182,62 @@ bool HeadsetControls::_isHeadphoneMediaDevice(const DeviceInfo& device) const {
 }
 
 void HeadsetControls::_scan(const char* reason) {
-    if (!mEnabled) {
+    if (!mEnabled || mScanInProgress) {
         return;
     }
-    try {
-        const QDir        dir("/dev/input");
-        const QStringList entries = dir.entryList(QStringList() << "event*", QDir::System | QDir::Files, QDir::Name);
+    mScanInProgress                      = true;
+    const std::string         scanReason = reason ? reason : "unknown";
+    QPointer<HeadsetControls> self(this);
+    QThreadPool::globalInstance()->start(QRunnable::create([self, scanReason]() {
         std::vector<DeviceInfo> devices;
-        for (const QString& entry : entries) {
-            DeviceInfo info;
-            if (_probeDevice(dir.absoluteFilePath(entry).toStdString(), &info)) {
-                devices.push_back(info);
+        try {
+            devices = _enumerateDevices();
+        } catch (...) {
+            if (self) {
+                QMetaObject::invokeMethod(
+                    self,
+                    [self]() {
+                        if (self) {
+                            self->mScanInProgress = false;
+                        }
+                    },
+                    Qt::QueuedConnection
+                );
             }
+            return;
         }
+        if (!self) {
+            return;
+        }
+        QMetaObject::invokeMethod(
+            self,
+            [self, devices = std::move(devices), scanReason]() mutable {
+                if (!self) {
+                    return;
+                }
+                self->mScanInProgress = false;
+                self->_applyScan(std::move(devices), scanReason);
+            },
+            Qt::QueuedConnection
+        );
+    }));
+}
 
+std::vector<HeadsetControls::DeviceInfo> HeadsetControls::_enumerateDevices() {
+    const QDir              dir("/dev/input");
+    const QStringList       entries = dir.entryList(QStringList() << "event*", QDir::System | QDir::Files, QDir::Name);
+    std::vector<DeviceInfo> devices;
+    for (const QString& entry : entries) {
+        DeviceInfo info;
+        if (_probeDevice(dir.absoluteFilePath(entry).toStdString(), &info)) {
+            devices.push_back(std::move(info));
+        }
+    }
+    return devices;
+}
+
+void HeadsetControls::_applyScan(std::vector<DeviceInfo> devices, const std::string& reason) {
+    try {
         std::string signature;
         for (const auto& d : devices) {
             signature += d.path + "|" + d.name + "|" + std::to_string(d.bustype) + "|" + std::to_string(d.vendor) + "|"

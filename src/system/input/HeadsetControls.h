@@ -85,7 +85,11 @@ private:
 
     void _scan(const char* reason);
 
-    bool _probeDevice(const std::string& path, DeviceInfo* out) const;
+    void _applyScan(std::vector<DeviceInfo> devices, const std::string& reason);
+
+    static std::vector<DeviceInfo> _enumerateDevices();
+
+    static bool _probeDevice(const std::string& path, DeviceInfo* out);
 
     /// USB/蓝牙媒体键设备（不看名称/event 号）。
     bool _isHeadphoneMediaDevice(const DeviceInfo& device) const;
@@ -114,10 +118,11 @@ private:
 
     void _dispatchPrevious();
 
-    bool mEnabled       = false;
-    bool mHandleVolume  = true;
-    bool mTimerStarted  = false;
-    bool mVolumeLogOnce = false;
+    bool mEnabled        = false;
+    bool mHandleVolume   = true;
+    bool mTimerStarted   = false;
+    bool mScanInProgress = false;
+    bool mVolumeLogOnce  = false;
 
     QTimer mScanTimer;
     QTimer mClickTimer;

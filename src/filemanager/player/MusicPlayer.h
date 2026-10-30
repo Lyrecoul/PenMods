@@ -11,7 +11,12 @@
 #include "common/service/Logger.h"
 
 #include <QDir>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QPointer>
 #include <QTimer>
+#include <QVariantList>
+#include <functional>
 
 namespace mod::filemanager {
 
@@ -29,7 +34,20 @@ class MusicPlayer : public QObject, public Singleton<MusicPlayer>, private Logge
     Q_PROPERTY(int shutdownTimerMinutes READ shutdownTimerMinutes NOTIFY shutdownTimerChanged);
     Q_PROPERTY(bool shutdownAfterPlaylist READ shutdownAfterPlaylist WRITE setShutdownAfterPlaylist NOTIFY shutdownTimerChanged);
 
+    Q_PROPERTY(bool lyricBusy READ lyricBusy NOTIFY onlineLyricsChanged);
+    Q_PROPERTY(QString lyricStatus READ lyricStatus NOTIFY onlineLyricsChanged);
+    Q_PROPERTY(QVariantList lyricCandidates READ lyricCandidates NOTIFY onlineLyricsChanged);
+
 public:
+    bool                lyricBusy() const { return mLyricReply; }
+    QString             lyricStatus() const { return mLyricStatus; }
+    QVariantList        lyricCandidates() const { return mLyricCandidates; }
+    Q_INVOKABLE bool    canFetchLyrics() const;
+    Q_INVOKABLE QString lyricSearchKeyword() const;
+    Q_INVOKABLE void    searchOnlineLyrics(const QString& keyword);
+    Q_INVOKABLE void    saveOnlineLyrics(int index);
+    Q_INVOKABLE void    cancelOnlineLyrics();
+
     /// 播放列表中的第 idx 首。
     /// @param showPlayerUi 是否把宿主播放页（YGlobal::showAudioPlayer）调到前台：只有用户显式
     ///        选曲才为 true；曲末自动切曲/单曲循环必须为 false，否则每首放完都会弹回播放页。
@@ -91,6 +109,7 @@ public:
     void cleanupTempSymlinks();
 
 signals:
+    void onlineLyricsChanged();
     void pauseOnScanChanged();
     void hideFloatingWindowChanged();
     void quickPanelMusicViewChanged();
@@ -100,6 +119,13 @@ signals:
 private:
     friend Singleton<MusicPlayer>;
     explicit MusicPlayer();
+
+    QNetworkAccessManager*  mLyricNetwork{nullptr}; // Created only after QCoreApplication exists.
+    QPointer<QNetworkReply> mLyricReply;
+    QString                 mLyricStatus;
+    QVariantList            mLyricCandidates;
+    QString                 mLyricTarget;
+    void                    lyricRequest(const QUrl& url, std::function<void(const QByteArray&)> done);
 
     PlayList mPlayList;
 

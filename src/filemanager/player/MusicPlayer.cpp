@@ -127,6 +127,7 @@ void MusicPlayer::play(size_t idx, bool showPlayerUi) {
 }
 
 void MusicPlayer::_play(const std::shared_ptr<QFileInfo>& file, bool showPlayerUi) {
+    cancelOnlineLyrics();
     mIsTakeOver                = true;
     mPausedByScan              = false;
     mPlaybackResumedDuringScan = false;
@@ -668,6 +669,7 @@ void MusicPlayer::seekToPosition(qint64 position) {
 }
 
 void MusicPlayer::stop() {
+    cancelOnlineLyrics();
     emit stopRequested();
 
     // 用户主动停止：恢复意图作废，扫描锁还给 AudioDaemon。
@@ -745,6 +747,7 @@ PEN_HOOK(void*, _ZN13YMediaManager9playAudioERK18YColumnMediaEntityb, void* self
 }
 
 PEN_HOOK(void*, _ZN13YMediaManager10clickMediaEi, void* a1, void* a2) {
+    MusicPlayer::getInstance().cancelOnlineLyrics();
     MusicPlayer::mIsTakeOver = false;
     return origin(a1, a2);
 }

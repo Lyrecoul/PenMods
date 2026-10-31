@@ -5,6 +5,8 @@
  */
 
 #include "filemanager/player/MusicPlayer.h"
+#include "filemanager/player/LyricClock.h"
+#include "filemanager/player/LyricLineItem.h"
 
 #include "base/YPointer.h"
 
@@ -72,6 +74,8 @@ MusicPlayer::MusicPlayer() : Logger("MusicPlayer") {
         ScreenManager::getInstance().requestPowerOff();
     });
     connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView& view, QQmlContext* context) {
+        qmlRegisterType<LyricClock>("com.github.penuniverse", 1, 0, "LyricClock");
+        qmlRegisterType<LyricLineItem>("com.github.penuniverse", 1, 0, "LyricLineItem");
         context->setContextProperty("musicPlayer", this);
     });
     // 上个进程留下的链接不会被任何会话引用，直接清掉，避免按歌曲数无限累积。
@@ -156,20 +160,23 @@ void MusicPlayer::_play(const std::shared_ptr<QFileInfo>& file, bool showPlayerU
     entity->mTitle         = file->fileName();
     // 上一个链接不删：宿主可能还拿着它（暂停中、或两次 _play 交错），删了就成了死路。
     entity->mLocalFile = prepareTempAudioLink(file);
-    // 在原目录查找配对的 .lrc 文件（先精确匹配，再模糊匹配）
+    // 配对歌词支持 LRC/Enhanced LRC、YRC、明文 QRC 和 TTML。
     auto       matchName = file->completeBaseName();
     double     bestScore = 0.0;
     QString    bestMatch;
     const auto entries = file->absoluteDir().entryInfoList();
     for (const auto& i : entries) {
-        if (i.suffix().toLower() != "lrc") continue;
-        if (i.completeBaseName() == matchName) {
-            bestMatch = i.absoluteFilePath();
-            bestScore = 1.0;
-            break;
-        }
-        double score = fuzzyLrcMatch(matchName, i.completeBaseName());
-        if (score > bestScore) {
+        if (!i.isFile() || !isLyricSuffix(i.suffix())) continue;
+        const double score = i.completeBaseName() == matchName ? 1.0 : fuzzyLrcMatch(matchName, i.completeBaseName());
+        const auto   priority = [](const QString& path) {
+            return QStringList{"lrc", "qrc", "yrc", "ttml"}.indexOf(QFileInfo(path).suffix().toLower());
+        };
+        if (score >= 0.35
+            && (score > bestScore || (score == bestScore && priority(i.filePath()) > priority(bestMatch)))) {
+            QFile candidate(i.absoluteFilePath());
+            if (!candidate.open(QIODevice::ReadOnly) || candidate.size() > 2 * 1024 * 1024
+                || parseLyrics(QString::fromUtf8(candidate.readAll())).isEmpty())
+                continue;
             bestScore = score;
             bestMatch = i.absoluteFilePath();
         }
@@ -180,6 +187,7 @@ void MusicPlayer::_play(const std::shared_ptr<QFileInfo>& file, bool showPlayerU
     }
     PEN_CALL(void*, "_ZN13YMediaManager9playAudioERK18YColumnMediaEntityb", void*, YColumnMediaEntity*, bool)
     (YPointer<YMediaManager>::getInstance(), entity, true);
+    loadLyrics(bestScore >= 0.35 ? bestMatch : QString());
     // 只有用户主动选曲才把播放页调到前台 —— 宿主也是这个约定（音频页列表选曲后由 QML
     // YYoudaoAudioPageColumnView.qml 自己调 YGlobal::showAudioPlayer）；曲末自动切曲弹页会打断用户当前页面。
     if (showPlayerUi) {
@@ -795,5 +803,8 @@ PEN_HOOK(void*, _ZN19YMediaPlayerManager10onSoundEndEj, void* self, uint32 a2) {
     return self;
 }
 
-// 系统清理播放数据时，同步清理临时软链接
-PEN_HOOK(void*, _ZN19YMediaPlayerManager8wipeDataEv, void* self) { return origin(self); }
+// 清空宿主媒体时清除歌词时间轴；音频软链接保留到进程结束。
+PEN_HOOK(void*, _ZN19YMediaPlayerManager8wipeDataEv, void* self) {
+    MusicPlayer::getInstance().clearLyrics();
+    return origin(self);
+}

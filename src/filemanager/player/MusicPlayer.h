@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "LyricTimeline.h"
 #include "base/YEnum.h"
 
 #include "common/service/Logger.h"
@@ -36,15 +37,29 @@ class MusicPlayer : public QObject, public Singleton<MusicPlayer>, private Logge
 
     Q_PROPERTY(bool lyricBusy READ lyricBusy NOTIFY onlineLyricsChanged);
     Q_PROPERTY(QString lyricStatus READ lyricStatus NOTIFY onlineLyricsChanged);
+    Q_PROPERTY(QString lyricPreview READ lyricPreview NOTIFY onlineLyricsChanged);
     Q_PROPERTY(QVariantList lyricCandidates READ lyricCandidates NOTIFY onlineLyricsChanged);
 
+    Q_PROPERTY(QVariantList lyricRows READ lyricRows NOTIFY lyricsChanged);
+    Q_PROPERTY(bool hasTimeline READ hasTimeline NOTIFY lyricsChanged);
+    Q_PROPERTY(bool hasLyricTranslation READ hasLyricTranslation NOTIFY lyricsChanged);
+
 public:
+    QVariantList        lyricRows() const;
+    bool                hasTimeline() const { return !mLyrics.isEmpty(); }
+    bool                hasLyricTranslation() const;
+    void                loadLyrics(const QString& path);
+    void                clearLyrics();
+    Q_INVOKABLE int     lyricIndex(qint64 position) const { return lyricLineAt(mLyrics, position); }
+    Q_INVOKABLE QString lyricText(int index, qint64 position, const QString& played, const QString& pending) const;
     bool                lyricBusy() const { return mLyricReply; }
     QString             lyricStatus() const { return mLyricStatus; }
     QVariantList        lyricCandidates() const { return mLyricCandidates; }
     Q_INVOKABLE bool    canFetchLyrics() const;
     Q_INVOKABLE QString lyricSearchKeyword() const;
     Q_INVOKABLE void    searchOnlineLyrics(const QString& keyword);
+    QString             lyricPreview() const { return mLyricPreview; }
+    Q_INVOKABLE void    commitOnlineLyrics();
     Q_INVOKABLE void    saveOnlineLyrics(int index);
     Q_INVOKABLE void    cancelOnlineLyrics();
 
@@ -109,6 +124,7 @@ public:
     void cleanupTempSymlinks();
 
 signals:
+    void lyricsChanged();
     void onlineLyricsChanged();
     void pauseOnScanChanged();
     void hideFloatingWindowChanged();
@@ -120,10 +136,13 @@ private:
     friend Singleton<MusicPlayer>;
     explicit MusicPlayer();
 
+    QVector<LyricLine>      mLyrics;
     QNetworkAccessManager*  mLyricNetwork{nullptr}; // Created only after QCoreApplication exists.
     QPointer<QNetworkReply> mLyricReply;
     QString                 mLyricStatus;
     QVariantList            mLyricCandidates;
+    QString                 mLyricPreview;
+    QString                 mLyricDownload;
     QString                 mLyricTarget;
     void                    lyricRequest(const QUrl& url, std::function<void(const QByteArray&)> done);
 

@@ -581,11 +581,10 @@ void FileManager::_initCurrentDir() {
     // 6. 处理同名歌词文件隐藏（先精确匹配，再模糊匹配）
     QSet<QString> filesToHide;
     if (getHidePairedLyrics()) {
-        // 收集所有 .lrc 文件
+        // 收集所有支持的侧挂歌词文件。
         QVector<QFileInfo> lrcFiles;
         for (const auto& i : list) {
-            if (i.suffix().toLower() == "lrc")
-                lrcFiles.append(i);
+            if (i.isFile() && isLyricSuffix(i.suffix())) lrcFiles.append(i);
         }
 
         const QStringList audioExts = {"mp3", "flac", "m4a", "wav", "ogg", "aac"};
@@ -613,6 +612,9 @@ void FileManager::_initCurrentDir() {
             }
             if (bestScore >= 0.35 && !bestMatch.isEmpty()) {
                 filesToHide.insert(bestMatch);
+                // 同一音频可能同时附带原版 LRC 和逐字歌词，均属于侧挂文件。
+                for (const auto& lyric : lrcFiles)
+                    if (lyric.completeBaseName() == baseName) filesToHide.insert(lyric.absoluteFilePath());
             }
         }
     }

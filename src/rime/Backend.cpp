@@ -1,202 +1,163 @@
 #include "Backend.h"
+#include "RimeRuntime.h"
 #include "RimeWrapper.h"
 #include "common/Event.h"
 
-#include "rime_api.h"
-
+#include <QRunnable>
 #include <nlohmann/json.hpp>
 
-#include <QRunnable>
-
 namespace mod::rime {
-
 namespace {
-
 template <typename Function>
 class RunnableTask final : public QRunnable {
 public:
     explicit RunnableTask(Function function) : m_function(std::move(function)) {}
-
     void run() override { m_function(); }
 
 private:
     Function m_function;
 };
-
 } // namespace
 
-Backend::Backend() : Logger("Rime"), m_rimeWrapper(nullptr) {
+Backend::Backend() : Logger("Rime") {
     m_workerPool.setMaxThreadCount(1);
     m_workerPool.setExpiryTimeout(30000);
-
-    connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView& view, QQmlContext* context) {
-        Q_UNUSED(view);
+    connect(&Event::getInstance(), &Event::beforeUiInitialization, this, [this](QQuickView&, QQmlContext* context) {
         initialize(context->engine(), nullptr);
         context->setContextProperty("rime", this);
     });
 }
 
+Backend::~Backend() {
+    m_workerPool.waitForDone();
+    if (m_deploying || m_syncing) RimeRuntime::endMaintenance();
+    // The process-wide management session is owned until native service cleanup.
+    // Do not call librime here: its static service may already be destroyed.
+}
+
 void Backend::initialize(QQmlEngine* engine, QJSEngine* scriptEngine) {
     Q_UNUSED(engine);
     Q_UNUSED(scriptEngine);
-
-    // 1. 注册 QML 类型
     qmlRegisterType<RimeWrapper>("com.youdao.input", 1, 0, "RimeWrapper");
-
-    // 2. 执行 Rime 的全局初始化 (加载字典等耗时操作)
-    // 这样当 QML 创建 RimeWrapper 实例时，Backend 已经准备好了
     RimeWrapper::globalInitialize();
-
-    // 初始化时常驻会话可能还不存在，这里只读取一次当前方案用于 QML 展示
-    refreshCurrentSchema();
-
-    // 注意：不需要创建 m_rimeWrapper 实例给 setContextProperty
-    // 因为 QML 文件里自己写了 "RimeWrapper { id: ... }"
-    // QML 会自己 new 一个出来，那个 new 出来的实例会自动调用构造函数创建 Session
-
-    qInfo() << "Rime backend registered and initialized";
+    startMaintenance(Maintenance::Startup);
 }
 
 RimeSessionId Backend::ensureSession() {
-    RimeApi* api = rime_get_api();
-    if (!api || !api->create_session) return 0;
-
-    if (m_sessionId && api->find_session && !api->find_session(m_sessionId)) {
-        m_sessionId = 0;
+    if (!RimeRuntime::available()) return 0;
+    auto* api = RimeRuntime::api();
+    if (!api->create_session) return 0;
+    if (m_generation != RimeRuntime::generation()) {
+        m_sessionId  = 0;
+        m_generation = RimeRuntime::generation();
     }
-
+    if (m_sessionId && api->find_session && !api->find_session(m_sessionId)) m_sessionId = 0;
     if (!m_sessionId) {
         m_sessionId = api->create_session();
-        if (m_sessionId) {
-            info("Rime management session created: {}", m_sessionId);
-        } else {
-            error("Failed to create Rime management session");
-        }
+        if (m_sessionId) info("Rime management session created: {}", m_sessionId);
     }
     return m_sessionId;
 }
 
 QString Backend::schemaListJson() {
     nlohmann::json result = nlohmann::json::array();
-
-    RimeApi* api = rime_get_api();
-    if (!api || !api->get_schema_list || !api->free_schema_list) {
-        return QString::fromStdString(result.dump());
-    }
-
-    RimeSchemaList list = {0};
+    if (!RimeRuntime::available()) return QString::fromStdString(result.dump());
+    auto* api = RimeRuntime::api();
+    if (!api->get_schema_list || !api->free_schema_list) return QString::fromStdString(result.dump());
+    RimeSchemaList list{};
     if (api->get_schema_list(&list)) {
         for (size_t i = 0; i < list.size; ++i) {
             const auto& item = list.list[i];
-            const char* id   = item.schema_id ? item.schema_id : "";
-            const char* name = item.name ? item.name : id;
             result.push_back({
-                {"id",   id  },
-                {"name", name}
+                {"id",   item.schema_id ? item.schema_id : ""},
+                {"name", item.name ? item.name : ""          }
             });
         }
         api->free_schema_list(&list);
     }
-
     return QString::fromStdString(result.dump());
 }
 
 bool Backend::selectSchema(const QString& schemaId) {
-    RimeApi* api = rime_get_api();
-    if (!api || !api->select_schema) return false;
-
-    const RimeSessionId session = ensureSession();
+    if (schemaId.isEmpty() || !RimeRuntime::available()) return false;
+    auto* api = RimeRuntime::api();
+    if (!api->select_schema) return false;
+    const auto session = ensureSession();
     if (!session) return false;
-
-    const QByteArray utf8 = schemaId.toUtf8();
-    const bool       ok   = api->select_schema(session, utf8.constData()) != 0;
-    if (ok) {
-        info("Rime schema switched to {}", utf8.constData());
-        refreshCurrentSchema();
-    } else {
-        error("Failed to switch Rime schema to {}", utf8.constData());
-    }
-    return ok;
+    const auto utf8 = schemaId.toUtf8();
+    if (!api->select_schema(session, utf8.constData())) return false;
+    info("Rime schema switched to {}", utf8.constData());
+    refreshCurrentSchema();
+    return true;
 }
 
 void Backend::refreshCurrentSchema() {
-    RimeApi* api = rime_get_api();
-    if (!api || !api->get_current_schema) return;
-
-    const RimeSessionId session = ensureSession();
+    if (!RimeRuntime::available()) return;
+    auto* api = RimeRuntime::api();
+    if (!api->get_status || !api->free_status) return;
+    const auto session = ensureSession();
     if (!session) return;
-
-    char buffer[256] = {0};
-    if (api->get_current_schema(session, buffer, sizeof(buffer))) {
-        const QString id = QString::fromUtf8(buffer);
-        if (id != m_currentSchemaId) {
-            m_currentSchemaId = id;
-            emit currentSchemaChanged();
-        }
+    RimeStatus status{};
+    RIME_STRUCT_INIT(RimeStatus, status);
+    if (!api->get_status(session, &status)) return;
+    const auto id = QString::fromUtf8(status.schema_id ? status.schema_id : "");
+    api->free_status(&status);
+    if (m_currentSchemaId != id) {
+        m_currentSchemaId = id;
+        emit currentSchemaChanged();
     }
 }
 
-void Backend::redeploy() {
-    if (m_deploying) return;
+void Backend::redeploy() { startMaintenance(Maintenance::Deploy); }
+void Backend::syncUserData() { startMaintenance(Maintenance::Sync); }
 
-    RimeApi* api = rime_get_api();
-    if (!api || !api->start_maintenance) {
-        emit deployFinished(false);
+void Backend::startMaintenance(Maintenance operation) {
+    if (m_deploying || m_syncing) return;
+    auto*      api  = RimeRuntime::api();
+    const bool sync = operation == Maintenance::Sync;
+    if (!api || !api->join_maintenance_thread || !api->cleanup_all_sessions
+        || (sync ? !api->sync_user_data : !api->start_maintenance)) {
+        if (sync) emit syncFinished(false);
+        else emit deployFinished(false);
         return;
     }
-
-    // start_maintenance 只负责拉起维护线程，在 UI 线程调用即可；
-    // join_maintenance_thread 会阻塞等待，放到后台线程，避免卡住界面。
-    if (!api->start_maintenance(True)) {
-        error("Failed to start Rime maintenance");
-        emit deployFinished(false);
-        return;
+    // Reserve and invalidate on the GUI thread before a worker can clear the
+    // session map. All editor/manager calls and destructors honor this gate.
+    if (!RimeRuntime::beginMaintenance()) return;
+    m_sessionId  = 0;
+    m_generation = RimeRuntime::generation();
+    if (sync) {
+        m_syncing = true;
+        emit syncingChanged();
+    } else {
+        m_deploying = true;
+        emit deployingChanged();
     }
 
-    m_deploying = true;
-    emit deployingChanged();
-
-    m_workerPool.start(new RunnableTask([this]() {
-        RimeApi* threadApi = rime_get_api();
-        if (threadApi && threadApi->join_maintenance_thread) {
-            threadApi->join_maintenance_thread();
-        }
-
+    m_workerPool.start(new RunnableTask([this, api, operation, sync] {
+        // start_maintenance also performs synchronous filesystem work. Keep
+        // its entire invocation and join off the UI thread, with APIs gated.
+        // sync_user_data clears sessions itself; ordinary deploy does not.
+        if (!sync) api->cleanup_all_sessions();
+        const bool started =
+            sync ? api->sync_user_data() != 0 : api->start_maintenance(operation == Maintenance::Deploy) != 0;
+        if (started) api->join_maintenance_thread();
+        const bool ok = started ? RimeRuntime::maintenanceSucceeded()
+                                : operation == Maintenance::Startup; // No changed files is normal at startup.
         QMetaObject::invokeMethod(
             this,
-            [this]() {
-                m_deploying = false;
-                emit deployingChanged();
+            [this, sync, ok] {
+                RimeRuntime::endMaintenance();
+                if (sync) m_syncing = false;
+                else m_deploying = false;
                 refreshCurrentSchema();
-                emit deployFinished(true);
-            },
-            Qt::QueuedConnection
-        );
-    }));
-}
-
-void Backend::syncUserData() {
-    if (m_syncing) return;
-
-    RimeApi* api = rime_get_api();
-    if (!api || !api->sync_user_data) {
-        emit syncFinished(false);
-        return;
-    }
-
-    m_syncing = true;
-    emit syncingChanged();
-
-    m_workerPool.start(new RunnableTask([this]() {
-        RimeApi*   threadApi = rime_get_api();
-        const bool ok        = threadApi && threadApi->sync_user_data && threadApi->sync_user_data() != 0;
-
-        QMetaObject::invokeMethod(
-            this,
-            [this, ok]() {
-                m_syncing = false;
-                emit syncingChanged();
-                emit syncFinished(ok);
+                if (sync) {
+                    emit syncingChanged();
+                    emit syncFinished(ok);
+                } else {
+                    emit deployingChanged();
+                    emit deployFinished(ok);
+                }
             },
             Qt::QueuedConnection
         );

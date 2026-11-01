@@ -16,6 +16,7 @@
 namespace mod::filemanager {
 
 void MusicPlayer::clearLyrics() {
+    if (mLyrics.isEmpty()) return;
     mLyrics.clear();
     emit lyricsChanged();
 }

@@ -356,6 +356,7 @@ void MusicPlayer::onSoundEnd() {
     if (mShutdownPending && getCurrentAudioSequence() == AudioSequence::ORDER
         && mCurrentPlaying.mIndex + 1 >= mPlayList.size()) {
         mShutdownPending = false;
+        clearLyrics();
         ScreenManager::getInstance().requestPowerOff();
         emit shutdownTimerChanged();
         return;
@@ -376,6 +377,7 @@ void MusicPlayer::onSoundEnd() {
         *(uint32*)(*((uint64*)YPointer<YMediaPlayerManager>::getInstance() + 4) + 100) = 0;
         PEN_CALL(void*, "_ZN19YMediaPlayerManager12setPlayStateERKN12YEnumWrapper10Play_StateE", void*, void*)
         (YPointer<YMediaPlayerManager>::getInstance(), &state);
+        clearLyrics();
         break;
     }
 }
@@ -700,6 +702,8 @@ void MusicPlayer::stop() {
     PEN_CALL(void*, "_ZN19YMediaPlayerManager12setPlayStateERKN12YEnumWrapper10Play_StateE", void*, void*)
     (manager, &state);
     PEN_CALL(void*, "_ZN19YMediaPlayerManager8wipeDataEv", void*)(manager);
+    // wipeData 在 seek/重同步时也会被调用，不再自动清时间轴；用户停止时在这里明确清。
+    clearLyrics();
     mIsTakeOver = false;
     releaseAudio();
 }
@@ -803,8 +807,6 @@ PEN_HOOK(void*, _ZN19YMediaPlayerManager10onSoundEndEj, void* self, uint32 a2) {
     return self;
 }
 
-// 清空宿主媒体时清除歌词时间轴；音频软链接保留到进程结束。
-PEN_HOOK(void*, _ZN19YMediaPlayerManager8wipeDataEv, void* self) {
-    MusicPlayer::getInstance().clearLyrics();
-    return origin(self);
-}
+// wipeData 不再挂钩子：宿主在 seek、重同步和真正清空媒体时都会调用它，凭它判断“歌放完了”
+// 会让一次进度跳转清掉本地时间轴（逐字歌词立刻回退成逐句、正文/译文间距同时异常）。
+// 时间轴改由明确的生命周期管理：stop()/单曲播完调用 clearLyrics()，切歌由 _play() 的 loadLyrics() 覆盖。

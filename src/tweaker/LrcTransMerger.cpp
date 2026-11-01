@@ -11,7 +11,9 @@
 
 PEN_HOOK(void, _ZN19YMediaPlayerManager15loadLrcFromFileERK7QString, void* self, const QString* path) {
     auto& player = mod::filemanager::MusicPlayer::getInstance();
-    player.clearLyrics();
+    // 宿主会在跳转/重同步时用空路径或非歌词路径调用这里。过去先无条件 clearLyrics()，
+    // 于是一次进度跳转就把时间轴清空且不再重载（逐字歌词回退成逐句）。现在只有确实要
+    // 读取歌词文件时才替换时间轴。
     if (!path || !mod::filemanager::isLyricSuffix(QFileInfo(*path).suffix())) {
         origin(self, path);
         return;

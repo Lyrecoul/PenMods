@@ -153,7 +153,8 @@ package("ffmpeg")
         import("package.tools.autoconf")
         local envs = autoconf.buildenvs(package)
         
-        -- 按文件名顺序应用所有补丁（0001 binutils 兼容，0002 rkmppdec 适配新版 MPP）
+        -- 按文件名顺序应用所有补丁（0001 binutils 兼容，0002 rkmppdec 适配新版 MPP，
+        -- 0008 修复 seek 位置变量未初始化导致负数索引检查被优化掉的问题，见 UPSTREAM.md）
         local patches = os.files(path.join(FFPLAYER_DIR, "patches", "*.patch"))
         table.sort(patches)
         for _, patchfile in ipairs(patches) do
@@ -300,7 +301,7 @@ add_requires("ffmpeg        3.4.8", {
         -- 不要把 has_device_libs() 的返回值直接喂给 rkmpp：本机出现过同一份工程
         -- 解析出 rkmpp=false 的旧变体并被链接、导致产物没有硬解的情况，
         -- 见 doc/FFMPEG_PLAYER_ANALYSIS.md §8.5。
-        network_revision = 8,
+        network_revision = 9,
         rkmpp = use_rkmpp,
     }
 })

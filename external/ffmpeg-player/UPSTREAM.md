@@ -114,6 +114,59 @@ PENMODS_FFMPEG_PLAYER_SW=1 xmake f -c <原有配置...> -y && xmake build ffmpeg
 > 表现为"配置里明明开了硬解，产物却没有 librockchip_mpp"。`xmake f` / `xmake build` 本身
 > 已会按工程配置自动安装依赖，不需要 `xmake require`。
 
+## ⚠️ 纯音频 seek 崩溃与 0008 补丁（务必保留）
+
+issue #29：没有视频轨的文件（例如 flac 改名成 `.mp4`）拖动进度条时，**seek 成功后继续播放会在
+`ff_seek_frame_binary()` 里段错误**（`unhandled level 0 translation fault`，故障地址 = 堆指针 + 0x17FFFFFFE8）。
+有视频轨的文件不触发。
+
+根因在 vendored 的 FFmpeg 3.4.8 源码，不在播放器线程时序里：
+
+```c
+int64_t av_uninit(pos_min), av_uninit(pos_max), pos, pos_limit;
+...
+index = av_index_search_timestamp(st, target_ts, flags & ~AVSEEK_FLAG_BACKWARD);
+av_assert0(index < st->nb_index_entries);
+if (index >= 0) { pos_max = e->pos; ts_max = e->timestamp; pos_limit = pos_max - e->min_distance; }
+...
+pos = ff_gen_search(s, stream_index, target_ts, pos_min, pos_max, pos_limit, ...);
+```
+
+`av_uninit(x)` 在 clang/zig 下展开成 `x`（只有 GCC 才是 `x=x`），所以第一次查找失败或第二次查找返回
+`-1` 时，`pos_min`/`pos_max` 是**真正未初始化**的，却仍然作为实参传给 `ff_gen_search()`——这本身就是
+C 未定义行为，优化器因此有权认为"`index < 0` 的那条路径不可能发生"，把 `if (index >= 0)` 整个删掉。
+编译结果里于是就变成：
+
+```
+cmp w0, w26        ; av_assert0(index < nb_index_entries)
+b.ge  <abort>
+umaddl x8, w0, #24, x25   ; 直接 &st->index_entries[index]，w0 = -1 时按无符号扩展
+ldp   x26, x25, [x8]      ; ← 崩溃点（0x17FFFFFFE8 = 4294967295 * 24）
+```
+
+纯音频文件缺少视频索引项，第二次（向后）查找会返回 `-1`，因此只有它们踩到这条路径。
+
+`patches/0008-avformat-init-seek-positions.patch` 把这两个变量初始化成 `0`，消除 UB 后编译器重新生成
+`tbnz w0, #31` 的负数分支，越界读取不再执行。**验证方法**（不需要设备，几分钟）：
+
+```sh
+# 取 FFmpeg 3.4.8 源码，打补丁前后各编译一次 libavformat/utils.c，比较反汇编
+zig cc -target aarch64-linux-gnu.2.27 -Os -fno-sanitize=all -c libavformat/utils.c
+aarch64-linux-gnu-objdump -d libavformat/utils.o | sed -n '/<ff_seek_frame_binary>:/,/^$/p'
+# 打补丁前：umaddl 前只有 cmp w0,w26 / b.ge，没有符号位检查 → 会崩
+# 打补丁后：多出 tbnz w0, #31 → 负数索引被跳过
+```
+
+已实测：未打补丁的源码用本工程的 zig/arm64 配置编译，机器码与设备上出问题的
+`libffmpegplayerplugin.so`（`build/linux/arm64-v8a/release/`，SHA-256 `d5ea7374…`）逐条一致，
+因此这不是猜测而是可复现的编译结果。
+
+- `network_revision` 已从 8 升到 9：该字段参与 ffmpeg 包哈希，升级后旧的（有缺陷的）静态包不会被复用。
+- 改动只在宿主构建时生效，**必须重新编译 ffmpeg 依赖包**（`PENMODS_WITH_PLAYER=1 xmake f -c ...` 之后
+  `xmake build ffmpegplayerplugin`），只重编插件本身仍然链接旧的 `libavformat.a`。
+- `tools/test_ffmpeg_seek_patch.py` 断言补丁存在、`network_revision` 已升级；给出 FFmpeg 3.4.8 源码路径
+  （`PENMODS_FFMPEG_SRC`）时还会真的打补丁并检查负数分支。
+
 ## ⚠️ 硬解与宿主门控（务必保留）
 
 出厂固件的设备树把 VPU 关掉了（`/proc/device-tree/vpu_combo` = `disabled`），

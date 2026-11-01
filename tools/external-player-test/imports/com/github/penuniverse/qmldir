@@ -1,0 +1,2 @@
+module com.github.penuniverse
+singleton PageIndex 1.0 PageIndex.qml

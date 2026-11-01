@@ -25,7 +25,7 @@ namespace {
 
 // 内嵌 FFmpeg 播放器（QML 插件）部署目录，存在时由它接管视频播放，
 // 不再拉起独立的 mpv（进程内播放能跟随左右手旋转、支持画面内控件与字幕）。
-const char* EmbeddedPlayerModule = "/userdata/PenMods/qml/FFmpegPlayer/libffmpegplayerplugin.so";
+const char* EmbeddedPlayerDirectory = "/userdata/PenMods/qml/FFmpegPlayer";
 
 // 左右手模式只在主程序的 QML 层做 180° 旋转, mpv 作为独立进程拿不到这个信息.
 bool isLeftHandMode() {
@@ -48,20 +48,24 @@ ExternalPlayer::ExternalPlayer() {
     });
 } // namespace mod::filemanager
 
-bool ExternalPlayer::hasEmbeddedPlayer() const { return QFile::exists(EmbeddedPlayerModule); }
+bool ExternalPlayer::hasEmbeddedPlayer() const {
+    const QDir moduleDirectory(EmbeddedPlayerDirectory);
+    return QFileInfo(moduleDirectory.filePath("libffmpegplayerplugin.so")).isFile()
+        && QFileInfo(moduleDirectory.filePath("qmldir")).isFile();
+}
 
 void ExternalPlayer::open(const QString& path) {
     mOpeningFileName = path;
     emit mediaChanged();
-    if (hasEmbeddedPlayer()) {
-        return;
-    }
+    if (!hasEmbeddedPlayer()) fallbackToMpv();
+}
+
+bool ExternalPlayer::fallbackToMpv() {
+    if (mOpeningFileName.isEmpty()) return false;
     QStringList args;
-    if (isLeftHandMode()) {
-        args << "--video-rotate=180";
-    }
+    if (isLeftHandMode()) args << "--video-rotate=180";
     args << getOpeningPath();
-    QProcess::startDetached(QStringLiteral("/userdisk/VideoPlayer"), args);
+    return QProcess::startDetached(QStringLiteral("/userdisk/VideoPlayer"), args);
 }
 
 QString ExternalPlayer::getOpeningPath() {

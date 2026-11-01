@@ -540,9 +540,10 @@ concatenates English words; and a crop's height is already ~48 before we see it,
 `target_h` is a second resample that costs dense-Chinese accuracy (knob: `/userdisk/ppocr_target_h`).
 - The backend is toggled either from the shell (`penmods-ppocr.sh`, or `scripts/deploy.sh` while
 developing) or from the mod's settings page (**更多设置 → 系统调整 → 实验性功能**, backed by
-`src/tweaker/OcrBackend.cpp` / context property `ocrBackend`). Both read the same three files
-(`/userdisk/ppocr_backend`, `/userdisk/Qtlib/libyocr.so`, `/userdisk/ppocr_target_h`) — keep it
-that way instead of adding a config key that can drift out of sync with reality. Enabling or
+`src/tweaker/OcrBackend.cpp` / context property `ocrBackend`). The runtime resolves a complete payload
+from the active managed generation first, then the legacy manual-install paths. Both require the shim
+and the fixed model pair under `/userdisk/ppocr_models`; the launcher restores managed compatibility
+aliases before app startup. `/userdisk/Qtlib/libyocr.so` remains the opt-in enable switch. Enabling or
 disabling has to restart the app; the accuracy/speed knob does not.
 - Deployment shadows the vendor library via the app's own `LD_LIBRARY_PATH`
 (`/userdisk/Qtlib/` is its first entry and does not otherwise exist). `scripts/deploy.sh on|off`
@@ -622,6 +623,29 @@ Releasing touches three places: the version in this repo, a release tag here, an
 - Stage with `penmods-update stage DESCRIPTOR ZIP`; this publishes pending metadata only. `init --snapshot-only` imports the known-good baseline without changing live paths, for bootstrap installation. An explicit reinstall with `disabled` present uses `init --reinstall-snapshot`, then stages and installs the launch hook before `enable`; only that validated final step clears the marker. GC always retains the active generation while reinstall resets journal references. Actual aliases and active generation switch only before the next app exec. Each core candidate must advertise `health_protocol:1`, include both main/resource libraries, and send matching generation/token/PID heartbeats after UI completion. A failed or interrupted trial rolls back outside the candidate process before another launch. Do not use firmware boot slots or misc for these application updates.
 - `tools/package_update.py` emits deterministic data-only ZIPs, catalog entries on stdout, and native descriptors (`--descriptor`, string version). Optional bootstrap flags produce a separate legacy OTA archive that installs the stable helper, snapshots the baseline, stages the inner package, and hooks the launcher without overwriting live libraries. Do not manually create a success marker or reuse a mutable release URL. See `doc/UPDATE_SYSTEM.md`.
 - Host checks: `python3 tools/test_package_update.py`; native fault tests documented in `tools/update/README.md`. Before deployment test startup failure, interrupted publication, low battery, dependency rejection, and health confirmation. Keep the independent `/userdata` legacy backups; they also recover when the version store is unavailable. The helper is not replaced as part of normal generation activation.
+
+### Local version testing (without publishing)
+
+- Use the managed staging flow for temporary builds on a device with the update launcher installed. Do not publish a Release, tag, or OTA manifest just to test locally. Never push over managed library symlinks, mutate objects/generations, or switch `active` by hand.
+- Before testing, keep a host-side copy of the original core ZIP and its native descriptor JSON, or save the original paired `libPenMods.so` and `libPenModsResources.so` and package them for restoration. Do not rely on the retained `previous` generation as a permanent backup; later updates/GC can retire it. Back up mutable configuration/data separately when testing migrations: generations do not snapshot those files.
+- A core test package must contain both libraries, even for a C++-only or resource-only change; use the matching unchanged library for the other half. Build the affected targets first, then copy the pair into a dedicated input directory such as `build/local-test/core/`.
+- Example for a YDP02X/dev 2.7.0 build (adapt version, model and channel to the actual binaries/device; dependencies still apply):
+
+```sh
+python3 tools/package_update.py --component core --version 2.7.0 --source build/local-test/core --output build/local-test/test-core.zip --descriptor build/local-test/test-core.json --download https://example.invalid/local/test-core.zip --model YDP02X --channel dev
+adb push build/local-test/test-core.zip /userdisk/PenMods/test-core.zip
+adb push build/local-test/test-core.json /userdisk/PenMods/test-core.json
+adb shell '/userdata/PenMods/penmods-update stage /userdisk/PenMods/test-core.json /userdisk/PenMods/test-core.zip'
+adb shell '/userdata/PenMods/penmods-update status'
+```
+
+- The placeholder HTTPS URL is descriptor metadata; local `stage` reads the supplied ZIP and does not download that URL. Local staging supports different builds with the same version; a version bump is not needed solely for this test. Use the normal data-only core package, not the bootstrap installer.
+- Successful `stage` creates `pending` only. Activate by restarting the app through the installed launcher, using the update-center restart action or `adb shell 'sync; killall -TERM YoudaoDictPen'`. Do not interrupt an ongoing download/staging operation. If the user has reserved UI operation for themselves, do not inject taps or swipes; leave UI validation to them.
+- After activation, check `status`: the intended generation must be `active`, with `pending:null`, `trial:null`, and no new `last_error`. Compare both deployed library SHA-256 hashes with the host pair and inspect startup QML errors. Same-version metadata alone does not identify the tested build.
+- There is currently **no run-once/automatically-return-after-testing mode and no explicit rollback CLI command**. A candidate that fails startup health verification rolls back automatically; a healthy candidate is automatically confirmed and remains current. Startup health does not prove feature correctness.
+- To return after functional testing, stage the saved original ZIP/descriptor and restart again. Staging only core retains the other selected components. To abandon a pending test **before activation**, run `adb shell '/userdata/PenMods/penmods-update cancel'`; this clears the whole pending combination, not just one component, and cannot cancel a running trial.
+- After `stage` succeeds, the manually uploaded ZIP and descriptor can be removed from the device: the helper has copied/verified the payload into its own store. Clean up only the exact scratch files uploaded for this test after checking their paths; keep the original restore package on the host. Manually uploaded archives outside the store are not automatically deleted.
+- Cleanup boundaries: normal update-center download directories are removed on completion/failure/cancellation; helper GC runs during staging/cancellation and before app startup. It retains active/confirmed, previous, pending/trial, and backup-journal references, plus their shared objects. Several retained generations are expected. As currently implemented, downloads orphaned by a crash/forced exit have no next-start cleanup fallback; do not claim they are automatically reclaimed.
 
 ### Versioning
 

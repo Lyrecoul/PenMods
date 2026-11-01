@@ -41,7 +41,12 @@ Rectangle {
             property real readingOffset: rootFixture.longProbe ? rootFixture.longFocus : 0
             onReadingOffsetChanged: if (index === viewport.activeIndex) viewport.followCurrent()
             sourceComponent: rootFixture.fadeProbe || rootFixture.longProbe ? solid : lyric
-            Component { id: solid; Rectangle { color: "white"; implicitHeight: 400; width: viewport.width } }
+            Component { id: solid; Column {
+                 width: viewport.width
+                 spacing: 3
+                 Rectangle { color: "white"; implicitHeight: 260; width: viewport.width }
+                 Rectangle { objectName: "translation"; color: "#a0a0a0"; implicitHeight: 40; width: viewport.width }
+             } }
             Component { id: lyric; LyricLineItem {
                 width: viewport.width; height: implicitHeight
                 line: ({mainLrc: "Line " + index + " 中文歌词换行测试", time: 0, cues: []})
@@ -192,7 +197,15 @@ Rectangle {
                                                     && longItem->y() + 260 < offset + list->height(),
                                                 "current singing row of a long line must stay visible"
                                             );
-                                            qInfo() << "GESTURE CHECK PASS";
+                                            const auto* translation = longItem ? longItem->findChild<QQuickItem*>("translation") : nullptr;
+                                             const qreal translationBottom = translation
+                                                 ? translation->mapToItem(viewport, QPointF(0, translation->height())).y()
+                                                 : -1;
+                                             check(
+                                                 translation && translationBottom <= viewport->y() + viewport->height() - 6,
+                                                 "bilingual translation must remain inside the lyric fade area"
+                                             );
+                                             qInfo() << "GESTURE CHECK PASS";
                                             app.quit();
                                         });
                                     });

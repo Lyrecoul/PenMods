@@ -24,6 +24,12 @@ if [ ! -f "$SRC_DIR/libffmpegplayerplugin.so" ]; then
     exit 1
 fi
 
+if adb shell "test -L $DST_DIR"; then
+    echo "$DST_DIR is managed by penmods-update; manual deployment would mutate an immutable generation." >&2
+    echo "Package the plugin as the managed player component and activate it on the next app start." >&2
+    exit 1
+fi
+
 echo "==> 部署 $SRC_DIR/ 到 $DST_DIR/"
 adb shell "mkdir -p $DST_DIR"
 

@@ -233,8 +233,7 @@ Config::Config() : Logger("Config") {
                 {"blocklist", json::array()}
             }},
             {"math_render", {
-                {"enabled",     false},
-                {"server_path", ""}
+                {"enabled", false}
             }}
         }}
     };

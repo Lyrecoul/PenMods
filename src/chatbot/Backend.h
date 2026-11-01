@@ -32,6 +32,8 @@ using json = nlohmann::json;
 
 namespace mod::chatbot {
 
+class MathServerRuntime;
+
 // 消息内容部分（多模态）
 struct MessagePart {
     QString type;      // "text" | "image_url" | "input_audio"
@@ -120,7 +122,10 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
     Q_PROPERTY(
         bool mathRenderEnabled READ getMathRenderEnabled WRITE setMathRenderEnabled NOTIFY mathRenderConfigChanged
     )
-    Q_PROPERTY(QString mathServerPath READ getMathServerPath WRITE setMathServerPath NOTIFY mathRenderConfigChanged)
+    Q_PROPERTY(QString mathServerPath READ getMathServerPath NOTIFY mathRenderConfigChanged)
+    Q_PROPERTY(bool mathServerInstalled READ getMathServerInstalled NOTIFY mathRenderConfigChanged)
+    Q_PROPERTY(QString mathServerStatus READ getMathServerStatus NOTIFY mathServerStateChanged)
+    Q_PROPERTY(bool mathServerRunning READ getMathServerRunning NOTIFY mathServerStateChanged)
     Q_PROPERTY(
         QString bubbleRenderMode READ getBubbleRenderMode WRITE setBubbleRenderMode NOTIFY bubbleRenderModeChanged
     )
@@ -256,12 +261,15 @@ public:
     void    setShellToolEnabled(bool v);
     void    setShellMode(const QString& mode);
 
-    bool    getMathRenderEnabled() const { return m_mathRenderEnabled; }
+    bool    getMathRenderEnabled() const;
     QString getMathServerPath() const;
+    bool    getMathServerInstalled() const;
+    QString getMathServerStatus() const;
+    bool    getMathServerRunning() const;
+    Q_INVOKABLE bool startMathServer();
     Q_INVOKABLE bool startManagedMathServer();
     QString getBubbleRenderMode() const { return m_bubbleRenderMode; }
     void    setMathRenderEnabled(bool v);
-    void    setMathServerPath(const QString& path);
     void    setBubbleRenderMode(const QString& mode);
 
     void setApiKey(const QString& key);
@@ -319,6 +327,7 @@ signals:
     shellCommandFinished(const QString& toolCallId, bool success, const QString& summary, const QString& resultText);
     void toolBatchFlushed();
     void mathRenderConfigChanged();
+    void mathServerStateChanged();
     void bubbleRenderModeChanged();
 
 private:
@@ -582,9 +591,7 @@ private:
     void abortAutomaticShellExecs(const QString& reason);
 
     // 数学公式渲染
-    bool    m_mathRenderEnabled = false;
-    QString m_mathServerPath;
-    QProcess* m_managedMathProcess = nullptr;
+    MathServerRuntime* m_mathRuntime = nullptr;
     QString m_bubbleRenderMode = "full";
 
     void initMathRender();

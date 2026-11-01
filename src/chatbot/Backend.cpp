@@ -9,6 +9,7 @@
 #include "chatbot/AttachmentManager.h"
 
 #include "chatbot/MarkdownParser.h"
+#include "chatbot/MathServerRuntime.h"
 #include "common/Event.h"
 #include "common/Utils.h"
 #include "common/service/Logger.h"
@@ -34,7 +35,6 @@
 #include <QNetworkReply>
 #include <QPointer>
 #include <QProcess>
-#include <sys/prctl.h>
 #include <signal.h>
 #include <unistd.h>
 #include <QProcessEnvironment>
@@ -5878,79 +5878,41 @@ void ChatBot::abortAutomaticShellExecs(const QString& reason) {
 // 数学公式渲染
 // -----------------------------------------------------------------------
 
-namespace {
-QString managedMathServerPath() {
-    return mod::util::getUpdateDirectory() + "/active/mathjax/mathjax-server";
-}
+QString ChatBot::getMathServerPath() const { return m_mathRuntime ? m_mathRuntime->path() : QString(); }
+bool ChatBot::getMathRenderEnabled() const { return m_mathRuntime && m_mathRuntime->enabled(); }
+bool ChatBot::getMathServerInstalled() const { return m_mathRuntime && m_mathRuntime->installed(); }
+QString ChatBot::getMathServerStatus() const { return m_mathRuntime ? m_mathRuntime->status() : QString(); }
+bool ChatBot::getMathServerRunning() const { return m_mathRuntime && m_mathRuntime->running(); }
 
-class ManagedMathProcess final : public QProcess {
-public:
-    using QProcess::QProcess;
-protected:
-    void setupChildProcess() override {
-        // A helper from the old generation must not survive an application restart.
-        const auto parent = getppid();
-        if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || parent == 1 || getppid() != parent) _exit(127);
-    }
-};
-} // namespace
-
-QString ChatBot::getMathServerPath() const {
-    if (!m_mathServerPath.isEmpty()) return m_mathServerPath;
-    const auto managed = managedMathServerPath();
-    return QFileInfo(managed).isExecutable() ? managed : QString();
-}
-
-bool ChatBot::startManagedMathServer() {
-    const auto path = managedMathServerPath();
-    if (getMathServerPath() != path) return false;
-    if (!m_mathRenderEnabled || !QFileInfo(path).isExecutable()) return true;
-    if (!m_managedMathProcess) {
-        m_managedMathProcess = new ManagedMathProcess(this);
-        m_managedMathProcess->setProcessChannelMode(QProcess::ForwardedChannels);
-        connect(m_managedMathProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
-            warn("Managed formula renderer failed: {}", m_managedMathProcess->errorString().toStdString());
-        });
-    }
-    if (m_managedMathProcess->state() == QProcess::NotRunning) m_managedMathProcess->start(path, QStringList{});
-    return true;
-}
-
+bool ChatBot::startMathServer() { return m_mathRuntime && m_mathRuntime->start(); }
+bool ChatBot::startManagedMathServer() { return startMathServer(); }
 void ChatBot::initMathRender() {
-    json aiCfg = mod::Config::getInstance().read("ai");
-    if (!aiCfg.contains("math_render") || !aiCfg["math_render"].is_object()) return;
-
-    const auto& mr      = aiCfg["math_render"];
-    m_mathRenderEnabled = mr.value("enabled", false);
-    m_mathServerPath    = QString::fromStdString(mr.value("server_path", std::string()));
-    emit mathRenderConfigChanged();
-    info("Math render 配置已加载, enabled={}, path={}", m_mathRenderEnabled, m_mathServerPath.toStdString());
+    if (!m_mathRuntime) {
+        m_mathRuntime = new MathServerRuntime(mod::util::getUpdateDirectory() + "/active/mathjax/mathjax-server",
+            [](const QJsonObject& settings) {
+                auto aiCfg = mod::Config::getInstance().read("ai");
+                if (!aiCfg.is_object()) aiCfg = json::object();
+                aiCfg["math_render"] = json::parse(QJsonDocument(settings).toJson(QJsonDocument::Compact).toStdString());
+                return mod::Config::getInstance().write("ai", std::move(aiCfg), true);
+            }, this);
+        m_mathRuntime->changed = [this]() { emit mathServerStateChanged(); };
+        m_mathRuntime->selectionChanged = [this]() { emit mathRenderConfigChanged(); };
+        m_mathRuntime->failed = [this](const QString& reason) {
+            warn("Formula renderer: {}", reason.toStdString());
+            emit errorOccurred(reason);
+        };
+    }
+    const auto aiCfg = mod::Config::getInstance().read("ai");
+    QJsonObject settings;
+    if (aiCfg.is_object() && aiCfg.contains("math_render") && aiCfg["math_render"].is_object())
+        settings = QJsonDocument::fromJson(QByteArray::fromStdString(aiCfg["math_render"].dump())).object();
+    m_mathRuntime->load(settings);
+    info("Math render config loaded, enabled={}, path={}", getMathRenderEnabled(), getMathServerPath().toStdString());
 }
 
-void ChatBot::setMathRenderEnabled(bool v) {
-    if (m_mathRenderEnabled == v) return;
-    m_mathRenderEnabled = v;
-    if (!v && m_managedMathProcess) m_managedMathProcess->terminate();
-
-    json aiCfg = mod::Config::getInstance().read("ai");
-    if (aiCfg.is_null()) aiCfg = json::object();
-    if (!aiCfg.contains("math_render") || !aiCfg["math_render"].is_object()) aiCfg["math_render"] = json::object();
-    aiCfg["math_render"]["enabled"] = v;
-    mod::Config::getInstance().write("ai", aiCfg, true);
-    emit mathRenderConfigChanged();
-}
-
-void ChatBot::setMathServerPath(const QString& path) {
-    if (m_mathServerPath == path) return;
-    m_mathServerPath = path;
-    if (m_managedMathProcess) m_managedMathProcess->terminate();
-
-    json aiCfg = mod::Config::getInstance().read("ai");
-    if (aiCfg.is_null()) aiCfg = json::object();
-    if (!aiCfg.contains("math_render") || !aiCfg["math_render"].is_object()) aiCfg["math_render"] = json::object();
-    aiCfg["math_render"]["server_path"] = path.toStdString();
-    mod::Config::getInstance().write("ai", aiCfg, true);
-    emit mathRenderConfigChanged();
+void ChatBot::setMathRenderEnabled(bool value) {
+    if (!m_mathRuntime || !m_mathRuntime->setEnabled(value)) return;
+    if (value) startMathServer();
 }
 
 void ChatBot::setBubbleRenderMode(const QString& mode) {
@@ -5966,28 +5928,13 @@ void ChatBot::setBubbleRenderMode(const QString& mode) {
 }
 
 QString ChatBot::getMathRenderConfig() {
-    json obj;
-    obj["enabled"]     = m_mathRenderEnabled;
-    obj["server_path"] = m_mathServerPath.toStdString();
-    return QString::fromStdString(obj.dump(2));
+    return m_mathRuntime ? QString::fromUtf8(QJsonDocument(m_mathRuntime->config()).toJson(QJsonDocument::Indented)) : "{}";
 }
 
 void ChatBot::setMathRenderConfig(const QString& configJson) {
-    QJsonDocument doc = QJsonDocument::fromJson(configJson.toUtf8());
-    if (!doc.isObject()) return;
-
-    QJsonObject obj = doc.object();
-    if (obj.contains("enabled")) m_mathRenderEnabled = obj["enabled"].toBool();
-    if (obj.contains("server_path")) m_mathServerPath = obj["server_path"].toString();
-
-    json aiCfg = mod::Config::getInstance().read("ai");
-    if (aiCfg.is_null()) aiCfg = json::object();
-    if (!aiCfg.contains("math_render") || !aiCfg["math_render"].is_object()) aiCfg["math_render"] = json::object();
-    aiCfg["math_render"]["enabled"]     = m_mathRenderEnabled;
-    aiCfg["math_render"]["server_path"] = m_mathServerPath.toStdString();
-    mod::Config::getInstance().write("ai", aiCfg, true);
-    emit mathRenderConfigChanged();
-    info("Math render 配置已保存");
+    const auto document = QJsonDocument::fromJson(configJson.toUtf8());
+    if (!document.isObject() || !m_mathRuntime || !m_mathRuntime->update(document.object())) return;
+    if (getMathRenderEnabled()) startMathServer();
 }
 
 } // namespace mod::chatbot

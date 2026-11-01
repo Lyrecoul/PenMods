@@ -20,7 +20,8 @@ class ExternalPlayer : public QObject, public Singleton<ExternalPlayer> {
     Q_PROPERTY(bool hasEmbeddedPlayer READ hasEmbeddedPlayer CONSTANT)
 
 public:
-    Q_INVOKABLE void open(const QString &path);
+    Q_INVOKABLE void open(const QString& path);
+    Q_INVOKABLE bool fallbackToMpv();
 
     QString getOpeningPath();
 

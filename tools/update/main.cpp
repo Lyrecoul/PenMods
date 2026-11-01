@@ -531,17 +531,45 @@ public:
         }
         return result;
     }
+    std::pair<bool, std::string> launcherReadiness() const {
+        if (fs::exists(root / "disabled")) return {false, "launcher disabled; enable after bootstrap completes"};
+        auto launcher = device("/usr/bin/runDictPen");
+        if (!fs::is_regular_file(fs::symlink_status(launcher)))
+            return {false, "/usr/bin/runDictPen is missing or not a regular file"};
+        auto helper = device("/userdata/PenMods/penmods-update");
+        if (!fs::is_regular_file(fs::symlink_status(helper)) || access(helper.c_str(), X_OK) != 0)
+            return {false, "/userdata/PenMods/penmods-update is missing or not executable"};
+        const std::string hooked =
+            "stdbuf -o0 /userdata/PenMods/penmods-update run -- ./YoudaoDictPen -platform wayland > $LOG_FILE 2>&1";
+        const std::string stock = "stdbuf -o0 ./YoudaoDictPen -platform wayland > $LOG_FILE 2>&1";
+        std::ifstream     input(launcher);
+        std::string       line;
+        unsigned          matches  = 0;
+        bool              hasStock = false;
+        while (std::getline(input, line)) {
+            if (line == hooked) ++matches;
+            if (line == stock) hasStock = true;
+        }
+        if (!input.eof()) return {false, "cannot read /usr/bin/runDictPen"};
+        if (matches == 1 && !hasStock) return {true, ""};
+        if (matches == 0 && hasStock)
+            return {false, "launcher hook missing; reinstall the launch hook using tools/update/install-launcher.sh from the PenMods bootstrap package"};
+        return {false, "/usr/bin/runDictPen has an unrecognized or ambiguous launcher hook"};
+    }
     Json status() const {
+        auto readiness = launcherReadiness();
         if (!fs::exists(root / "state.json"))
             return Json{
-                {"schema",             1             },
-                {"installed",          false         },
-                {"active",             nullptr       },
-                {"pending",            nullptr       },
-                {"trial",              nullptr       },
-                {"components",         Json::object()},
-                {"pending_components", Json::object()},
-                {"last_error",         ""            }
+                {"schema",             1               },
+                {"installed",          false           },
+                {"active",             nullptr         },
+                {"pending",            nullptr         },
+                {"trial",              nullptr         },
+                {"components",         Json::object()  },
+                {"pending_components", Json::object()  },
+                {"last_error",         ""              },
+                {"launcher_ready",     readiness.first },
+                {"launcher_error",     readiness.second}
             };
         auto value = state();
         auto id    = value["trial"].is_object() ? value["trial"].at("generation").get<std::string>()
@@ -556,7 +584,9 @@ public:
             {"pending_components",
              value["pending"].is_string() ? exposed(value["pending"].get<std::string>()) : Json::object()},
             {"last_error", value.value("last_error", std::string())},
-            {"disabled", fs::exists(root / "disabled")}
+            {"disabled", fs::exists(root / "disabled")},
+            {"launcher_ready", readiness.first},
+            {"launcher_error", readiness.second}
         };
     }
     void enable() {

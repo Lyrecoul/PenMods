@@ -261,6 +261,36 @@ for seq in range(20):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(backup.read_text(), original)
 
+    def test_status_requires_exact_launcher_hook_and_executable_helper(self):
+        launcher=self.prefix/"usr/bin/runDictPen"
+        launcher.parent.mkdir(parents=True)
+        helper=self.mod/"penmods-update"
+        helper.write_text("helper");helper.chmod(0o755)
+        stock="#!/bin/sh\nstdbuf -o0 ./YoudaoDictPen -platform wayland > $LOG_FILE 2>&1\n"
+        managed="#!/bin/sh\nstdbuf -o0 /userdata/PenMods/penmods-update run -- ./YoudaoDictPen -platform wayland > $LOG_FILE 2>&1\n"
+        launcher.write_text(managed)
+        ready=self.status()
+        self.assertTrue(ready["launcher_ready"])
+        self.assertEqual(ready["launcher_error"],"")
+        launcher.write_text(stock)
+        missing_hook=self.status()
+        self.assertFalse(missing_hook["launcher_ready"])
+        self.assertIn("hook missing",missing_hook["launcher_error"])
+        launcher.write_text(managed)
+        helper.chmod(0o644)
+        missing_helper=self.status()
+        self.assertFalse(missing_helper["launcher_ready"])
+        self.assertIn("not executable",missing_helper["launcher_error"])
+        helper.chmod(0o755)
+        launcher.write_text(managed+managed.splitlines(keepends=True)[1])
+        ambiguous=self.status()
+        self.assertFalse(ambiguous["launcher_ready"])
+        self.assertIn("ambiguous",ambiguous["launcher_error"])
+        (self.root/"disabled").touch()
+        disabled=self.status()
+        self.assertFalse(disabled["launcher_ready"])
+        self.assertIn("disabled",disabled["launcher_error"])
+
     def test_low_battery_defers_without_consuming_pending(self):
         battery = self.prefix / "sys/class/power_supply/battery"
         battery.mkdir(parents=True)

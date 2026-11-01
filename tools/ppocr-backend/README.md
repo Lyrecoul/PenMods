@@ -64,9 +64,7 @@ adb shell 'sh /userdisk/penmods-ppocr.sh'
 | 使用 PP-OCRv5 识别引擎 | 启用/禁用。会替换影子文件并重启 app（几秒），因为 `libyocr.so` 在进程启动时就被解析了。组件未安装时该行显示“未安装”并置灰 |
 | 识别精度优先（较慢） | 输入高度 48 ↔ 32，下一条识别即生效，不需要重启 |
 
-它由 `mod::OcrBackend`（`src/tweaker/OcrBackend.cpp`，context property `ocrBackend`）实现，读取的正是 shim
-用的那几个文件（`/userdisk/ppocr_backend`、`/userdisk/Qtlib/libyocr.so`、`/userdisk/ppocr_target_h`），
-所以命令行和界面永远一致，不存在第二份会走样的配置。
+它由 `mod::OcrBackend`（`src/tweaker/OcrBackend.cpp`，context property `ocrBackend`）实现。托管安装优先从活动 generation 读取 shim 和模型；旧版手动安装则从 `/userdisk/ppocr_backend/libyocr.so` 与 `/userdisk/ppocr_models` 读取。两种来源都必须包含 shim 和固定的模型参数/权重文件。更新启动器会在应用启动前恢复 `/userdisk/ppocr_backend` 与 `/userdisk/ppocr_models` 兼容别名；`/userdisk/Qtlib/libyocr.so` 仍单独控制是否启用。
 
 ## 从源码构建
 
@@ -97,8 +95,9 @@ scripts/make-bundle.sh    # -> dist/penmods-ppocr.sh
 | 路径 | 用途 |
 |---|---|
 | `/userdisk/Qtlib/libyocr.so` | shim；该目录是 app 的 `LD_LIBRARY_PATH` 首项，用来影子覆盖厂商库 |
-| `/userdisk/ppocr_backend/libyocr.so` | 安装脚本暂存的 shim 本体（`enable`/`disable` 只切换影子文件） |
-| `/userdisk/ppocr_models/PP_OCRv5_mobile_rec.ncnn.{param,bin}` | 模型（8.2 MB） |
+| `/userdisk/PenMods/update-system/active/ppocr/` | 更新器管理的 shim 与模型载荷；不可直接修改 |
+| `/userdisk/ppocr_backend/libyocr.so` | 旧手动安装暂存文件；托管安装时由启动器映射到活动 generation |
+| `/userdisk/ppocr_models/PP_OCRv5_mobile_rec.ncnn.{param,bin}` | 固定运行时模型路径；托管安装时由启动器映射到活动 generation |
 | `/userdisk/ppocr_target_h` | 目标高度，16..64（默认 32） |
 | `/userdisk/ppocr_shim.log` | 每次识别的日志：输入/输出尺寸、耗时、文本 |
 

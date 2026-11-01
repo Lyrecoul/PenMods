@@ -10,6 +10,7 @@
 #include "common/Utils.h"
 #include "common/util/System.h"
 #include "mod/Mod.h"
+#include "mod/PpOcrPayload.h"
 #include <cstdio>
 
 #include <QDir>
@@ -22,6 +23,7 @@ namespace {
 
 // 安装脚本(见 tools/ppocr-backend/installer)约定的路径
 constexpr auto STAGE_SHIM  = "/userdisk/ppocr_backend/libyocr.so";
+constexpr auto MODEL_DIR   = "/userdisk/ppocr_models";
 constexpr auto SHADOW_DIR  = "/userdisk/Qtlib";
 constexpr auto SHADOW_SHIM = "/userdisk/Qtlib/libyocr.so";
 constexpr auto HEIGHT_FILE = "/userdisk/ppocr_target_h";
@@ -55,28 +57,31 @@ OcrBackend::OcrBackend() : Logger("OcrBackend") {
     });
 }
 
-bool OcrBackend::installed() const { return QFile::exists(STAGE_SHIM); }
+bool OcrBackend::installed() const {
+    return !ppocr::resolveShim(util::getUpdateDirectory(), STAGE_SHIM, MODEL_DIR).isEmpty();
+}
 
-bool OcrBackend::enabled() const { return QFile::exists(SHADOW_SHIM); }
+bool OcrBackend::enabled() const { return ppocr::hasCompletePayload(SHADOW_SHIM, MODEL_DIR); }
 
 bool OcrBackend::accuracyFirst() const { return readHeight() >= HEIGHT_ACCURATE; }
 
 void OcrBackend::setEnabled(bool value) {
-    if (value == enabled()) {
-        return;
-    }
-    if (value && !installed()) {
-        warn("PP-OCRv5 backend is not installed; run penmods-ppocr.sh on the device first.");
-        return;
-    }
+    const QFileInfo shadow(SHADOW_SHIM);
+    const bool shadowEntryExists = shadow.exists() || shadow.isSymLink();
+    if (value == enabled() && (value || !shadowEntryExists)) return;
 
     if (value) {
+        const auto source = ppocr::resolveShim(util::getUpdateDirectory(), STAGE_SHIM, MODEL_DIR);
+        if (source.isEmpty()) {
+            warn("PP-OCRv5 backend or its required model pair is missing; install the component first.");
+            return;
+        }
         QDir().mkpath(SHADOW_DIR);
-        // 先写临时文件再 rename:正在运行(app 已把旧文件映射进来时)覆盖会被撕裂
+        // Publish through a temporary path so a running process never sees a partial shim.
         const QString temp = QString(SHADOW_SHIM) + ".new";
         QFile::remove(temp);
-        const auto managed = util::getUpdateDirectory() + "/active/ppocr/libyocr.so";
-        const bool staged  = QFile::exists(managed) ? QFile::link(managed, temp) : QFile::copy(STAGE_SHIM, temp);
+        const auto managed = QDir(util::getUpdateDirectory()).filePath("active/ppocr/libyocr.so");
+        const bool staged = source == managed ? QFile::link(source, temp) : QFile::copy(source, temp);
         if (!staged) {
             error("Cannot stage the OCR shim to {}", temp.toStdString());
             return;

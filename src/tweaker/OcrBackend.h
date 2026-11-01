@@ -28,10 +28,10 @@ class OcrBackend : public QObject, public Singleton<OcrBackend>, private Logger 
     Q_PROPERTY(bool accuracyFirst READ accuracyFirst WRITE setAccuracyFirst NOTIFY stateChanged)
 
 public:
-    /// 安装包(shim + 模型)是否已经就位
+    /// 托管 generation 或旧手动安装中的 shim 和必需模型是否完整
     [[nodiscard]] bool installed() const;
 
-    /// 当前 app 进程启动时是否加载了 shim
+    /// shim 与固定运行时模型路径是否完整可用
     [[nodiscard]] bool enabled() const;
 
     /// true: target height 48(更准更慢); false: 32(更快,密集中文会丢笔画)

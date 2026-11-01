@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "UpdateCenter.h"
+#include "UpdateLaunchStatus.h"
 
 #include "Version.h"
 #include "common/Event.h"
 #include "helper/NetworkSettings.h"
 #include "mod/Config.h"
 #include "mod/Mod.h"
+#include "mod/PpOcrPayload.h"
 #include "mod/Updater.h"
 
 #include <QCryptographicHash>
@@ -272,7 +274,7 @@ QVariantList UpdateCenter::components() const {
     for (const auto& c : mComponents) {
         const QString latest      = c.descriptor.value("version").toString();
         const bool    available   = !c.descriptor.isEmpty();
-        const bool    pending     = !c.pendingVersion.isEmpty() && c.pendingVersion != c.installedVersion;
+        const bool    pending     = !c.pendingVersion.isEmpty() && (!c.installed || c.pendingVersion != c.installedVersion);
         const bool    rowBusy     = c.state == "queued" || c.state == "downloading" || c.state == "staging";
         const bool    needsUpdate = available && (!c.installed || newer(latest, c.installedVersion));
         const bool    healthyCore = c.id != "core" || c.descriptor.value("health_protocol").toInt() == 1;
@@ -280,6 +282,8 @@ QVariantList UpdateCenter::components() const {
         QString text = c.state == "error" && !c.error.isEmpty() ? "更新失败：" + c.error : componentStateText(c.state);
         if (text.isEmpty()) {
             if (pending) text = "已暂存，重启应用后生效";
+            else if (c.id == "ppocr" && !c.installed && !c.installedVersion.isEmpty())
+                text = "组件文件缺失，请重新安装";
             else if (!available) text = c.installed ? "已安装，暂无更新目录" : "暂无可用版本";
             else if (needsUpdate && !healthyCore) text = "此旧版更新包不支持启动健康验证";
             else if (needsUpdate && !dependency.isEmpty()) text = dependency;
@@ -371,17 +375,23 @@ void UpdateCenter::refresh() {
         *done = true;
         mStatusProcess.clear();
         const auto status = readObject(process->readAllStandardOutput());
-        mLauncherReady    = ok && !status.isEmpty() && status.value("installed").toBool(false)
-                         && !status.value("disabled").toBool(false)
-                         && !QFile::exists(QDir(rootPath()).filePath("disabled"));
-        mTrialActive      = status.value("trial").isObject();
-        if (mLauncherReady) {
+        const bool storeReady = ok && !status.isEmpty() && status.value("installed").toBool(false)
+                             && !status.value("disabled").toBool(false)
+                             && !QFile::exists(QDir(rootPath()).filePath("disabled"));
+        mLauncherReady = storeReady && updateLaunchHookReady()
+                      && (!status.contains("launcher_ready") || status.value("launcher_ready").toBool(false));
+        mTrialActive = status.value("trial").isObject();
+        if (storeReady) {
             const auto installed = status.value("components").toObject();
             const auto pending   = status.value("pending_components").toObject();
             mPendingRestart      = !status.value("pending").toString().isEmpty();
             for (auto& c : mComponents) {
                 const auto item    = installed.value(c.id).toObject();
                 c.installed        = !item.isEmpty();
+                if (c.id == "ppocr") {
+                    const QString shim = item.value("path").toString();
+                    c.installed = ppocr::managedPayloadReady(shim, "/userdisk/ppocr_models");
+                }
                 c.installedVersion = item.value("version").toString();
                 c.pendingVersion   = pending.value(c.id).toObject().value("version").toString();
                 // The running core reports its real version even when an imported baseline was unknown.
@@ -397,7 +407,8 @@ void UpdateCenter::refresh() {
                     break;
                 }
             const QString lastError = status.value("last_error").toString();
-            mStatusText             = mTrialActive          ? "正在验证新版本启动状态，稍后可继续更新"
+            mStatusText             = !mLauncherReady       ? "启动入口未挂接，暂存更新无法在重启时激活；请重新安装启动器"
+                                    : mTrialActive          ? "正在验证新版本启动状态，稍后可继续更新"
                                     : mPendingRestart       ? "更新已暂存，下次启动应用时激活"
                                     : !localError.isEmpty() ? localError
                                     : !lastError.isEmpty()  ? "上次更新已回滚：" + lastError

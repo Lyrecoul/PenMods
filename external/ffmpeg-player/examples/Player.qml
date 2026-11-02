@@ -36,6 +36,14 @@ Window {
     property alias edgeProgressColor: player.progressBarColor
     property alias edgeProgressBackgroundColor: player.progressBarBackgroundColor
     property alias edgeProgressHeight: player.progressBarHeight
+    readonly property bool buffering: typeof player.buffering === "boolean" && player.buffering
+    readonly property real bufferProgress: typeof player.bufferProgress === "number" &&
+            isFinite(player.bufferProgress) ? Math.max(0, Math.min(1, player.bufferProgress)) : -1
+    readonly property real downloadSpeed: typeof player.downloadSpeed === "number" &&
+            isFinite(player.downloadSpeed) && player.downloadSpeed >= 0 ? player.downloadSpeed : -1
+    readonly property real bufferedPosition: typeof player.bufferedPosition === "number" &&
+            isFinite(player.bufferedPosition) && player.bufferedPosition >= 0
+            ? player.bufferedPosition : -1
     readonly property bool swipeSeeking: gestureArea.pressed && gestureArea.gestureValid && gestureArea.dragMode === 1
     readonly property bool previewSeeking: swipeSeeking || seekMouseArea.pressed
     readonly property real displayedPosition: previewSeeking ? seekPreviewPosition : player.position
@@ -365,10 +373,44 @@ Window {
         styleColor: "#aa000000"
     }
 
-    Text {
+    PlayerLoadingIndicator {
+        id: loadingIndicator
+        anchors.centerIn: parent
+        z: 5
+        active: player.loading || player.seeking || app.buffering
+        message: player.seeking ? "正在定位…" : app.buffering ? "正在缓冲…" : "正在加载…"
+        progress: (player.seeking || app.buffering) ? app.bufferProgress : -1
+        downloadSpeed: (player.seeking || app.buffering) ? app.downloadSpeed : -1
+    }
+
+    Rectangle {
+        id: seekPreviewPill
+        anchors.top: parent.top
+        anchors.topMargin: 8
+        anchors.horizontalCenter: parent.horizontalCenter
+        visible: app.swipeSeeking
+        width: seekPreviewText.implicitWidth + 18
+        height: 24
+        radius: 12
+        color: "#b0101620"
+        opacity: 0.75
+        z: 4
+
+        Text {
+            id: seekPreviewText
+            anchors.centerIn: parent
+            text: app.formatTime(app.seekPreviewPosition) + " / " + app.formatTime(player.duration)
+            color: "#f4f6f8"
+            font.pixelSize: 14
+            style: Text.Outline
+            styleColor: "#aa000000"
+        }
+    }
+
+    Rectangle {
         id: errorLabel
         objectName: "errorLabel"
-        text: {
+        property string message: {
             var messages = []
             if (!player.loading && player.errorString.length)
                 messages.push(player.errorString)
@@ -376,27 +418,41 @@ Window {
                 messages.push("字幕：" + player.subtitleErrorString)
             return messages.join("\n")
         }
-        textFormat: Text.PlainText
+        property alias text: errorText.text
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.bottom: controls.top
-        anchors.bottomMargin: 10
-        width: parent.width * 0.9
-        visible: text.length > 0
+        anchors.bottomMargin: player.boosted ? 38 : 10
+        width: Math.min(parent.width - 80, errorText.implicitWidth + 18)
+        height: Math.max(24, errorText.implicitHeight + 8)
+        visible: message.length > 0
         z: 4
-        color: "#ffd2d2"
-        wrapMode: Text.Wrap
-        horizontalAlignment: Text.AlignHCenter
-        font.pixelSize: 13
-        style: Text.Outline
-        styleColor: "#dd000000"
+        radius: 12
+        color: "#b0303842"
+        opacity: 0.85
+
+        Text {
+            id: errorText
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.leftMargin: 9
+            anchors.rightMargin: 9
+            anchors.verticalCenter: parent.verticalCenter
+            text: errorLabel.message
+            textFormat: Text.PlainText
+            color: "#f4f6f8"
+            wrapMode: Text.Wrap
+            horizontalAlignment: Text.AlignHCenter
+            font.pixelSize: 13
+        }
     }
 
     Column {
-        anchors.left: parent.left
+        id: zoomControls
+        anchors.right: parent.right
         anchors.top: parent.top
-        anchors.leftMargin: 16 * app.uiScale
-        anchors.topMargin: Math.max(25 * app.uiScale, gestureIndicator.y + gestureIndicator.height + 8)
-        spacing: 10 * app.uiScale
+        anchors.rightMargin: 16
+        anchors.topMargin: 10
+        spacing: 8
         z: 3
         opacity: app.osdVisible ? 1 : 0
         enabled: app.osdVisible
@@ -405,13 +461,13 @@ Window {
         PlayerButton {
             id: resetZoomButton
             objectName: "resetZoomButton"
-            width: 21 * app.uiScale
-            height: 21 * app.uiScale
+            width: 28
+            height: 28
             onClicked: app.resetZoom()
             contentItem: Text {
                 text: "↺"
                 color: "#f4f6f8"
-                font.pixelSize: 16 * app.uiScale
+                font.pixelSize: 18
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
             }
@@ -424,13 +480,13 @@ Window {
         PlayerButton {
             id: zoomInButton
             objectName: "zoomInButton"
-            width: 21 * app.uiScale
-            height: 21 * app.uiScale
+            width: 28
+            height: 28
             onClicked: app.zoomIn()
             contentItem: Text {
                 text: "+"
                 color: "#f4f6f8"
-                font.pixelSize: 16 * app.uiScale
+                font.pixelSize: 18
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
             }
@@ -444,13 +500,13 @@ Window {
             id: zoomOutButton
             objectName: "zoomOutButton"
             visible: app.zoomMode && app.zoomLevel > 0
-            width: 21 * app.uiScale
-            height: 21 * app.uiScale
+            width: 28
+            height: 28
             onClicked: app.zoomOut()
             contentItem: Text {
                 text: "−"
                 color: "#f4f6f8"
-                font.pixelSize: 16 * app.uiScale
+                font.pixelSize: 18
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
             }
@@ -461,30 +517,35 @@ Window {
         }
     }
 
-    PlayerButton {
-        id: closeButton
-        objectName: "closeButton"
-        anchors.top: parent.top
-        anchors.right: parent.right
-        anchors.topMargin: 10 * app.uiScale
-        anchors.rightMargin: 10 * app.uiScale
-        width: 23 * app.uiScale
-        height: 23 * app.uiScale
+    Item {
+        id: closeOverlay
+        anchors.fill: parent
         z: 3
         opacity: app.osdVisible ? 1 : 0
         enabled: app.osdVisible
+        visible: opacity > 0.01
         Behavior on opacity { NumberAnimation { duration: 250 } }
-        onClicked: app.close()
-        contentItem: Text {
-            text: "×"
-            color: "#e8edf2"
-            font.pixelSize: 17 * app.uiScale
-            horizontalAlignment: Text.AlignHCenter
-            verticalAlignment: Text.AlignVCenter
-        }
-        background: Rectangle {
-            radius: 5
-            color: closeButton.pressed ? "#dc263548" : "#a6101620"
+
+        PlayerButton {
+            id: closeButton
+            objectName: "closeButton"
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.topMargin: 10
+            width: 50
+            height: 50
+            onClicked: app.close()
+            contentItem: Text {
+                text: "×"
+                color: "#f4f6f8"
+                font.pixelSize: 24
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+            }
+            background: Rectangle {
+                radius: 15
+                color: closeButton.pressed ? "#dc263548" : "#a6101620"
+            }
         }
     }
 
@@ -509,8 +570,8 @@ Window {
         Column {
             id: controlContent
             anchors.fill: parent
-            anchors.leftMargin: Math.max(8, parent.width * 0.025)
-            anchors.rightMargin: Math.max(8, parent.width * 0.025)
+            anchors.leftMargin: 16
+            anchors.rightMargin: 16
             anchors.topMargin: 6
             anchors.bottomMargin: 6
             spacing: 3
@@ -521,12 +582,10 @@ Window {
                 height: app.height < 250 ? 18 : 22
 
                 Text {
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.fill: parent
                     text: app.resolvedTitle()
                     color: "#f4f6f8"
-                    font.pixelSize: Math.max(12, Math.min(16, parent.height * 0.57))
+                    font.pixelSize: Math.max(12, Math.min(16, parent.height * 0.65))
                     elide: Text.ElideRight
                     verticalAlignment: Text.AlignVCenter
                 }
@@ -541,7 +600,7 @@ Window {
                     id: elapsedLabel
                     anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
-                    width: 36
+                    width: 42
                     text: app.formatTime(app.displayedPosition)
                     color: "#e6eaf0"
                     font.pixelSize: 10
@@ -553,7 +612,7 @@ Window {
                     id: seekTrack
                     anchors.left: elapsedLabel.right
                     anchors.right: remainingLabel.left
-                    anchors.leftMargin: Math.max(12, parent.width * 0.065)
+                    anchors.leftMargin: 12
                     anchors.rightMargin: 12
                     anchors.verticalCenter: parent.verticalCenter
                     height: parent.height
@@ -565,6 +624,25 @@ Window {
                         height: 3
                         radius: 2
                         color: "#70dbe4ee"
+                    }
+
+                    Rectangle {
+                        id: bufferedTrack
+                        objectName: "bufferedTrack"
+                        anchors.verticalCenter: parent.verticalCenter
+                        // Keep the cached range tied to real playback during seek previews.
+                        readonly property real startFraction: player.duration > 0 &&
+                                isFinite(player.duration) && isFinite(player.position)
+                                ? Math.max(0, Math.min(1, player.position / player.duration)) : 0
+                        readonly property real endFraction: app.bufferedPosition >= 0 &&
+                                player.duration > 0 && isFinite(player.duration)
+                                ? Math.max(startFraction, Math.min(1, app.bufferedPosition / player.duration))
+                                : startFraction
+                        x: parent.width * startFraction
+                        width: parent.width * (endFraction - startFraction)
+                        height: 3
+                        radius: 2
+                        color: "#c0dbe4ee"
                     }
 
                     Rectangle {
@@ -610,7 +688,7 @@ Window {
                     id: remainingLabel
                     anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
-                    width: 36
+                    width: 42
                     text: app.formatTime(player.duration)
                     color: "#e6eaf0"
                     font.pixelSize: 10
@@ -637,7 +715,7 @@ Window {
                         contentItem: PlayerTransportIcon { direction: -1 }
                         background: Rectangle {
                             radius: 5
-                            color: "transparent"
+                            color: backwardButton.pressed ? "#dc263548" : "transparent"
                         }
                     }
 
@@ -657,7 +735,7 @@ Window {
                         }
                         background: Rectangle {
                             radius: 5
-                            color: "transparent"
+                            color: playButton.pressed ? "#dc263548" : "transparent"
                         }
                     }
 
@@ -669,7 +747,7 @@ Window {
                         contentItem: PlayerTransportIcon { direction: 1 }
                         background: Rectangle {
                             radius: 5
-                            color: "transparent"
+                            color: forwardButton.pressed ? "#dc263548" : "transparent"
                         }
                     }
                 }
@@ -693,8 +771,9 @@ Window {
                         verticalAlignment: Text.AlignVCenter
                     }
                     background: Rectangle {
-                        radius: 4
-                        color: "transparent"
+                        radius: 12
+                        color: subtitleButton.checked ? "#8039a9ff" :
+                               subtitleButton.pressed ? "#80555555" : "#8c101620"
                     }
                 }
 
@@ -724,8 +803,9 @@ Window {
                         verticalAlignment: Text.AlignVCenter
                     }
                     background: Rectangle {
-                        radius: 4
-                        color: "transparent"
+                        radius: 12
+                        color: player.playbackRate !== 1.0 ? "#8039a9ff" :
+                               speedButton.pressed ? "#80555555" : "#8c101620"
                     }
                 }
             }

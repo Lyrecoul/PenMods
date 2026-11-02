@@ -4,8 +4,8 @@
 （面向 RK3326 / AArch64 / Qt 5.15 的 QML 视频播放器插件），用来给 PenMods 提供
 「画在 Qt 场景图里」的视频播放能力（跟随左右手旋转、画面内控件、ASS/LRC 字幕）。
 
-- 上游版本: **v1.0.3**（commit `d7733e3`，tag `v1.0.3`），缩放时保留双线性过滤并关闭多点降采样。
-- 同步状态: `src/` 与 `examples/` 已与上游 **v1.0.3** 同步，保留 PenMods 构建适配与设备库。
+- 上游版本: **v1.0.5**（commit `b98a8ea`，tag `v1.0.5`），包含缓存/初始缓冲、音视频同步和 seek 修复。
+- 同步状态: `src/`、`examples/` 与 `patches/` 已与上游 **v1.0.5** 同步，保留 PenMods 构建适配与设备库。
 - 许可: **GPL-3.0**（与 PenMods 的 GPL-3.0-only 兼容）
 - 可行性分析、设备实测与坑位记录: [`doc/FFMPEG_PLAYER_ANALYSIS.md`](../../doc/FFMPEG_PLAYER_ANALYSIS.md)
 
@@ -52,9 +52,21 @@ external/ffmpeg-player/
 示例改为 `downsamplingEnabled: !zoomMode`、`smooth: true`，缩放时以原始纹理做双线性采样；普通模式保持原有降采样行为。
 PenMods 的 `qrc_qml.h` 同步纳入对应页面适配。此版本未更改构建配方、依赖、`patches/` 或设备库。
 
+## 上游 v1.0.5 相对 v1.0.3 的改动
+
+完整变更：[v1.0.3...v1.0.5](https://github.com/Haikure/ffmpeg-player/compare/v1.0.3...v1.0.5)。
+
+| 上游 commit | 内容 | 对 PenMods 的影响 |
+|---|---|---|
+| `c053ced` feat(player): improve buffering, seeking, and A/V sync | 引入共享压缩包缓存、初始缓冲、后台预取、缓冲状态、网速统计和视频单独恢复；补充变速滤镜源进度与视频减负逻辑 | 同步 `src/` 新增缓存/缓冲实现和 QML 属性，完整重编插件 |
+| `908e9d7` fix(ffmpeg): prevent audio-only seek crash | 初始化 FFmpeg seek 索引位置变量，避免纯音频文件 seek 后负数索引越界 | 对应补丁归位为 `patches/0011-avformat-init-seek-positions.patch`，`network_revision` 使用 10 |
+| `b98a8ea` chore(release): release v1.0.5 | 发布 v1.0.5 及更新日志 | PenMods vendor 文档与 changelog 同步到 v1.0.5 |
+
+同步包含 `patches/0008-network-byte-counter-and-seek-reset.patch`、`0009-hls-backward-seek-prefix.patch`、`0010-atempo-source-timestamps.patch` 和 `0011-avformat-init-seek-positions.patch`。原 PenMods 本地编号为 `0008` 的 seek 补丁内容未丢失，只按完整补丁序列重命名为 `0011`。
+
 ## 与上游的差异
 
-以下差异以上游 **v1.0.3** 的独立工程为参照。
+以下差异以上游 **v1.0.5** 的独立工程为参照。
 `xmake.lua` 仍保留 PenMods 的集成适配，与上游独立工程的版本不同：
 
 | 改动 | 原因 |
@@ -62,7 +74,7 @@ PenMods 的 `qrc_qml.h` 同步纳入对应页面适配。此版本未更改构�
 | 去掉文件级 `add_rules("mode.debug","mode.release")`；把 `set_languages("c11","c++17")`、`set_optimize("fastest")`、`set_warnings("all","error")` 移进 target 作用域 | 本文件现在由根工程的 `includes()` 载入，文件级设置会污染 PenMods 自己的 target（它是 c++23、且不能把警告当错误） |
 | target 内加 `set_pcxxheader()` | 根工程给所有 target 预设了 PCH `src/base/Base.h`，插件不该用它 |
 | 所有 `os.scriptdir()` / 相对路径 → `path.join(os.projectdir(), "external", "ffmpeg-player", …)` | 被 `includes()` 载入后，相对路径的基准是根工程目录 |
-| `network_revision = 7` → `8` | 该字段参与 ffmpeg 包哈希，改它可强制重编；也用于让本地旧变体失效 |
+| `network_revision` 当前为 `10` | 该字段参与 ffmpeg 包哈希；v1.0.5 新增 FFmpeg 补丁后必须让旧变体失效 |
 | 文件开头加"默认跳过"开关：没有 `PENMODS_WITH_PLAYER=1` 就 `return`，连 `add_requires` 都不声明 | CI 与只编 libPenMods.so 的人不必为一个 40 分钟的依赖链（FFmpeg/OpenSSL3/libass/harfbuzz→meson→python）和容器里的 `unzip`/`perl` 买单；`xmake build` 仍会成功（插件被跳过并打印一行提示） |
 | `rkmpp = has_device_libs(...)` → `rkmpp = use_rkmpp`（设备库存在即开启；`PENMODS_FFMPEG_PLAYER_SW=1` 可强制软解） | 保留原语义、去掉隐式行为；不用 xmake option 是因为本机 xmake 在工程加载阶段 `get_config()` 读不到 CLI 传进来的值（实测为 nil） |
 | moc 实现头依赖与生成文件路径使用 `external/ffmpeg-player/src/` | 修正 vendor 工程的路径基准，使实现头变化时两个 moc 对象的失效规则指向实际文件 |
@@ -70,13 +82,13 @@ PenMods 的 `qrc_qml.h` 同步纳入对应页面适配。此版本未更改构�
 
 双方现在都使用 `ffplayer-openssl3 3.5.6`，相对原发布基线的版本调整已随 v1.0.2 进入上游，不再属于当前差异。
 
-以下三个文件已与上游 v1.0.3 同步：
+当前 `src/` 与 `examples/` 已与上游 v1.0.5 同步。此前保留的 v1.0.3 过滤适配包括：
 
 - `VideoRenderNode.hpp`：原有自适应缩小采样，以及缩放时的独立单次采样材质、纹理过滤切换与 CPU 暂停帧保留。
 - `FFmpegVideoPlayerQml.hpp`：默认开启的 `downsamplingEnabled` 与继承属性 `smooth` 的更新通知。
 - `examples/Player.qml`：缩放状态绑定 `downsamplingEnabled`，保持 `smooth: true`。
 
-从上游 v1.0.3 更新这些文件时，无需再次套用上述修复。此次同步只包含正式代码，未包含临时测试或性能诊断代码。
+从上游 v1.0.5 更新这些文件时，无需再次套用上述修复。此次同步只包含正式代码，未包含临时测试或性能诊断代码。
 
 v1.0.2 过滤修复的设备测量见 [`doc/FFMPEG_PLAYER_FILTER_PERFORMANCE.md`](../../doc/FFMPEG_PLAYER_FILTER_PERFORMANCE.md)；其中缩放组使用最近邻，不能作为 v1.0.3 双线性缩放的性能结果。下面的画质记录描述原有普通模式降采样，本轮保持其采样数量、位置和颜色转换。
 
@@ -109,12 +121,12 @@ PENMODS_FFMPEG_PLAYER_SW=1 xmake f -c <原有配置...> -y && xmake build ffmpeg
 ```
 
 > ⚠️ 不要在 PenMods 工程里跑 `xmake require ffmpeg`（上游 README 这么写是因为它只在
-> 自己的工程里构建）：该命令按 **recipe 默认值**（`network_revision = 7`、`rkmpp = false`）
+> 自己的工程里构建）：该命令按 **recipe 默认值**（`network_revision = 10`、`rkmpp = false`）
 > 再装一个 ffmpeg 变体，紧接着的 `xmake build` 就会链接这个软解变体，
 > 表现为"配置里明明开了硬解，产物却没有 librockchip_mpp"。`xmake f` / `xmake build` 本身
 > 已会按工程配置自动安装依赖，不需要 `xmake require`。
 
-## ⚠️ 纯音频 seek 崩溃与 0008 补丁（务必保留）
+## ⚠️ 纯音频 seek 崩溃与 0011 补丁（务必保留）
 
 issue #29：没有视频轨的文件（例如 flac 改名成 `.mp4`）拖动进度条时，**seek 成功后继续播放会在
 `ff_seek_frame_binary()` 里段错误**（`unhandled level 0 translation fault`，故障地址 = 堆指针 + 0x17FFFFFFE8）。
@@ -146,7 +158,7 @@ ldp   x26, x25, [x8]      ; ← 崩溃点（0x17FFFFFFE8 = 4294967295 * 24）
 
 纯音频文件缺少视频索引项，第二次（向后）查找会返回 `-1`，因此只有它们踩到这条路径。
 
-`patches/0008-avformat-init-seek-positions.patch` 把这两个变量初始化成 `0`，消除 UB 后编译器重新生成
+`patches/0011-avformat-init-seek-positions.patch` 把这两个变量初始化成 `0`，消除 UB 后编译器重新生成
 `tbnz w0, #31` 的负数分支，越界读取不再执行。**验证方法**（不需要设备，几分钟）：
 
 ```sh
@@ -161,7 +173,7 @@ aarch64-linux-gnu-objdump -d libavformat/utils.o | sed -n '/<ff_seek_frame_binar
 `libffmpegplayerplugin.so`（`build/linux/arm64-v8a/release/`，SHA-256 `d5ea7374…`）逐条一致，
 因此这不是猜测而是可复现的编译结果。
 
-- `network_revision` 已从 8 升到 9：该字段参与 ffmpeg 包哈希，升级后旧的（有缺陷的）静态包不会被复用。
+- `network_revision` 当前为 10：该字段参与 ffmpeg 包哈希，升级后旧的（有缺陷的）静态包不会被复用。
 - 改动只在宿主构建时生效，**必须重新编译 ffmpeg 依赖包**（`PENMODS_WITH_PLAYER=1 xmake f -c ...` 之后
   `xmake build ffmpegplayerplugin`），只重编插件本身仍然链接旧的 `libavformat.a`。
 - `tools/test_ffmpeg_seek_patch.py` 断言补丁存在、`network_revision` 已升级；给出 FFmpeg 3.4.8 源码路径
@@ -184,22 +196,23 @@ aarch64-linux-gnu-objdump -d libavformat/utils.o | sed -n '/<ff_seek_frame_binar
 
 ## 与上游同步
 
-在 PenMods 根目录执行，`<upstream>` 指向上游 v1.0.3 的检出目录。先预览源码与示例的变化：
+在 PenMods 根目录执行，`<upstream>` 指向上游 v1.0.5 的检出目录。先预览源码、示例和补丁的变化：
 
 ```sh
 rsync -rlpc --dry-run --itemize-changes \
   <upstream>/src/ external/ffmpeg-player/src/
-rsync -lpc --dry-run --itemize-changes \
-  <upstream>/examples/Player.qml external/ffmpeg-player/examples/Player.qml
+rsync -rlpc --dry-run --itemize-changes \
+  <upstream>/examples/ external/ffmpeg-player/examples/
+rsync -rlpc --dry-run --itemize-changes <upstream>/patches/ external/ffmpeg-player/patches/
 ```
 
-核对后移除 `--dry-run` 执行同步，再审阅 `git diff`。这些命令仅同步 `src/` 与示例，不删除目标额外文件，
+核对后移除 `--dry-run` 执行同步，再审阅 `git diff`。这些命令仅同步 `src/`、示例和补丁，不删除目标额外文件，
 也不覆盖 PenMods 的 `xmake.lua`、`UPSTREAM.md` 或本地构建产物。上游删除或重命名文件时，按差异单独处理。
 
 `xmake.lua` 按上面的差异表单独合并：先比较旧、新上游版本，确认构建或依赖变化，再应用到 PenMods 的适配版本。
 保留 `PENMODS_WITH_PLAYER` 门控、`path.join(os.projectdir(), …)` 路径基准、软解开关与 moc 构建适配。
 向独立上游回传代码时同样保留其独立工程的 `xmake.lua`，不要整份互相覆盖。
-`patches/` 与 `external/` 在上游确有变更时另行核对；v1.0.1 → v1.0.3 同步未涉及这两个目录。
+`patches/` 与 `external/` 在上游确有变更时另行核对；本次 v1.0.3 → v1.0.5 同步包含 `0008` 至 `0011` 四个补丁。
 若同步源是尚未包含回传修复的旧 tag 或提交，应先比较上述三个文件，保留当前共享实现。
 
 ## 构建与验证

@@ -16,7 +16,7 @@ Item {
         onPaint: {
             var ctx = getContext("2d")
             ctx.clearRect(0, 0, width, height)
-            ctx.fillStyle = "#ffffff"
+            ctx.fillStyle = "#f4f6f8"
             if (icon.direction === 0) {
                 if (icon.playing) {
                     ctx.fillRect(4, 3, 4, 14)

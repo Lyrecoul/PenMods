@@ -37,6 +37,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <chrono>
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -230,13 +231,18 @@ public:
   bool Available(QOpenGLContext *ctx) {
     if (state_ == State::Unknown)
       state_ = Init(ctx) ? State::Ready : State::Disabled;
-    return state_ == State::Ready;
+    return state_ == State::Ready && std::chrono::steady_clock::now() >= retry_at_;
   }
 
   void Disable() {
-    if (state_ != State::Disabled) {
-      LOG(WARNING) << "dma-buf zero-copy import failed, using mmap upload";
-      state_ = State::Disabled;
+    if (state_ == State::Ready) {
+      if (++failures_ >= 3) {
+        state_ = State::Disabled;
+        LOG(WARNING) << "dma-buf zero-copy import failed three times, using mmap upload";
+      } else {
+        LOG(WARNING) << "dma-buf zero-copy import failed, using mmap upload";
+        retry_at_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      }
     }
   }
 
@@ -353,16 +359,19 @@ private:
     if (!create_image_ || !destroy_image_ || !image_target_texture_)
       return false;
 
+    failures_ = 0;
     LOG(INFO) << "dma-buf zero-copy rendering enabled";
     return true;
   }
 
   State state_ = State::Unknown;
   bool use_hints_ = true;
+  int failures_ = 0;
   void *display_ = nullptr;
   CreateImageFn create_image_ = nullptr;
   DestroyImageFn destroy_image_ = nullptr;
   ImageTargetTextureFn image_target_texture_ = nullptr;
+  std::chrono::steady_clock::time_point retry_at_{};
 };
 
 // ─── 材质与着色器 ────────────────────────────────────
@@ -390,17 +399,18 @@ inline int MaxTapsForMode(GlVideoMode mode) {
 
 class GlVideoMaterial : public QSGMaterial {
 public:
-  explicit GlVideoMaterial(GlVideoMode mode, bool multisampling = true)
-      : mode_(mode), multisampling_(multisampling) {}
+  explicit GlVideoMaterial(GlVideoMode mode, bool multisampling = true, int samples = 1)
+      : mode_(mode), multisampling_(multisampling), samples_(samples) {}
 
   QSGMaterialType *type() const override {
-    static QSGMaterialType types[3][2];
-    return &types[static_cast<int>(mode_)][multisampling_ ? 1 : 0];
+    static QSGMaterialType types[3][9];
+    return &types[static_cast<int>(mode_)][samples_];
   }
   QSGMaterialShader *createShader() const override;
 
   GlVideoMode mode() const { return mode_; }
   bool multisampling() const { return multisampling_; }
+  int samples() const { return samples_; }
 
   bool smooth = true;
   GLuint textures[3] = {0, 0, 0};
@@ -413,12 +423,13 @@ public:
 private:
   GlVideoMode mode_;
   bool multisampling_;
+  int samples_;
 };
 
 class GlVideoShader : public QSGMaterialShader {
 public:
-  explicit GlVideoShader(GlVideoMode mode, bool multisampling)
-      : mode_(mode), multisampling_(multisampling), source_(BuildFragmentShader()) {}
+  explicit GlVideoShader(GlVideoMode mode, bool multisampling, int samples)
+      : mode_(mode), multisampling_(multisampling), samples_(samples), source_(BuildFragmentShader()) {}
 
   char const *const *attributeNames() const override {
     static const char *const names[] = {"a_position", "a_texcoord", nullptr};
@@ -489,13 +500,10 @@ protected:
       s += std::string("  return texture2D(t, uv * cs)") + swizzle + ";\n}\n";
       return s;
     }
-    s += std::string("  if (taps < 1.5) return texture2D(t, uv * cs)") + swizzle + ";\n";
     s += std::string("  ") + ret + " acc = " + zero + ";\n";
     s += "  highp float cnt = 0.0;\n";
     s += "  for (int y = 0; y < MAXTAPS; ++y) {\n";
-    s += "    if (float(y) >= taps) break;\n";
     s += "    for (int x = 0; x < MAXTAPS; ++x) {\n";
-    s += "      if (float(x) >= taps) break;\n";
     s += "      highp vec2 off = (vec2(float(x), float(y)) - (taps - 1.0) * 0.5) * tap_step;\n";
     s += std::string("      acc += texture2D(t, (uv + off) * cs)") + swizzle + ";\n";
     s += "      cnt += 1.0;\n";
@@ -518,7 +526,7 @@ protected:
     if (multisampling_) {
       s += "uniform highp vec2 tap_step;\n";
       s += "uniform highp float taps;\n";
-      s += "#define MAXTAPS " + std::to_string(MaxTapsForMode(mode_)) + "\n";
+      s += "#define MAXTAPS " + std::to_string(samples_) + "\n";
     }
     for (int i = 0; i < PlaneCount(); ++i)
       s += std::string("uniform ") + sampler + " tex" + std::to_string(i) + ";\n";
@@ -576,6 +584,7 @@ private:
 
   GlVideoMode mode_;
   bool multisampling_;
+  int samples_;
   const std::string source_;
   int matrix_loc_ = -1;
   int opacity_loc_ = -1;
@@ -588,7 +597,7 @@ private:
 };
 
 inline QSGMaterialShader *GlVideoMaterial::createShader() const {
-  return new GlVideoShader(mode_, multisampling_);
+  return new GlVideoShader(mode_, samples_ > 1, samples_);
 }
 
 // ─── GL 视频节点：纹理上传与生命周期管理 ─────────────────
@@ -719,6 +728,8 @@ private:
             MaxTapsForMode(material_->mode()), std::ceil(minify)));
       }
     }
+    sample_count_ = static_cast<int>(taps);
+    EnsureMaterial(material_->mode());
     material_->taps = taps;
     material_->tap_step =
         QVector2D(static_cast<float>(1.0 / (w * taps)),
@@ -751,8 +762,9 @@ private:
   };
 
   GlVideoMaterial *EnsureMaterial(GlVideoMode mode) {
-    if (!material_ || material_->mode() != mode || material_->multisampling() != multisampling_) {
-      auto *replacement = new GlVideoMaterial(mode, multisampling_);
+    if (!material_ || material_->mode() != mode || material_->multisampling() != multisampling_ ||
+        material_->samples() != sample_count_) {
+      auto *replacement = new GlVideoMaterial(mode, multisampling_, sample_count_);
       if (material_ && material_->mode() == mode) {
         // A paused frame has no upload to repopulate these after a shader switch.
         std::copy(std::begin(material_->textures), std::end(material_->textures), replacement->textures);
@@ -906,6 +918,7 @@ private:
   qreal dpr_ = 1.0;
   int tex_w_ = 0;
   int tex_h_ = 0;
+  int sample_count_ = 1;
   float logged_taps_ = -1.0f;
   int logged_src_w_ = -1;
   int logged_dst_w_ = -1;
@@ -961,6 +974,7 @@ public:
   // 接管 frame 所有权
   void SetFrame(AVFrame *frame, const QRectF &rect, int rotation, qreal dpr) {
     dpr_ = dpr;
+    has_content_ = false;
 #if FFPLAYER_GL_RENDER
     if (gl_node_) {
       if (gl_node_->SetFrame(frame))
@@ -1037,6 +1051,36 @@ private:
   SwsConverter converter_;
   QImage image_;
   bool has_content_ = false;
+};
+
+// Two reusable resource sets: preparing an obsolete frame cannot overwrite the
+// displayed textures. Commit only relinks nodes; GL and destruction stay outside
+// the player's frame mutex.
+class VideoRenderSlots : public QSGNode {
+public:
+  explicit VideoRenderSlots(QQuickWindow *window) : window_(window) {}
+  ~VideoRenderSlots() override { delete spare_; }
+  void Prepare(AVFrame *frame, const QRectF &rect, int rotation, qreal dpr,
+               bool downsampling, bool smooth) {
+    if (!spare_) spare_ = new VideoRootNode(window_);
+    spare_->SetSampling(downsampling, smooth);
+    spare_->SetFrame(frame, rect, rotation, dpr);
+    spare_->UpdateLayout(rect, rotation, dpr);
+  }
+  void Commit() {
+    if (!spare_ || !spare_->HasContent()) return;
+    if (active_) removeChildNode(active_);
+    std::swap(active_, spare_);
+    appendChildNode(active_);
+  }
+  void Update(const QRectF &rect, int rotation, qreal dpr, bool downsampling, bool smooth) {
+    if (!active_) return;
+    active_->SetSampling(downsampling, smooth);
+    active_->UpdateLayout(rect, rotation, dpr);
+  }
+private:
+  QQuickWindow *window_;
+  VideoRootNode *active_ = nullptr, *spare_ = nullptr;
 };
 
 } // namespace render

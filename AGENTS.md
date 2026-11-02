@@ -445,7 +445,7 @@ render them into the frame before the autorotate post-filter if that ever needs 
 
 ### Embedded FFmpeg Player (QML plugin)
 
-`external/ffmpeg-player/` vendors [`Haikure/ffmpeg-player`](https://github.com/Haikure/ffmpeg-player) v1.0.3
+`external/ffmpeg-player/` vendors [`Haikure/ffmpeg-player`](https://github.com/Haikure/ffmpeg-player) v1.0.5
 (GPL-3.0) — a Qt 5 QML video player that renders **into the host scene graph** (custom `QSGNode`, static FFmpeg
 3.4.8 + libass + OpenSSL 3 + libxml2), so the picture follows `YMainWindow.rotation` and PenMods controls can sit on
 top of it. `xmake build ffmpegplayerplugin` produces `build/<plat>/<arch>/<mode>/qml/FFmpegPlayer/`;
@@ -481,7 +481,8 @@ device measurements: `doc/FFMPEG_PLAYER_ANALYSIS.md`.
   are **symlinks** in git (a zip download turns them into text files and breaks `-lrockchip_mpp`). On this dev machine
   the xmake-repo `python` recipe needed `--enable-optimizations` removed (PGO test flake) because `harfbuzz` builds
   through `meson`.
-- The vendored `src/` matches upstream v1.0.3. The adaptive N×N downsampling code in `src/VideoRenderNode.hpp`
+- The vendored `src/` matches upstream v1.0.5. It includes shared packet caching, initial buffering, HLS seek
+  recovery, and continuous A/V timing. The adaptive N×N downsampling code in `src/VideoRenderNode.hpp`
   retains historical `// PENMODS PATCH` comments but is already upstream. Zoom disables multi-tap downsampling
   while keeping bilinear filtering (`downsamplingEnabled: !zoomMode`, `smooth: true`); `smooth` independently
   selects linear or nearest filtering for GL and CPU rendering. Preserve the PenMods-specific build integration.

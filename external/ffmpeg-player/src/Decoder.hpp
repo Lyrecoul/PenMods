@@ -23,6 +23,7 @@
 #include "FFmpegCore.hpp"
 
 #include <chrono>
+#include <deque>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -80,6 +81,35 @@ public:
   // 送入一个包并取出所有可用帧；pkt 为 nullptr 表示 drain（EOF 冲刷）。
   // 返回 AVERROR_EOF 表示解码器已完全排空，其余情况返回 0 或错误码。
   int Decode(const AVPacket *pkt, const FrameCallback &on_frame) {
+    const auto start = std::chrono::steady_clock::now();
+    double callback = 0;
+    unsigned frames = 0;
+    const int ret = DecodeInternal(pkt, [&](AVFrame *frame) {
+      ++frames;
+      const auto begin = std::chrono::steady_clock::now();
+      const bool result = on_frame(frame);
+      callback += std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+      return result;
+    });
+    callback_seconds_ += callback;
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed = std::chrono::duration<double>(now - start).count() - callback;
+    decode_seconds_ += elapsed;
+    recent_.push_back({now, elapsed, frames});
+    recent_seconds_ += elapsed;
+    recent_frames_ += frames;
+    PruneRecent(now);
+    return ret;
+  }
+  double DecodeSeconds() const { return decode_seconds_; }
+  double CallbackSeconds() const { return callback_seconds_; }
+  double RecentFrameSeconds() {
+    PruneRecent(std::chrono::steady_clock::now());
+    return recent_frames_ >= 12 ? recent_seconds_ / recent_frames_ : 0;
+  }
+  void ResetPerformance() { recent_.clear(); recent_seconds_ = 0; recent_frames_ = 0; }
+
+  int DecodeInternal(const AVPacket *pkt, const FrameCallback &on_frame) {
     if (!ctx_)
       return AVERROR(EINVAL);
     if (!frame_ && !(frame_ = av_frame_alloc()))
@@ -134,6 +164,13 @@ public:
   }
 
   void Flush() {
+    ResetPerformance();
+#ifdef FFPLAYER_VALIDATION
+    if (ctx_ && ctx_->codec_type == AVMEDIA_TYPE_VIDEO) {
+      const char *delay = std::getenv("FFPLAYER_TEST_VIDEO_FLUSH_MS");
+      if (delay) std::this_thread::sleep_for(std::chrono::milliseconds(std::max(0, std::atoi(delay))));
+    }
+#endif
     if (ctx_)
       avcodec_flush_buffers(ctx_);
     packets_since_frame_ = 0;
@@ -200,6 +237,7 @@ private:
   }
 
   bool Open(AVCodec *codec, bool hw) {
+    ResetPerformance();
     FreeContext();
 
     ctx_ = avcodec_alloc_context3(codec);
@@ -240,6 +278,12 @@ private:
         return ret;
 
       ++got;
+#ifdef FFPLAYER_VALIDATION
+      if (ctx_->codec_type == AVMEDIA_TYPE_VIDEO) {
+        const char *delay = std::getenv("FFPLAYER_TEST_VIDEO_DELAY_MS");
+        if (delay) std::this_thread::sleep_for(std::chrono::milliseconds(std::max(0, std::atoi(delay))));
+      }
+#endif
       packets_since_frame_ = 0;
       consecutive_errors_ = 0;
 
@@ -360,6 +404,18 @@ private:
   int skip_level_ = 0;
   int packets_since_frame_ = 0;
   int consecutive_errors_ = 0;
+  double decode_seconds_ = 0, callback_seconds_ = 0;
+  struct DecodeSample { std::chrono::steady_clock::time_point time; double seconds; unsigned frames; };
+  std::deque<DecodeSample> recent_;
+  double recent_seconds_ = 0;
+  unsigned recent_frames_ = 0;
+  void PruneRecent(std::chrono::steady_clock::time_point now) {
+    while (!recent_.empty() && now - recent_.front().time > std::chrono::seconds(1)) {
+      recent_seconds_ -= recent_.front().seconds;
+      recent_frames_ -= recent_.front().frames;
+      recent_.pop_front();
+    }
+  }
 };
 
 } // namespace ffmpeg_player

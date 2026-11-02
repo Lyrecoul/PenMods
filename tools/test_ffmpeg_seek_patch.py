@@ -9,7 +9,7 @@ conclude the ``index < 0`` path never happens and drop ``if (index >= 0)``.
 The resulting code indexes ``st->index_entries[-1]`` and segfaults for
 audio-only files (they have no second index entry to find).
 
-``patches/0008-avformat-init-seek-positions.patch`` initializes both variables.
+``patches/0011-avformat-init-seek-positions.patch`` initializes both variables.
 This test asserts the patch is present, that the dependent package will be
 rebuilt (``network_revision`` participates in the package hash), and — when an
 FFmpeg 3.4.8 source tree is available — that a cross-compiled object really
@@ -28,9 +28,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 PLAYER = ROOT / "external/ffmpeg-player"
-PATCH = PLAYER / "patches/0008-avformat-init-seek-positions.patch"
+PATCH = PLAYER / "patches/0011-avformat-init-seek-positions.patch"
 XMAKE = PLAYER / "xmake.lua"
-REVISION = 9
+REVISION = 10
 
 
 class SeekPatchTest(unittest.TestCase):

@@ -295,7 +295,7 @@ external/dictpen/librockchip_mpp.so.1 + libdrm.so.2)`，虽然两个文件都在
 
 ```lua
 -- 项目 xmake.lua，add_requires("ffmpeg 3.4.8", {...}) 里
-network_revision = 8,   -- 换一个值即可强制重编（recipe 自带该开关）
+network_revision = 10,  -- 换一个值即可强制重编（recipe 自带该开关）
 rkmpp = true,           -- 不要再用 has_device_libs() 的返回值
 ```
 
@@ -334,7 +334,7 @@ mpp_rt: NOT found ion allocator / found drm allocator
 ## 9. 仓库集成（已落地）
 
 ```
-external/ffmpeg-player/          上游 v1.0.1（62905fb）的 vendor 副本，GPL-3.0
+external/ffmpeg-player/          上游 v1.0.5（b98a8ea）的 vendor 副本，GPL-3.0
 ├── xmake.lua                    已适配为 PenMods 根工程的子工程（见 UPSTREAM.md 的差异表）
 ├── UPSTREAM.md                  来源、改动、同步方式、硬解门控说明
 ├── src/ patches/ examples/      上游原样
@@ -370,7 +370,7 @@ PENMODS_WITH_PLAYER=1 xmake build ffmpegplayerplugin   # 插件默认不参与�
 构建期的两个坑（已写进 `UPSTREAM.md`）：
 
 1. **不要在 PenMods 工程里跑 `xmake require ffmpeg`** —— 它按 recipe 默认值
-   （`network_revision=7`、`rkmpp=false`）再装一个软解变体，紧接着的 `xmake build`
+   （`network_revision=10`、`rkmpp=false`）再装一个软解变体，紧接着的 `xmake build`
    会链接那个变体，表现为"配置开了硬解但产物没有 MPP 依赖"。`xmake f`/`xmake build`
    本身会按工程配置装依赖。
 2. `qt.moc` 生成的 moc 单元在 `-r` 重建时可能丢掉 `add_packages` 的 include 目录，

@@ -112,6 +112,11 @@ public:
     std::lock_guard<std::mutex> lock(mtx);
     return queue.size();
   }
+
+  inline bool IsFull() {
+    std::lock_guard<std::mutex> lock(mtx);
+    return queue.size() >= max_size;
+  }
 };
 
 } // namespace ffmpeg_player

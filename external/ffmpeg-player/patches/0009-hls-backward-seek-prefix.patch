@@ -1,0 +1,86 @@
+--- a/libavformat/hls.c
++++ b/libavformat/hls.c
+@@ -140,6 +140,7 @@
+ 
+     int64_t seek_timestamp;
+     int seek_flags;
++    int seek_seq_no;
+     int seek_stream_index; /* into subdemuxer stream array */
+ 
+     /* Renditions associated with this playlist, if any.
+@@ -1926,6 +1927,22 @@
+     return av_compare_mod(scaled_ts_a, scaled_ts_b, 1LL << 33);
+ }
+ 
++static void reset_seek_reader(struct playlist *pls)
++{
++    if (pls->input)
++        ff_format_io_close(pls->parent, &pls->input);
++    av_packet_unref(&pls->pkt);
++    reset_packet(&pls->pkt);
++    pls->cur_seg_offset = 0;
++    pls->pb.error = 0;
++    pls->pb.eof_reached = 0;
++    pls->pb.buf_end = pls->pb.buf_ptr = pls->pb.buffer;
++    pls->pb.buf_ptr_max = pls->pb.buffer;
++    pls->pb.checksum_ptr = NULL;
++    pls->pb.pos = 0;
++    ff_read_frame_flush(pls->ctx);
++}
++
+ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
+ {
+     HLSContext *c = s->priv_data;
+@@ -1946,6 +1963,14 @@
+                 if (ret < 0) {
+                     if (!avio_feof(&pls->pb) && ret != AVERROR_EOF)
+                         return ret;
++                    if (pls->seek_timestamp != AV_NOPTS_VALUE &&
++                        (pls->seek_flags & AVSEEK_FLAG_BACKWARD) &&
++                        !(pls->seek_flags & AVSEEK_FLAG_ANY) &&
++                        pls->seek_seq_no > pls->start_seq_no) {
++                        pls->cur_seq_no = --pls->seek_seq_no;
++                        reset_seek_reader(pls);
++                        continue;
++                    }
+                     reset_packet(&pls->pkt);
+                     break;
+                 } else {
+@@ -1976,6 +2001,24 @@
+                     ts_diff = av_rescale_rnd(pls->pkt.dts, AV_TIME_BASE,
+                                             tb.den, AV_ROUND_DOWN) -
+                             pls->seek_timestamp;
++                    /* Backward seeks return a decode prefix, not the first
++                     * keyframe after the target. PTS (rather than reordered
++                     * DTS) determines whether that prefix starts too late. */
++                    if ((pls->seek_flags & AVSEEK_FLAG_BACKWARD) &&
++                        (pls->seek_flags & AVSEEK_FLAG_ANY ||
++                         pls->pkt.flags & AV_PKT_FLAG_KEY)) {
++                        int64_t pts = pls->pkt.pts == AV_NOPTS_VALUE ?
++                                      pls->pkt.dts : pls->pkt.pts;
++                        if (!(pls->seek_flags & AVSEEK_FLAG_ANY) &&
++                            av_compare_ts(pts, tb, pls->seek_timestamp, AV_TIME_BASE_Q) > 0 &&
++                            pls->seek_seq_no > pls->start_seq_no) {
++                            pls->cur_seq_no = --pls->seek_seq_no;
++                            reset_seek_reader(pls);
++                            continue;
++                        }
++                        pls->seek_timestamp = AV_NOPTS_VALUE;
++                        break;
++                    }
+                     if (ts_diff >= 0 && (pls->seek_flags  & AVSEEK_FLAG_ANY ||
+                                         pls->pkt.flags & AV_PKT_FLAG_KEY)) {
+                         pls->seek_timestamp = AV_NOPTS_VALUE;
+@@ -2126,10 +2169,12 @@
+ 
+         pls->seek_timestamp = seek_timestamp;
+         pls->seek_flags = flags;
++        pls->seek_seq_no = pls->cur_seq_no;
+ 
+         if (pls != seek_pls) {
+             /* set closest segment seq_no for playlists not handled above */
+             find_timestamp_in_playlist(c, pls, seek_timestamp, &pls->cur_seq_no);
++            pls->seek_seq_no = pls->cur_seq_no;
+             /* seek the playlist to the given position without taking
+              * keyframes into account since this playlist does not have the
+              * specified stream where we should look for the keyframes */

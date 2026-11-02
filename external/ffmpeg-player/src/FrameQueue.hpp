@@ -10,7 +10,8 @@ namespace ffmpeg_player {
 
 class FrameQueue {
 private:
-  std::queue<std::pair<AVFrame *, int>> queue;
+  struct Entry { AVFrame *frame; int serial; uint64_t generation; };
+  std::queue<Entry> queue;
   std::mutex mtx;
   std::condition_variable cond;
   size_t max_size = 10; // 默认最大缓存 10 个帧
@@ -28,7 +29,7 @@ public:
 
   // 入队（带超时）
   // timeout_ms: 超时时间（毫秒），-1 表示无限等待
-  inline bool Push(AVFrame *frame, int timeout_ms, int serial = 0) {
+  inline bool Push(AVFrame *frame, int timeout_ms, int serial = 0, uint64_t generation = 0) {
     std::unique_lock<std::mutex> lock(mtx);
 
     if (timeout_ms < 0) {
@@ -52,7 +53,7 @@ public:
       av_frame_free(&copy_frame);
       return false;
     }
-    queue.push({copy_frame, serial});
+    queue.push({copy_frame, serial, generation});
     cond.notify_one();
     return true;
   }
@@ -65,7 +66,8 @@ public:
 
   // 出队（带超时）
   // timeout_ms: 超时时间（毫秒），-1 表示无限等待
-  inline bool Pop(AVFrame *&frame, bool block, int timeout_ms, int *serial = nullptr) {
+  inline bool Pop(AVFrame *&frame, bool block, int timeout_ms, int *serial = nullptr,
+                  uint64_t *generation = nullptr) {
     std::unique_lock<std::mutex> lock(mtx);
 
     if (block && timeout_ms < 0) {
@@ -83,9 +85,11 @@ public:
     if (abort_request || queue.empty())
       return false;
 
-    frame = queue.front().first;
+    frame = queue.front().frame;
     if (serial)
-      *serial = queue.front().second;
+      *serial = queue.front().serial;
+    if (generation)
+      *generation = queue.front().generation;
     queue.pop();
 
     cond.notify_one(); // 通知 Push 线程队列有空间了
@@ -96,7 +100,7 @@ public:
   inline void Clear() {
     std::lock_guard<std::mutex> lock(mtx);
     while (!queue.empty()) {
-      AVFrame *frame = queue.front().first;
+      AVFrame *frame = queue.front().frame;
       queue.pop();
       av_frame_free(&frame); // 必须彻底释放内存
     }

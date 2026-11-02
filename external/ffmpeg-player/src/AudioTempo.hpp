@@ -2,6 +2,7 @@
 
 #include "FFmpegCore.hpp"
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <sstream>
 
@@ -19,6 +20,8 @@ class AudioTempo {
   AVFilterContext *source_ = nullptr;
   AVFilterContext *tempo_ = nullptr;
   AVFilterContext *sink_ = nullptr;
+  double rate_ = 1;
+  double output_source_end_ = NAN;
 
 public:
   AudioTempo() = default;
@@ -28,6 +31,7 @@ public:
   void Reset() {
     avfilter_graph_free(&graph_);
     source_ = tempo_ = sink_ = nullptr;
+    output_source_end_ = NAN;
   }
 
   bool Init(const AVFrame *frame, int sample_rate, int channels, double rate) {
@@ -46,7 +50,8 @@ public:
     input << "time_base=1/" << frame->sample_rate << ":sample_rate=" << frame->sample_rate
           << ":sample_fmt=" << format << ":channel_layout=" << layout;
     AVFilterContext *convert = nullptr;
-    const std::string tempo_args = "tempo=" + std::to_string(rate);
+    rate_ = rate;
+    const std::string tempo_args = "tempo=" + std::to_string(rate) + ":source_timestamps=1";
     const std::string output = "sample_fmts=s16:sample_rates=" + std::to_string(sample_rate)
         + ":channel_layouts=" + std::to_string(av_get_default_channel_layout(channels));
     if (avfilter_graph_create_filter(&source_, avfilter_get_by_name("abuffer"), "input",
@@ -67,9 +72,14 @@ public:
   int SetRate(double rate) {
     if (!tempo_ || !std::isfinite(rate) || rate < 0.5 || rate > 2.0)
       return AVERROR(EINVAL);
-    return avfilter_process_command(tempo_, "tempo", std::to_string(rate).c_str(),
-                                    nullptr, 0, 0);
+    const int ret = avfilter_process_command(tempo_, "tempo", std::to_string(rate).c_str(),
+                                            nullptr, 0, 0);
+    if (ret >= 0) rate_ = rate;
+    return ret;
   }
+
+  // Valid inside the consume callback. The filter owns the tempo-change origin.
+  double OutputSourceEnd() const { return output_source_end_; }
 
   int Process(AVFrame *frame, const std::function<bool(AVFrame *)> &consume) {
     if (!source_ || !sink_)
@@ -81,6 +91,16 @@ public:
     if (!out)
       return AVERROR(ENOMEM);
     while ((ret = av_buffersink_get_frame(sink_, out)) >= 0) {
+      const auto *position = av_dict_get(out->metadata, "lavfi.atempo.source_end_us", nullptr, 0);
+      if (position) {
+        output_source_end_ = std::strtoll(position->value, nullptr, 10) / static_cast<double>(AV_TIME_BASE);
+      } else if (std::isfinite(output_source_end_)) {
+        // The resampler's final fractional-sample drain has no input props.
+        output_source_end_ += static_cast<double>(out->nb_samples) / out->sample_rate * rate_;
+      } else {
+        ret = AVERROR_INVALIDDATA;
+        break;
+      }
       const bool keep = consume(out);
       av_frame_unref(out);
       if (!keep)

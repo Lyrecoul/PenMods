@@ -1,6 +1,6 @@
 -- ============================================================================
 -- Haikure/ffmpeg-player —— Qt5 QML 视频播放器插件（已 vendor 进 PenMods）
---   上游   : https://github.com/Haikure/ffmpeg-player  (v1.0.3 / d7733e3, GPL-3.0)
+--   上游   : https://github.com/Haikure/ffmpeg-player  (v1.0.5 / b98a8ea, GPL-3.0)
 --   改动   : external/ffmpeg-player/UPSTREAM.md
 --   分析与实测: doc/FFMPEG_PLAYER_ANALYSIS.md
 --   构建   : xmake build ffmpegplayerplugin
@@ -147,14 +147,14 @@ package("ffmpeg")
     -- 设备库缺失时自动退回纯软解构建，播放器运行时同样会走软解。
     -- 需要较新的 MPP（已移除 MPP_DEC_GET_FREE_PACKET_SLOT_COUNT），见 patches/0002。
     add_configs("rkmpp", {description = "Enable Rockchip MPP hardware decoders.", default = false, type = "boolean"})
-    add_configs("network_revision", {description = "Patched FFmpeg recipe revision (invalidates old builds).", default = 7, type = "number"})
+    add_configs("network_revision", {description = "Patched FFmpeg recipe revision (invalidates old builds).", default = 10, type = "number"})
 
     on_install("linux", "macosx", "android", "iphoneos", function (package)
         import("package.tools.autoconf")
         local envs = autoconf.buildenvs(package)
         
         -- 按文件名顺序应用所有补丁（0001 binutils 兼容，0002 rkmppdec 适配新版 MPP，
-        -- 0008 修复 seek 位置变量未初始化导致负数索引检查被优化掉的问题，见 UPSTREAM.md）
+        -- 0008-0011 覆盖网络/HLS/变速/seek 修复，见 UPSTREAM.md）
         local patches = os.files(path.join(FFPLAYER_DIR, "patches", "*.patch"))
         table.sort(patches)
         for _, patchfile in ipairs(patches) do
@@ -214,12 +214,12 @@ package("ffmpeg")
             "--enable-postproc",
             -- 解码器/格式支持
             "--enable-decoder=" .. decoders,
-            "--enable-demuxer=mov,dash,matroska,flv,mpegts,mpegps,avi,asf,rm,mp3,ogg,wav,aac,flac,mjpeg,mpegvideo,h264,hevc,image2",
+            "--enable-demuxer=mov,dash,hls,matroska,flv,mpegts,mpegps,avi,asf,rm,mp3,ogg,wav,aac,flac,mjpeg,mpegvideo,h264,hevc,image2",
             "--enable-muxer=mp4,mov,matroska,flv,mpegts,mpegps,avi,asf,mp3,ogg,wav,image2",
             "--enable-parser=h264,hevc,vp8,vp9,mpeg4video,mpeg1video,mpeg2video,vc1,aac,opus,flac,vorbis,ac3,dca,mpegaudio",
             -- rkmpp 需要 Annex-B 码流（decoder 内部自动挂 bsf）
             "--enable-bsf=h264_mp4toannexb,hevc_mp4toannexb",
-            "--enable-protocol=file,http,https,tls_openssl,tcp,udp,rtp,rtmp,rtmps,concat,data,pipe",
+            "--enable-protocol=file,http,https,tls_openssl,tcp,udp,rtp,rtmp,rtmps,concat,crypto,data,pipe",
             "--enable-filter=scale,overlay,pad,crop,yadif,setpts,atempo,abuffer,abuffersink,aformat,aresample,fps,format,transpose",
         }
 
@@ -285,7 +285,7 @@ package("ffmpeg")
         -- 9. 执行安装
         os.vrunv("./configure", configs, {envs = envs})
         local enabled = io.readfile("config.h")
-        for _, feature in ipairs({"HTTPS_PROTOCOL", "TLS_OPENSSL_PROTOCOL", "DASH_DEMUXER", "ATEMPO_FILTER", "AFORMAT_FILTER", "ARESAMPLE_FILTER"}) do
+        for _, feature in ipairs({"HTTPS_PROTOCOL", "TLS_OPENSSL_PROTOCOL", "DASH_DEMUXER", "HLS_DEMUXER", "CRYPTO_PROTOCOL", "ATEMPO_FILTER", "AFORMAT_FILTER", "ARESAMPLE_FILTER"}) do
             assert(enabled:find("#define CONFIG_" .. feature .. " 1", 1, true), "FFmpeg feature missing: " .. feature)
         end
         os.vrunv("make", {"-j" .. os.default_njob()})
@@ -301,7 +301,7 @@ add_requires("ffmpeg        3.4.8", {
         -- 不要把 has_device_libs() 的返回值直接喂给 rkmpp：本机出现过同一份工程
         -- 解析出 rkmpp=false 的旧变体并被链接、导致产物没有硬解的情况，
         -- 见 doc/FFMPEG_PLAYER_ANALYSIS.md §8.5。
-        network_revision = 9,
+        network_revision = 10,
         rkmpp = use_rkmpp,
     }
 })

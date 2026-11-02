@@ -1,6 +1,6 @@
 # FFmpegPlayer
 
-面向 RK3326 / AArch64 Linux、Qt 5.15 的 QML 播放器插件。使用项目补丁版 FFmpeg 3.4.8，支持本地文件、HTTP/HTTPS MP4、DASH `.mpd`、独立音轨、请求头、暂停与跳转、0.5–2 倍变速不变调、按住临时 2 倍速，以及外挂 ASS/LRC 字幕。
+面向 RK3326 / AArch64 Linux、Qt 5.15 的 QML 播放器插件。使用项目补丁版 FFmpeg 3.4.8，支持本地文件、HTTP/HTTPS MP4、DASH `.mpd` / HLS 点播、独立音轨、请求头、暂停与跳转、0.5–2 倍变速不变调、按住临时 2 倍速，以及外挂 ASS/LRC 字幕。
 
 H.264、HEVC、VP8 优先尝试 Rockchip MPP；初始化失败或运行中检测到硬解故障时回退软解。Qt 5 OpenGL 场景图支持 YUV 纹理和 DRM PRIME / DMA-BUF 导入，CPU RGBA 是备用渲染路径。Qt 6 和非 Linux 平台目前不在验收范围内。
 
@@ -113,6 +113,15 @@ VideoPlayer {
 | `beginBoost()` / `endBoost()` | 临时使用 `boostRate`，结束时固定恢复 1.0 倍速 |
 | `source` / `audioSource` / `httpHeaders` | 输入与 HTTP 请求头；`autoPlay` 默认关闭 |
 | `loading` / `seeking` / `errorString` | 异步状态与错误 |
+| `buffering` | 首次打开、跳转或实际断粮时等待数据；暂停及片尾排空不计为断流 |
+| `bufferProgress` | 0–1；网络按配置的预读秒数、本地按 1 媒体秒计算，显示实际完成比例 |
+| `bufferedDuration` / `bufferedPosition` | 压缩包队列、解码输入及输出队列覆盖的共同音视频媒体秒数、结束位置；跳转时重置 |
+| `downloadSpeed` | HTTP/HTTPS 实际读取字节/秒，合计主输入、AES-HLS 分片、DASH 分片及独立音轨，每 500ms 更新，按约一秒窗口平滑；本地文件为 0 |
+| `cacheEnabled` | 默认 `true`；关闭时使用小容量顺序队列，配置下次打开媒体生效 |
+| `cacheForwardBytes` / `cacheBackwardBytes` | 默认前向 `30 * 1024 * 1024`、历史 `15 * 1024 * 1024` 字节；两者之和为缓存硬上限，下次打开生效 |
+| `networkBufferSeconds` | 默认 30 媒体秒，下次打开生效；2 倍速可播放约 15 秒 |
+| `cachedStartPosition` / `cachedEndPosition` | 实际可缓存跳转区间，需具备视频关键帧、连续时间戳及音频预滚；无可用区间时均为 0 |
+| `cacheUsedBytes` | 当前共享压缩包缓存占用，含包数据及索引开销 |
 | `position` / `duration` | 秒；未知时长为 0 |
 | `videoDecoder` / `hardwareDecoding` | 当前解码器及硬解状态 |
 | `downsamplingEnabled` | 默认 true；关闭后使用独立的单次采样着色器，暂停时立即生效 |
@@ -121,6 +130,14 @@ VideoPlayer {
 不要使用播放状态的数字值；用 `VideoPlayer.PlayingState` 等枚举。错误通过 `errorOccurred` 通知，媒体结束通过 `endOfMedia` 通知。
 
 缩放页面绑定 `downsamplingEnabled: !zoomMode` 并保持 `smooth: true`，以原始纹理做双线性采样；需要最近邻时可单独设置 `smooth: false`。CPU 回退在关闭降采样时保留原尺寸转换，暂停后切换也能恢复源图细节；恢复普通模式后沿用原有降采样和颜色转换。
+
+缓冲统计约每 100ms 更新，网速使用独立定时器每 500ms 更新；`buffering` 不改变 `playbackState`。网络首次播放等待共同 A/V 可播放时长达到 `networkBufferSeconds`，容量上限或 EOF 时已有有效输出则可提前开始。开始播放后继续在后台补到目标，低于目标不触发等待；只有可播放数据实际耗尽才冻结时钟，恢复及后续跳转在所需音视频重新产生有效输出后继续，不再等待完整目标秒数。QML 可用 `buffering` 控制等待动画，用 `bufferProgress` 显示百分比，将 `downloadSpeed / 1024` 显示为 KB/s；有时长时用 `bufferedPosition / duration` 绘制真实缓冲位置。
+
+共享压缩包缓存按需分配，网络默认前向 30 MiB、后向 15 MiB，共享硬上限 45 MiB，音视频解码线程使用独立游标。已解码视频帧队列仍为 3 帧。本地前向预读约 1 媒体秒，已交给解码线程的压缩包引用立即释放，不保留历史 GOP；本地只使用前向预算。网络按播放位置淘汰历史，前向预算不能借用历史预算。达到硬上限且具备可播放输出时提前播放，`bufferProgress` 保留实际百分比。片尾不足目标时在剩余内容读完后播放；暂停期间继续预读至目标或容量上限。
+
+缓存内跳转重置解码及输出状态后重解码，底层输入保持读位置；若跳转中断了 FFmpeg 的阻塞读取，则清空旧缓存并执行底层 seek。硬解失败优先重放缓存 GOP；无可重放前缀时只等待下一个视频关键帧，保持音频连续。缺少可靠时间戳或连续数据的区间不会声明可缓存跳转。单个超过前向预算的包可与其他缓存并存，以一次性交接消费，不进入历史缓存。45 MiB 不含解码器、PCM、FFmpeg 内部输入缓冲及渲染内存。未知时长的网络输入使用顺序缓冲，首版不提供直播回看或磁盘缓存。
+
+切换倍速不执行 seek，也不重建变速滤镜。音频主时钟同时跟随原始音轨时间戳、滤镜的实际源进度和待播 PCM；音频播空时停止推算。倍速解码不足时先跳过可确认的 H.264 非参考帧，过期画面直接丢弃；持续严重落后时仅恢复视频，音频和用户选择的倍速保持连续。构建配方 revision 10 包含网络、HLS、变速滤镜源进度和 seek 安全补丁。
 
 ### 手势与底边进度条
 
@@ -206,6 +223,7 @@ player.clearSubtitles()         // 清除内容，需重新加载才能显示
 | `FFPLAYER_HWDEC=force` | 调试时跳过硬解能力预检 |
 | `FFPLAYER_ZEROCOPY=0` | 禁用 DMA-BUF 导入，保留其他渲染路径 |
 | `FFPLAYER_GL=0` | 强制 CPU 转 RGBA |
+| `FFPLAYER_SYNC_TRACE=1` | 每约 0.5 秒记录原始音频 PTS、累计输出样本、ALSA 延迟及丢弃／欠载／清空计数、视频 PTS、解码减负与丢帧计数、主时钟 |
 | `SSL_CERT_FILE` / `SSL_CERT_DIR` | 可选 HTTPS CA 文件 / 哈希证书目录；未设置时使用 OpenSSL 默认信任路径及设备 `/etc/ssl/certs`，不要求 CA 合集文件。显式配置加载失败时报错，始终校验证书链和主机名。 |
 
 HTTPS 默认验证证书链和主机名。设备系统时间和 CA 文件须正确。网络读写有超时及取消机制，尚不提供应用层自动重连、内嵌字幕轨选择或播放列表管理。

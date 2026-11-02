@@ -28,16 +28,18 @@
 #include "AudioDevice.hpp"
 #include "AudioResampler.hpp"
 #include "AudioTempo.hpp"
+#include "BufferingStats.hpp"
 #include "Clock.hpp"
 #include "Decoder.hpp"
 #include "Demuxer.hpp"
 #include "FFmpegCore.hpp"
 #include "FrameQueue.hpp"
-#include "PacketQueue.hpp"
+#include "PacketCache.hpp"
 #include "PlaybackController.hpp"
 #include "PlaybackProgressOverlay.hpp"
 #include "RAII_WRAPPERS_HPP"
 #include "VideoRenderNode.hpp"
+#include "VideoPacketDrop.hpp"
 #include "SubtitleOverlay.hpp"
 
 #include <QQmlEngine>
@@ -54,6 +56,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <iomanip>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -131,58 +134,6 @@ static inline void SetThreadAffinityMulti(std::initializer_list<int>, int = 0) {
 }
 #endif
 
-// ─── 硬解回退用的 GOP 缓存 ─────────────────────────
-// 缓存自最近关键帧以来的包（引用计数，不复制数据）。硬解中途失败时
-// 把这些包重放给软解器，画面可以立即接上，而不用等下一个关键帧。
-class GopCache {
-public:
-  ~GopCache() { Release(); }
-
-  void Reset() {
-    Release();
-    valid_ = true;
-  }
-
-  void Add(AVPacket *pkt) {
-    if (!valid_)
-      return;
-    if (packets_.size() >= kMaxPackets || bytes_ + pkt->size > kMaxBytes) {
-      Invalidate();
-      return;
-    }
-    AVPacket *copy = av_packet_clone(pkt);
-    if (!copy) {
-      Invalidate();
-      return;
-    }
-    packets_.push_back(copy);
-    bytes_ += pkt->size;
-  }
-
-  bool valid() const { return valid_; }
-  const std::vector<AVPacket *> &packets() const { return packets_; }
-
-private:
-  static constexpr size_t kMaxPackets = 600;
-  static constexpr int64_t kMaxBytes = 32LL << 20;
-
-  void Invalidate() {
-    Release();
-    valid_ = false;
-  }
-
-  void Release() {
-    for (AVPacket *p : packets_)
-      av_packet_free(&p);
-    packets_.clear();
-    bytes_ = 0;
-  }
-
-  std::vector<AVPacket *> packets_;
-  int64_t bytes_ = 0;
-  bool valid_ = true;
-};
-
 } // namespace detail
 
 // ============================================================
@@ -198,6 +149,18 @@ class VideoPlayer : public QQuickItem {
   Q_PROPERTY(QVariantMap httpHeaders READ httpHeaders WRITE setHttpHeaders NOTIFY httpHeadersChanged)
   Q_PROPERTY(bool loading READ loading NOTIFY playbackStateChanged)
   Q_PROPERTY(bool seeking READ seeking NOTIFY seekingChanged)
+  Q_PROPERTY(bool buffering READ buffering NOTIFY bufferingChanged)
+  Q_PROPERTY(qreal bufferProgress READ bufferProgress NOTIFY bufferStatsChanged)
+  Q_PROPERTY(qreal bufferedDuration READ bufferedDuration NOTIFY bufferStatsChanged)
+  Q_PROPERTY(qreal bufferedPosition READ bufferedPosition NOTIFY bufferStatsChanged)
+  Q_PROPERTY(qreal downloadSpeed READ downloadSpeed NOTIFY downloadSpeedChanged)
+  Q_PROPERTY(bool cacheEnabled READ cacheEnabled WRITE setCacheEnabled NOTIFY cacheConfigChanged)
+  Q_PROPERTY(qint64 cacheForwardBytes READ cacheForwardBytes WRITE setCacheForwardBytes NOTIFY cacheConfigChanged)
+  Q_PROPERTY(qint64 cacheBackwardBytes READ cacheBackwardBytes WRITE setCacheBackwardBytes NOTIFY cacheConfigChanged)
+  Q_PROPERTY(qreal networkBufferSeconds READ networkBufferSeconds WRITE setNetworkBufferSeconds NOTIFY cacheConfigChanged)
+  Q_PROPERTY(qreal cachedStartPosition READ cachedStartPosition NOTIFY bufferStatsChanged)
+  Q_PROPERTY(qreal cachedEndPosition READ cachedEndPosition NOTIFY bufferStatsChanged)
+  Q_PROPERTY(qint64 cacheUsedBytes READ cacheUsedBytes NOTIFY bufferStatsChanged)
   Q_PROPERTY(qreal playbackRate READ playbackRate WRITE setPlaybackRate NOTIFY playbackRateChanged)
   Q_PROPERTY(qreal boostRate READ boostRate WRITE setBoostRate NOTIFY boostRateChanged)
   Q_PROPERTY(bool boosted READ boosted NOTIFY boostedChanged)
@@ -235,6 +198,16 @@ class VideoPlayer : public QQuickItem {
   Q_PROPERTY(QString subtitleErrorString READ subtitleErrorString NOTIFY subtitleErrorChanged)
 
 public:
+#ifdef FFPLAYER_VALIDATION
+  // Host-only observation at the actual presentation/PCM handoff, absent from
+  // production builds and the QML interface. Install before open().
+  std::function<void(double, int, uint64_t, double)> validation_video;
+  std::function<void(double, int64_t, int, int)> validation_audio;
+  std::function<void(double, double, int)> validation_audio_input;
+  std::function<void(uint64_t)> validation_recovery;
+  std::function<void()> validation_packet_drop;
+  std::function<void(uint64_t, uint64_t, uint64_t)> validation_audio_device;
+#endif
   enum PlaybackState { StoppedState, PlayingState, PausedState, LoadingState };
   Q_ENUM(PlaybackState)
 
@@ -243,8 +216,7 @@ public:
 
   // ─── 构造 / 析构 ─────────────────────────────
   explicit VideoPlayer(QQuickItem *parent = nullptr)
-      : QQuickItem(parent), video_pkt_queue_(20), audio_pkt_queue_(80),
-        ready_frames_(3) {
+      : QQuickItem(parent), ready_frames_(3) {
     setFlag(ItemHasContents, true);
     connect(this, &QQuickItem::smoothChanged, this, [this]() { update(); });
 
@@ -284,6 +256,14 @@ public:
         }
       }
     });
+
+    buffer_timer_ = new QTimer(this);
+    buffer_timer_->setInterval(100);
+    connect(buffer_timer_, &QTimer::timeout, this, &VideoPlayer::updateBufferingStats);
+
+    download_speed_timer_ = new QTimer(this);
+    download_speed_timer_->setInterval(500);
+    connect(download_speed_timer_, &QTimer::timeout, this, &VideoPlayer::updateDownloadSpeed);
   }
 
   ~VideoPlayer() override {
@@ -302,6 +282,38 @@ public:
   QVariantMap httpHeaders() const { return http_headers_; }
   bool loading() const { return state_ == LoadingState; }
   bool seeking() const { return seeking_.load(std::memory_order_acquire); }
+  bool buffering() const { return buffering_; }
+  qreal bufferProgress() const { return buffer_progress_; }
+  qreal bufferedDuration() const { return buffered_duration_; }
+  qreal bufferedPosition() const { return buffered_position_; }
+  bool cacheEnabled() const { return cache_config_.enabled; }
+  qint64 cacheForwardBytes() const { return cache_config_.forward; }
+  qint64 cacheBackwardBytes() const { return cache_config_.backward; }
+  qreal networkBufferSeconds() const { return cache_config_.networkSeconds; }
+  qreal cachedStartPosition() const { return cached_start_; }
+  qreal cachedEndPosition() const { return cached_end_; }
+  qint64 cacheUsedBytes() const { return cache_used_; }
+  void setCacheEnabled(bool enabled) {
+    if (cache_config_.enabled == enabled) return;
+    cache_config_.enabled = enabled;
+    emit cacheConfigChanged();
+  }
+  void setCacheForwardBytes(qint64 bytes) {
+    if (bytes <= 0 || bytes > INT64_MAX - cache_config_.backward || bytes == cache_config_.forward) return;
+    cache_config_.forward = bytes;
+    emit cacheConfigChanged();
+  }
+  void setCacheBackwardBytes(qint64 bytes) {
+    if (bytes < 0 || bytes > INT64_MAX - cache_config_.forward || bytes == cache_config_.backward) return;
+    cache_config_.backward = bytes;
+    emit cacheConfigChanged();
+  }
+  void setNetworkBufferSeconds(qreal seconds) {
+    if (!std::isfinite(seconds) || seconds <= 0 || seconds == cache_config_.networkSeconds) return;
+    cache_config_.networkSeconds = seconds;
+    emit cacheConfigChanged();
+  }
+  qreal downloadSpeed() const { return download_speed_; }
   qreal playbackRate() const { return playback_rate_.load(); }
   qreal boostRate() const { return boost_rate_; }
   bool boosted() const { return boosted_; }
@@ -572,17 +584,14 @@ public slots:
     // 从暂停状态恢复（包括 EOF 暂停）
     if (state_ == PausedState) {
       // 如果是 EOF 暂停，需要先 seek 到开头或当前位置以清除 EOF 状态
-      if (eof_reached_.load(std::memory_order_relaxed)) {
+      if (eof_signaled_.load(std::memory_order_relaxed)) {
         // seek 到开头重新播放
         seek(0.0);
-      } else if (has_audio_ && !seeking_.load()) {
-        // ALSA 不支持硬件暂停时会丢弃缓冲；从暂停位置重建音频。
-        seek(position());
       }
       {
         std::lock_guard<std::mutex> lock(clock_update_mutex_);
         playback_controller_.SetPaused(false);
-        audio_clock_.SetPaused(seeking_.load());
+        if (!has_audio_) audio_clock_.SetPaused(seeking_.load() || buffer_hold_.load());
       }
       setState(PlayingState);
       return;
@@ -600,9 +609,13 @@ public slots:
     {
       std::lock_guard<std::mutex> lock(clock_update_mutex_);
       playback_controller_.SetPaused(true);
+      // Freeze the software clock at the request boundary. The output thread
+      // later confirms the actual device position and applies latency.
       audio_clock_.SetPaused(true);
+      video_recovering_.store(false);
     }
     setState(PausedState);
+    setBuffering(seeking());
   }
 
   void togglePlayPause() {
@@ -622,14 +635,36 @@ public slots:
     seconds = std::max(0.0, duration_ > 0 ? std::min(seconds, duration_) : seconds);
     bool notify_seeking;
     {
+      std::lock_guard<std::mutex> inputLock(seek_control_mutex_);
       // 与音频回调提交时钟互斥，旧 PCM 不能在跳转后覆盖目标位置。
       std::lock_guard<std::mutex> lock(clock_update_mutex_);
       notify_seeking = !seeking_.exchange(true, std::memory_order_acq_rel);
       eof_reached_.store(false, std::memory_order_release);
       eof_signaled_.store(false, std::memory_order_release);
       playback_controller_.RequestSeek(seconds);
+      const auto request = playback_controller_.GetSeekRequest();
+      const int nextSerial = seek_serial_.load() + 1;
+      video_recovering_.store(false);
+      buffer_hold_.store(true, std::memory_order_release);
+      buffer_stats_serial_.store(nextSerial, std::memory_order_release);
+      buffer_stats_generation_.store(buffer_stats_.Reset(buffer_video_, has_audio_, seconds),
+                                     std::memory_order_release);
+      audio_waiting_.store(false);
+      video_waiting_.store(false);
+      audio_output_serial_.store(-1);
+      video_output_serial_.store(-1);
       audio_clock_.SetClock(seconds, 0.0);
       audio_clock_.SetPaused(true);
+      if (!input_seek_pending_.load() && packet_cache_.Seek(seconds, nextSerial)) {
+        discard_before_.store(seconds);
+        seek_serial_.store(nextSerial, std::memory_order_release);
+        ready_frames_.Clear();
+        eof_reached_.store(packet_cache_.Get(seconds).eof);
+        playback_controller_.CompleteSeek(request.first);
+        LOG(INFO) << "Packet cache seek hit: " << seconds;
+      } else {
+        input_seek_pending_.store(true, std::memory_order_release);
+      }
     }
     {
       std::lock_guard<std::mutex> lock(frame_mutex_);
@@ -637,6 +672,11 @@ public slots:
     }
 
     last_reported_pos_ = seconds;
+    starvation_since_ = 0;
+    buffer_progress_ = buffered_duration_ = 0;
+    buffered_position_ = seconds;
+    emit bufferStatsChanged();
+    setBuffering(true);
     if (notify_seeking)
       emit seekingChanged();
     emit positionChanged();
@@ -659,6 +699,10 @@ signals:
   void audioSourceChanged();
   void httpHeadersChanged();
   void seekingChanged();
+  void bufferingChanged();
+  void bufferStatsChanged();
+  void cacheConfigChanged();
+  void downloadSpeedChanged();
   void seekFinished(qreal position);
   void playbackRateChanged();
   void boostRateChanged();
@@ -691,13 +735,17 @@ signals:
 protected:
   // 渲染线程调用（GUI 线程阻塞中）。像素转换/纹理上传都在 VideoRootNode 内完成。
   QSGNode *updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *) override {
-    auto *root = static_cast<render::VideoRootNode *>(oldNode);
+    auto *root = static_cast<render::VideoRenderSlots *>(oldNode);
 
     AVFrame *frame = nullptr;
+    uint64_t generation;
+    const int serial = seek_serial_.load();
     {
-      std::lock_guard<std::mutex> lock(frame_mutex_);
+      std::lock_guard<std::mutex> frameLock(frame_mutex_);
       std::swap(frame, pending_frame_);
+      generation = pending_generation_;
     }
+    if (frame && generation != video_generation_.load()) av_frame_free(&frame);
 
     if (clear_node_.exchange(false, std::memory_order_acq_rel)) {
       delete root;
@@ -707,19 +755,17 @@ protected:
     if (!frame && !root)
       return nullptr;
     if (!root)
-      root = new render::VideoRootNode(window());
+      root = new render::VideoRenderSlots(window());
 
     const QRectF rect = calculateRenderRect();
-    root->SetSampling(downsampling_enabled_, smooth());
+    const auto dpr = window()->effectiveDevicePixelRatio();
     if (frame) {
-      root->SetFrame(frame, rect, rotation_angle_,
-                     window()->effectiveDevicePixelRatio());
+      root->Prepare(frame, rect, rotation_angle_, dpr, downsampling_enabled_, smooth());
+      std::lock_guard<std::mutex> frameLock(frame_mutex_);
+      if (generation == video_generation_.load() && serial == seek_serial_.load() &&
+          !playback_controller_.IsSeekRequested() && is_running_.load()) root->Commit();
     }
-    if (!root->HasContent()) {
-      delete root;
-      return nullptr;
-    }
-    root->UpdateLayout(rect, rotation_angle_, window()->effectiveDevicePixelRatio());
+    root->Update(rect, rotation_angle_, dpr, downsampling_enabled_, smooth());
     return root;
   }
 
@@ -742,6 +788,121 @@ protected:
 #endif
 
 private:
+  static double monotonicSeconds() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+
+  void setBuffering(bool active) {
+    if (buffering_ == active) return;
+    buffering_ = active;
+    emit bufferingChanged();
+  }
+
+  void releaseBufferHold() {
+    std::lock_guard<std::mutex> lock(clock_update_mutex_);
+    if (buffer_hold_.exchange(false, std::memory_order_acq_rel)) {
+      packet_cache_.AcknowledgeCapacity();
+      audio_clock_.SetPaused(playback_controller_.IsPaused() || seeking());
+    }
+  }
+
+  void updateDownloadSpeed() {
+    if (state_ == StoppedState) return;
+    const double speed = download_rate_.Update(monotonicSeconds(), demuxer_ ? demuxer_->NetworkBytes() : 0);
+    if (download_speed_ == speed) return;
+    download_speed_ = speed;
+    emit downloadSpeedChanged();
+  }
+
+  void recordBufferedPacket(const AVPacket *packet, bool video, int serial) {
+    if (!packet || !packet->data || packet->size <= 0 ||
+        serial != buffer_stats_serial_.load(std::memory_order_acquire) ||
+        serial != seek_serial_.load(std::memory_order_acquire) || playback_controller_.IsSeekRequested())
+      return;
+    const AVRational timeBase = video ? v_time_base_ : a_time_base_;
+    const int64_t timestamp = packet->pts != AV_NOPTS_VALUE ? packet->pts : packet->dts;
+    const double start = timestamp != AV_NOPTS_VALUE
+        ? timestamp * av_q2d(timeBase) : audio_clock_.GetClock();
+    const double length = packet->duration > 0 ? packet->duration * av_q2d(timeBase)
+        : video ? v_packet_duration_ : a_packet_duration_;
+    if (length > 0)
+      buffer_stats_.Record(buffer_stats_generation_.load(std::memory_order_acquire), video,
+                           start, start + length);
+  }
+
+  void updateBufferingStats() {
+    if (state_ == StoppedState) return;
+    const auto session = session_id_.load();
+    const double now = monotonicSeconds();
+    const double pos = position();
+    packet_cache_.SetPosition(pos);
+    const auto stats = packet_cache_.Get(pos);
+    const double target = active_cache_config_.network && active_cache_config_.enabled
+        ? active_cache_config_.networkSeconds : BufferingStats::LocalTargetSeconds;
+    const auto handed = buffer_stats_.Get(pos, target, duration_);
+    const double videoEnd = std::max(stats.videoEnd, handed.videoEnd);
+    const double audioEnd = std::max(stats.audioEnd, handed.audioEnd);
+    double end = buffer_video_ && has_audio_ ? std::min(videoEnd, audioEnd)
+               : buffer_video_ ? videoEnd : has_audio_ ? audioEnd : pos;
+    if (duration_ > 0) end = std::min(duration_, end);
+    end = std::max(pos, end);
+    const double seconds = end - pos;
+    // Progress always refers to the configured prefetch target, including
+    // capacity and EOF exceptions.
+    const double progress = std::min(1.0, seconds / target);
+    const bool statsChanged = buffer_progress_ != progress || buffered_position_ != end ||
+        buffered_duration_ != seconds || cached_start_ != stats.seekStart ||
+        cached_end_ != stats.seekEnd || cache_used_ != stats.bytes;
+    buffer_progress_ = progress;
+    buffered_duration_ = seconds;
+    buffered_position_ = end;
+    cached_start_ = stats.seekStart;
+    cached_end_ = duration_ > 0 ? std::min(duration_, stats.seekEnd) : stats.seekEnd;
+    cache_used_ = stats.bytes;
+
+    // 缺包需持续 150ms；解码慢、正常帧间隔以及片尾排空不作为网络缓冲。
+    const bool eof = eof_reached_.load(std::memory_order_acquire);
+    const bool waiting = read_waiting_.load(std::memory_order_acquire) &&
+        ((has_audio_ && audio_waiting_.load()) || (buffer_video_ && video_waiting_.load()));
+    const bool canWait = state_ == PlayingState && !seeking() && !eof;
+    if (canWait && waiting) {
+      if (starvation_since_ == 0) starvation_since_ = now;
+    } else {
+      starvation_since_ = 0;
+    }
+    const bool starved = canWait && starvation_since_ > 0 && now - starvation_since_ >= 0.15;
+    // Either required track can starve with independent readers. The output
+    // thread preserves queued PCM and confirms the actual freeze position.
+    if (starved && !buffer_hold_.load()) {
+      std::lock_guard<std::mutex> lock(clock_update_mutex_);
+      buffer_hold_.store(true, std::memory_order_release);
+      if (!has_audio_) audio_clock_.SetPaused(true);
+    }
+
+    if (buffer_hold_.load()) {
+      const bool videoReady = !buffer_video_ || (has_audio_ && video_recovering_.load()) ||
+          video_output_serial_.load() == seek_serial_.load() ||
+          video_drained_serial_.load() == seek_serial_.load();
+      const bool audioReady = !has_audio_ || audio_output_serial_.load() == seek_serial_.load() ||
+          audio_drained_serial_.load() == seek_serial_.load();
+      const bool startupReady = !initial_network_buffer_pending_ || seconds >= target || stats.capacity || stats.eof;
+      if (!playback_controller_.IsSeekRequested() && videoReady && audioReady && startupReady) {
+        LOG(INFO) << "Buffer ready: serial=" << seek_serial_.load() << " seconds=" << seconds
+                  << " target=" << target << " bytes=" << stats.bytes
+                  << " capacity=" << stats.capacity << " eof=" << stats.eof;
+        releaseBufferHold();
+        initial_network_buffer_pending_ = false;
+        if (demuxer_) demuxer_->SetStartupPrefetch(false);
+        starvation_since_ = 0;
+      }
+    }
+
+    setBuffering(loading() || seeking() || (state_ == PlayingState && (buffer_hold_.load() || starved)));
+    // QML 信号处理器可以停止或更换媒体，后续通知不能泄漏到新会话。
+    if (session != session_id_.load()) return;
+    if (statsChanged) emit bufferStatsChanged();
+  }
+
   void syncProgressBar() {
     if (!progress_overlay_) return;
     const qreal barHeight = std::min(progress_bar_height_, std::max(qreal(0), height()));
@@ -806,8 +967,7 @@ private:
       subtitle_timer_->stop();
     }
   }
-  // 帧之间允许的最长无画面间隔：解码跟不上时也强制出图，避免画面完全冻结
-  static constexpr auto kMaxDisplayGap = std::chrono::milliseconds(250);
+  // 解码与呈现线程丢弃过期画面，保留最后一帧等待追赶。
 
   // ─── 渲染区域计算 ─────────────────────────────
   QRectF calculateRenderRect() const {
@@ -890,7 +1050,10 @@ private:
       if (session != session_id_.load() || serial != seek_serial_.load() ||
           playback_controller_.IsSeekRequested() || !seeking_.exchange(false))
         return;
-      audio_clock_.SetPaused(playback_controller_.IsPaused());
+      {
+        std::lock_guard<std::mutex> lock(clock_update_mutex_);
+        audio_clock_.SetPaused(playback_controller_.IsPaused() || buffer_hold_.load());
+      }
       emit seekingChanged();
       emit seekFinished(position());
     }, Qt::QueuedConnection);
@@ -906,6 +1069,8 @@ private:
 
     // 暂停播放控制器（让工作线程进入等待状态）
     playback_controller_.SetPaused(true);
+    releaseBufferHold();
+    setBuffering(false);
 
     // 先取消长按，状态/位置的 QML 回调即使调用 endBoost 也不会在 EOF 发起跳转。
     finishBoost();
@@ -930,20 +1095,32 @@ private:
       return;
 
     is_running_.store(false, std::memory_order_release);
+    video_recovering_.store(false);
     ++session_id_;
 
     // 唤醒所有阻塞的队列操作
-    video_pkt_queue_.Abort();
-    audio_pkt_queue_.Abort();
+    packet_cache_.Abort();
     ready_frames_.Abort();
 
     joinAllThreads();
+    buffer_timer_->stop();
+    download_speed_timer_->stop();
 
     // 重置所有状态
-    video_pkt_queue_.Clear();
-    audio_pkt_queue_.Clear();
+    packet_cache_.Clear();
     ready_frames_.Clear();
     resetSyncState();
+    buffer_hold_.store(false);
+    audio_waiting_.store(false);
+    video_waiting_.store(false);
+    audio_output_serial_.store(-1);
+    video_output_serial_.store(-1);
+    read_waiting_.store(false);
+    starvation_since_ = 0;
+    buffer_video_ = false;
+    buffer_progress_ = buffered_duration_ = buffered_position_ = download_speed_ = 0;
+    cached_start_ = cached_end_ = 0;
+    cache_used_ = 0;
 
     demuxer_.reset();
     video_decoder_.reset();
@@ -975,6 +1152,9 @@ private:
 
     setVideoDecoderInfo(QString(), false);
     setState(StoppedState);
+    setBuffering(false);
+    emit bufferStatsChanged();
+    emit downloadSpeedChanged();
     if (seeking_.exchange(false))
       emit seekingChanged();
     endBoost();
@@ -987,6 +1167,8 @@ private:
 
   // ─── 启动播放 ─────────────────────────────
   void startPlayback() {
+    startup_at_ = monotonicSeconds();
+    first_handoff_.store(true);
     error_string_.clear();
     const auto inputPath = [](const QUrl &url) {
       return (url.isLocalFile() ? url.toLocalFile()
@@ -995,56 +1177,90 @@ private:
     };
     const std::string path = inputPath(source_);
     const std::string audio_path = inputPath(audio_source_);
+    active_cache_config_ = cache_config_;
+    active_cache_config_.network = (!source_.scheme().isEmpty() && !source_.isLocalFile()) ||
+        (!audio_source_.isEmpty() && !audio_source_.scheme().isEmpty() && !audio_source_.isLocalFile());
     std::string headers;
     for (auto it = http_headers_.cbegin(); it != http_headers_.cend(); ++it)
       headers += it.key().toStdString() + ": " + it.value().toString().toStdString() + "\r\n";
     demuxer_ = std::make_unique<Demuxer>();
     is_running_.store(true, std::memory_order_release);
-    setState(LoadingState);
+    download_rate_.Reset(monotonicSeconds());
     const auto session = ++session_id_;
+    setState(LoadingState);
+    if (session != session_id_.load()) return;
+    setBuffering(true);
+    if (session != session_id_.load()) return;
+    buffer_timer_->start();
+    download_speed_timer_->start();
     open_thread_ = std::thread([this, path, audio_path, headers, session]() {
       const bool ok = demuxer_->Open(path, headers, &is_running_, audio_path);
-      QMetaObject::invokeMethod(this, [this, ok, session]() {
+      auto prepared = std::make_shared<PreparedDecoders>();
+      if (ok && is_running_.load() && session == session_id_.load()) {
+        auto *fmt = demuxer_->GetRawContext();
+        prepared->index = demuxer_->GetVideoStreamIndex();
+        prepared->attached = prepared->index < 0 && demuxer_->HasAttachedPicture();
+        if (prepared->attached) {
+          for (unsigned i = 0; i < fmt->nb_streams; ++i)
+            if (fmt->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC) {
+              prepared->index = static_cast<int>(i);
+              break;
+            }
+        }
+        prepared->video = std::make_unique<Decoder>();
+        prepared->audio = std::make_unique<Decoder>();
+        prepared->hasVideo = prepared->index >= 0 &&
+            prepared->video->Init(fmt->streams[prepared->index]->codecpar, !prepared->attached);
+        if (is_running_.load() && session == session_id_.load())
+          prepared->hasAudio = demuxer_->GetAudioStreamIndex() >= 0 &&
+              prepared->audio->Init(demuxer_->GetAudioCodecParameters(), false);
+        demuxer_->Trace("decoder-init");
+      }
+      const QString openError = QString::fromStdString(demuxer_->Error());
+      QMetaObject::invokeMethod(this, [this, ok, session, prepared, openError]() {
         if (session != session_id_)
           return;
         if (open_thread_.joinable())
           open_thread_.join();
         if (!ok) {
           stopInternal();
-          setError(QStringLiteral("Cannot open media (network, format or audio track error)"));
+          setError(openError);
           return;
         }
-        finishStartPlayback();
+        finishStartPlayback(*prepared);
       }, Qt::QueuedConnection);
     });
   }
 
-  void finishStartPlayback() {
-    demuxer_->SetReadInterrupt([this]() { return playback_controller_.IsSeekRequested(); });
+  struct PreparedDecoders {
+    std::unique_ptr<Decoder> video, audio;
+    int index = -1;
+    bool attached = false, hasVideo = false, hasAudio = false;
+  };
+
+  void finishStartPlayback(PreparedDecoders &prepared) {
+    video_recovering_.store(false);
+    callback_drops_.store(0);
+    present_drops_.store(0);
+    render_drops_.store(0);
+    sync_trace_ = qEnvironmentVariableIsSet("FFPLAYER_SYNC_TRACE");
+    input_seek_pending_.store(false);
+    demuxer_->SetReadInterrupt([this]() { return input_seek_pending_.load(); });
     AVFormatContext *fmt_ctx = demuxer_->GetRawContext();
     duration_ = fmt_ctx->duration > 0 ? static_cast<double>(fmt_ctx->duration) / AV_TIME_BASE : 0.0;
+    // Unknown-duration network inputs use sequential buffering; live rewind is
+    // intentionally outside the compressed VOD cache contract.
+    if (active_cache_config_.network && duration_ <= 0) active_cache_config_.enabled = false;
     emit durationChanged();
 
-    video_decoder_ = std::make_unique<Decoder>();
-    audio_decoder_ = std::make_unique<Decoder>();
-
-    has_video_ = false;
-    has_audio_ = false;
+    video_decoder_ = std::move(prepared.video);
+    audio_decoder_ = std::move(prepared.audio);
+    has_video_ = prepared.hasVideo;
+    has_audio_ = prepared.hasAudio;
 
     // 视频流：普通视频优先尝试硬解；专辑封面（附加图片）直接软解
-    video_stream_index_ = demuxer_->GetVideoStreamIndex();
-    const bool attached_pic =
-        video_stream_index_ < 0 && demuxer_->HasAttachedPicture();
-    if (attached_pic) {
-      for (unsigned i = 0; i < fmt_ctx->nb_streams; i++) {
-        auto *st = fmt_ctx->streams[i];
-        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
-            (st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
-          video_stream_index_ = static_cast<int>(i);
-          break;
-        }
-      }
-    }
+    video_stream_index_ = prepared.index;
+    const bool attached_pic = prepared.attached;
 
     // 时间基
     v_time_base_ = {1, 25};
@@ -1052,16 +1268,11 @@ private:
 
     if (video_stream_index_ >= 0) {
       AVStream *vst = fmt_ctx->streams[video_stream_index_];
-      has_video_ = video_decoder_->Init(vst->codecpar, !attached_pic);
       v_time_base_ = vst->time_base;
     }
     if (!has_video_)
       video_stream_index_ = -1;
-
-    if (demuxer_->GetAudioStreamIndex() >= 0) {
-      has_audio_ =
-          audio_decoder_->Init(demuxer_->GetAudioCodecParameters(), false);
-    }
+    buffer_video_ = has_video_ && !attached_pic;
 
     if (!has_video_ && !has_audio_) {
       stopInternal();
@@ -1083,14 +1294,29 @@ private:
       a_time_base_ = demuxer_->GetAudioTimeBase();
     }
 
+    // 在工作线程启动前缓存回退时长，读包线程不读取正在解码的 AVCodecContext。
+    v_packet_duration_ = a_packet_duration_ = 0;
+    if (has_video_) {
+      const auto rate = av_guess_frame_rate(fmt_ctx, fmt_ctx->streams[video_stream_index_], nullptr);
+      if (rate.num > 0 && rate.den > 0) v_packet_duration_ = av_q2d(av_inv_q(rate));
+    }
+    if (has_audio_) {
+      const auto *ctx = audio_decoder_->GetContext();
+      if (ctx->sample_rate > 0) a_packet_duration_ = static_cast<double>(ctx->frame_size) / ctx->sample_rate;
+    }
+
     // 重置队列和状态
-    video_pkt_queue_.Resume();
-    audio_pkt_queue_.Resume();
     ready_frames_.Resume();
-    video_pkt_queue_.Clear();
-    audio_pkt_queue_.Clear();
+    packet_cache_.Open(active_cache_config_, has_video_, has_audio_, buffer_video_, seek_serial_.load());
+    buffer_stats_serial_.store(seek_serial_.load(), std::memory_order_release);
+    buffer_stats_generation_.store(buffer_stats_.Reset(buffer_video_, has_audio_, position()),
+                                   std::memory_order_release);
     ready_frames_.Clear();
     resetSyncState();
+    buffer_hold_.store(true);
+    initial_network_buffer_pending_ = active_cache_config_.network && active_cache_config_.enabled;
+    demuxer_->SetStartupPrefetch(initial_network_buffer_pending_);
+    audio_clock_.SetPaused(true);
     eof_reached_.store(false, std::memory_order_relaxed);
     eof_signaled_.store(false, std::memory_order_relaxed);
     video_drained_serial_.store(-1, std::memory_order_relaxed);
@@ -1134,66 +1360,84 @@ private:
   void readThreadFunc() {
     const int v_idx = video_stream_index_;
     const int a_idx = demuxer_->GetAudioStreamIndex();
+    AVPacket *pending = nullptr;
 
     while (is_running_.load(std::memory_order_acquire)) {
       // Seek 处理
       if (playback_controller_.IsSeekRequested()) {
+        std::lock_guard<std::mutex> inputLock(seek_control_mutex_);
+        if (!playback_controller_.IsSeekRequested()) continue;
         const auto request = playback_controller_.GetSeekRequest();
         const double target = request.second;
-        video_pkt_queue_.Clear();
-        audio_pkt_queue_.Clear();
         ready_frames_.Clear();
-
-        int64_t ts = static_cast<int64_t>(target * AV_TIME_BASE);
-        const int result = demuxer_->Seek(ts);
-        if (result < 0) {
-          postPlaybackError(QStringLiteral("Seek failed: ") + QString::fromStdString(FFmpegCore::ErrorToString(result)));
-          break;
+        const int serial = seek_serial_.load() + 1;
+        buffer_stats_serial_.store(serial, std::memory_order_release);
+        buffer_stats_generation_.store(buffer_stats_.Reset(buffer_video_, has_audio_, target),
+                                       std::memory_order_release);
+        const bool interrupted = demuxer_->ConsumeSeekInterruptedRead();
+        const bool hit = !interrupted && packet_cache_.Seek(target, serial);
+        if (!hit) {
+          av_packet_free(&pending);
+          packet_cache_.Reset(target, serial);
+          if (interrupted)
+            LOG(INFO) << "Seek interrupted demux read; rebuilding input state";
+          // Older HLS demuxers reject the exact playlist endpoint (their first
+          // DTS can precede the normalized PTS origin). Read the final prefix
+          // and let discard_before_ retain the user's precise output target.
+          const double readTarget = duration_ > 0 ? std::min(target, std::max(0.0, duration_ - 1.0)) : target;
+          const int result = demuxer_->Seek(static_cast<int64_t>(readTarget * AV_TIME_BASE));
+          if (result < 0) {
+            postPlaybackError(QStringLiteral("Seek failed: ") + QString::fromStdString(FFmpegCore::ErrorToString(result)));
+            break;
+          }
         }
-
+        LOG(INFO) << "Packet cache seek " << (hit ? "hit: " : "miss: ") << target;
         discard_before_.store(target, std::memory_order_relaxed);
-        seek_serial_.fetch_add(1, std::memory_order_release);
-        // 带序号的队列同时阻止并发解码/呈现中的旧数据跨越跳转。
-        video_pkt_queue_.Clear();
-        audio_pkt_queue_.Clear();
+        seek_serial_.store(serial, std::memory_order_release);
         ready_frames_.Clear();
-        eof_reached_.store(false, std::memory_order_relaxed);
+        eof_reached_.store(packet_cache_.Get(target).eof, std::memory_order_release);
         eof_signaled_.store(false, std::memory_order_relaxed);
 
         playback_controller_.CompleteSeek(request.first);
+        input_seek_pending_.store(false, std::memory_order_release);
         continue;
       }
 
-      // 暂停时休眠
-      if (playback_controller_.IsPaused() && !seeking_.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      // Prefetch also runs while paused. Capacity waits remain interruptible.
+      packet_cache_.SetPosition(audio_clock_.GetClock());
+      if (!packet_cache_.WantRead()) {
+        packet_cache_.Wait();
         continue;
       }
 
-      // EOF 后等待 seek 或停止
-      if (eof_reached_.load(std::memory_order_relaxed)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        continue;
+      double missing = 0;
+      if (packet_cache_.BeginRefill(missing)) {
+        av_packet_free(&pending);
+        const int result = demuxer_->Seek(static_cast<int64_t>(std::max(0.0, missing) * AV_TIME_BASE));
+        if (result < 0) {
+          postPlaybackError(QStringLiteral("Cache tail refill failed: ") +
+              QString::fromStdString(FFmpegCore::ErrorToString(result)));
+          break;
+        }
+        LOG(INFO) << "Packet cache refill missing tail: " << missing;
       }
 
-      AVPacket *pkt = av_packet_alloc();
-      if (!pkt)
-        break;
-
-      int ret = demuxer_->ReadPacket(pkt);
+      const bool needRead = !pending;
+      if (needRead) pending = av_packet_alloc();
+      if (!pending) break;
+      read_waiting_.store(needRead, std::memory_order_release);
+      const int ret = needRead ? demuxer_->ReadPacket(pending) : 0;
+      read_waiting_.store(ret == AVERROR(EAGAIN), std::memory_order_release);
       if (ret < 0) {
-        av_packet_free(&pkt);
+        av_packet_free(&pending);
         if (playback_controller_.IsSeekRequested())
           continue;
 
         if (ret == AVERROR_EOF) {
           eof_reached_.store(true, std::memory_order_release);
 
-          // 发送 flush packet 让解码器输出缓存帧
-          if (has_video_)
-            pushFlushPacket(video_pkt_queue_, v_idx);
-          if (has_audio_)
-            pushFlushPacket(audio_pkt_queue_, a_idx);
+          // Each cursor sees its own drain marker after all cached packets.
+          packet_cache_.End();
           continue;
         }
         if (ret == AVERROR(EAGAIN)) {
@@ -1207,47 +1451,39 @@ private:
 
       // 视频包不再在这里按时间丢弃：丢掉参考帧会导致花屏直到下一个关键帧。
       // 追帧改由解码线程丢弃解码后的帧 + 软解 skip_frame 完成。
-      if (pkt->stream_index == v_idx && has_video_) {
-        if (!pushPacketToQueue(video_pkt_queue_, pkt)) {
-          av_packet_free(&pkt);
-        }
-      } else if (pkt->stream_index == a_idx && has_audio_) {
-        if (!pushPacketToQueue(audio_pkt_queue_, pkt)) {
-          av_packet_free(&pkt);
-        }
-      } else {
-        av_packet_free(&pkt);
+      if (playback_controller_.IsSeekRequested()) {
+        // A cache hit must retain the reader's pending tail packet. Throwing it
+        // away here would leave a hole when the cursor reaches the demux tail.
+        continue;
       }
+      const bool video = pending->stream_index == v_idx && has_video_;
+      if (video || (pending->stream_index == a_idx && has_audio_)) {
+        bool accepted = false;
+        while (is_running_.load() && !playback_controller_.IsSeekRequested()) {
+          packet_cache_.SetPosition(audio_clock_.GetClock());
+          if (packet_cache_.Push(pending, video, video ? v_time_base_ : a_time_base_,
+                                video ? v_packet_duration_ : a_packet_duration_)) {
+            accepted = true;
+            break;
+          }
+          if (packet_cache_.NeedsRefill()) break;
+          packet_cache_.Wait();
+        }
+        if (!accepted) continue;
+      }
+      av_packet_free(&pending);
     }
-  }
-
-  bool pushPacketToQueue(PacketQueue &queue, AVPacket *pkt) {
-    while (is_running_.load(std::memory_order_relaxed) &&
-           !playback_controller_.IsSeekRequested()) {
-      if (queue.Push(pkt, 5, seek_serial_.load(std::memory_order_acquire)))
-        return true;
-    }
-    return false;
-  }
-
-  void pushFlushPacket(PacketQueue &queue, int stream_index) {
-    AVPacket *flush = av_packet_alloc();
-    if (!flush)
-      return;
-    flush->data = nullptr;
-    flush->size = 0;
-    flush->stream_index = stream_index;
-    if (!pushPacketToQueue(queue, flush))
-      av_packet_free(&flush);
+    av_packet_free(&pending);
+    read_waiting_.store(false, std::memory_order_release);
   }
 
   // 解码帧送入呈现队列（队列满时阻塞，响应 seek/停止）
-  bool pushFrame(AVFrame *frame, int serial) {
+  bool pushFrame(AVFrame *frame, int serial, uint64_t generation) {
     while (is_running_.load(std::memory_order_relaxed)) {
-      if (seek_serial_.load(std::memory_order_acquire) != serial ||
+      if (seek_serial_.load(std::memory_order_acquire) != serial || generation != video_generation_.load() ||
           playback_controller_.IsSeekRequested())
         return false;
-      if (ready_frames_.Push(frame, 10, serial))
+      if (ready_frames_.Push(frame, 10, serial, generation))
         return true;
     }
     return false;
@@ -1276,14 +1512,9 @@ private:
       frame_duration = av_q2d(av_inv_q(ctx->framerate));
     }
     if (frame_duration <= 0.0 || frame_duration > 1.0) {
-      if (v_time_base_.num > 0 && v_time_base_.den > 0) {
-        frame_duration = av_q2d(v_time_base_);
-      }
-      if (frame_duration <= 0.0 || frame_duration > 1.0)
-        frame_duration = 1.0 / 25.0;
+      frame_duration = v_packet_duration_ > 0 ? v_packet_duration_ : 1.0 / 25.0;
     }
 
-    detail::GopCache gop;
     double synthetic_pts = 0.0;
     double replay_until_pts = -1.0; // 回退重放时，已显示过的帧直接跳过
     double last_output_pts = -1.0;
@@ -1291,11 +1522,18 @@ private:
     bool video_dead = false;
     int late_streak = 0;
     int ontime_streak = 0;
-    auto last_push = std::chrono::steady_clock::now();
+    double late_since = 0, last_recovery = -1, recovery_target = 0, trace_time = 0, video_lag = 0;
+    uint64_t generation = video_generation_.load(), packet_drops = 0, recoveries = 0;
+    uint64_t decoded_frames = 0, preroll_drops = 0, nonref_drops = 0;
+    bool recover = false, finding_key = false;
+    double measured_rate = playbackRate();
     int last_seek_serial = seek_serial_.load(std::memory_order_acquire);
 
     // 软解跟不上时逐级跳过环路滤波/非参考帧，追上后恢复
     auto adapt_skip = [&]() {
+#ifdef FFPLAYER_VALIDATION
+      if (qEnvironmentVariableIsSet("FFPLAYER_TEST_NO_SKIP")) return;
+#endif
       if (video_decoder_->IsHardware())
         return;
       int level = video_decoder_->GetSkipLevel();
@@ -1309,14 +1547,19 @@ private:
     };
 
     const FrameCallback on_frame = [&](AVFrame *frame) -> bool {
+      ++decoded_frames;
+      if (decoded_frames == 1) LOG(INFO) << "STARTUP stage=first-video ms=" << (monotonicSeconds() - startup_at_) * 1000;
       if (seek_serial_.load(std::memory_order_acquire) != last_seek_serial ||
-          playback_controller_.IsSeekRequested())
+          generation != video_generation_.load() || playback_controller_.IsSeekRequested())
         return false;
+      if (duration_ > 0 && discard_before_.load() >= duration_) return true;
 
       const double pts = detail::GetFramePts(
           frame, v_time_base_, synthetic_pts, frame_duration, &audio_clock_);
-      if (pts + frame_duration < discard_before_.load(std::memory_order_relaxed))
+      if (pts + frame_duration < discard_before_.load(std::memory_order_relaxed)) {
+        ++preroll_drops;
         return true;
+      }
 
       if (replay_until_pts >= 0.0) {
         if (pts <= replay_until_pts + 0.001)
@@ -1324,9 +1567,17 @@ private:
         replay_until_pts = -1.0;
       }
 
-      const auto now = std::chrono::steady_clock::now();
-      if (audio_clock_.IsStarted() && !seeking_.load() && !playback_controller_.IsPaused()) {
+      if (audio_clock_.IsStarted() && !buffer_hold_.load() && !seeking_.load() && !playback_controller_.IsPaused()) {
         const double diff = pts - audio_clock_.GetClock();
+        video_lag = std::max(0.0, -diff);
+        const double realNow = monotonicSeconds();
+        if (diff < -0.5 && diff > -300) {
+          if (!late_since) late_since = realNow;
+          if (realNow - late_since >= 0.5 && realNow - last_recovery >= 1.0) {
+            recover = true;
+            return false;
+          }
+        } else late_since = 0;
         const bool late = std::abs(diff) < 300.0 && diff < -0.10;
         if (late) {
           ++late_streak;
@@ -1336,13 +1587,17 @@ private:
           late_streak = 0;
         }
         adapt_skip();
-        if (late && now - last_push < kMaxDisplayGap)
+        if (late) {
+          ++callback_drops_;
           return true; // 过期帧：在像素转换/上传之前就丢弃
+        }
+      } else {
+        late_since = 0;
+        video_lag = 0;
       }
 
-      if (!pushFrame(frame, last_seek_serial))
+      if (!pushFrame(frame, last_seek_serial, generation))
         return false;
-      last_push = now;
       last_output_pts = pts;
       return true;
     };
@@ -1351,13 +1606,28 @@ private:
       // 暂停时休眠（但仍响应 seek）
       if (playback_controller_.IsPaused() &&
           !seeking_.load() && !playback_controller_.IsSeekRequested()) {
+        late_since = 0;
+        video_lag = 0;
+        video_recovering_.store(false);
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         continue;
       }
 
+      if (finding_key && last_seek_serial != seek_serial_.load()) finding_key = false;
+      if (finding_key && !playback_controller_.IsSeekRequested()) {
+        recovery_target = std::max(recovery_target, audio_clock_.GetClock());
+        const bool found = packet_cache_.AdvanceVideo(recovery_target, last_seek_serial, &packet_drops);
+        if (!found && !packet_cache_.Get(recovery_target).eof) {
+          packet_cache_.Wait();
+          continue;
+        }
+        finding_key = false;
+      }
       AVPacket *pkt = nullptr;
       int packet_serial = 0;
-      if (!video_pkt_queue_.Pop(pkt, true, 20, &packet_serial))
+      if (!packet_cache_.Pop(true, pkt, packet_serial, [this] {
+            return !is_running_.load() || playback_controller_.IsSeekRequested();
+          }))
         continue;
 
       // Pop 可能跨越 seek；先确认包属于当前跳转，再清空解码器。
@@ -1367,15 +1637,20 @@ private:
         av_packet_free(&pkt);
         continue;
       }
+      recordBufferedPacket(pkt, true, packet_serial);
       if (packet_serial != last_seek_serial) {
         last_seek_serial = packet_serial;
         video_decoder_->Flush();
         video_decoder_->SetSkipLevel(0);
-        gop.Reset();
         synthetic_pts = -1.0;
         replay_until_pts = -1.0;
         last_output_pts = -1.0;
         wait_keyframe = false;
+        finding_key = recover = false;
+        video_recovering_.store(false);
+        late_since = 0;
+        video_lag = 0;
+        generation = video_generation_.load();
         late_streak = 0;
         ontime_streak = 0;
         video_drained_serial_.store(video_dead ? last_seek_serial : -1, std::memory_order_release);
@@ -1389,44 +1664,111 @@ private:
       const bool is_flush = !pkt->data && pkt->size == 0;
       if (!is_flush) {
         if (pkt->flags & AV_PKT_FLAG_KEY) {
-          gop.Reset();
           wait_keyframe = false;
         } else if (wait_keyframe) {
           av_packet_free(&pkt);
           continue;
         }
-        if (video_decoder_->IsHardware())
-          gop.Add(pkt);
+      }
+
+      // Display drops save no VPU work. Skip only provably non-reference
+      // access units when decoding is late, leaving all reference/state NALs.
+      // MPP can have queued pictures ahead of its latest output; waiting until
+      // the next packet itself is late allows that hidden backlog to grow.
+      bool allow_packet_drop = true;
+#ifdef FFPLAYER_VALIDATION
+      allow_packet_drop = !qEnvironmentVariableIsSet("FFPLAYER_TEST_NO_PACKET_DROP");
+#endif
+      const double packet_lag = pkt->pts == AV_NOPTS_VALUE ? 0 :
+          audio_clock_.GetClock() - (pkt->pts * av_q2d(v_time_base_) + frame_duration);
+      if (measured_rate != playbackRate()) {
+        measured_rate = playbackRate();
+        video_decoder_->ResetPerformance();
+      }
+      const bool decode_overloaded = measured_rate > 1 &&
+          video_decoder_->RecentFrameSeconds() * measured_rate > frame_duration * 1.05;
+      if (allow_packet_drop && !is_flush && audio_clock_.IsStarted() &&
+          !buffer_hold_.load() && !seeking_.load() && !playback_controller_.IsPaused() &&
+          (decode_overloaded || packet_lag > 0.05 * playbackRate() || video_lag > 0.05 * playbackRate()) &&
+          std::abs(packet_lag) < 300 &&
+          IsNonReferenceVideoPacket(pkt, ctx)) {
+        ++nonref_drops;
+#ifdef FFPLAYER_VALIDATION
+        if (validation_packet_drop) validation_packet_drop();
+#endif
+        av_packet_free(&pkt);
+        continue;
       }
 
       int ret = video_decoder_->Decode(is_flush ? nullptr : pkt, on_frame);
       av_packet_free(&pkt);
+      if (recover) {
+        recover = false;
+        // The decode call has returned: no decoder callback can survive Flush.
+        // Do not hold the audio clock lock while waiting for the renderer or
+        // resetting MPP: both can block for much longer than an audio period.
+        bool recovering = false;
+        {
+          std::lock_guard<std::mutex> control(clock_update_mutex_);
+          if (is_running_.load() && !playback_controller_.IsPaused() &&
+              !playback_controller_.IsSeekRequested() && last_seek_serial == seek_serial_.load()) {
+            generation = ++video_generation_;
+            recovery_target = audio_clock_.GetClock();
+            video_recovering_.store(true);
+            recovering = true;
+          }
+        }
+        if (recovering) {
+          {
+            std::lock_guard<std::mutex> lock(frame_mutex_);
+            av_frame_free(&pending_frame_);
+#ifdef FFPLAYER_VALIDATION
+            if (validation_recovery) validation_recovery(generation);
+#endif
+          }
+          ready_frames_.Clear();
+          video_decoder_->Flush();
+          video_decoder_->SetSkipLevel(0);
+          replay_until_pts = -1;
+          synthetic_pts = -1;
+          finding_key = wait_keyframe = true;
+          last_recovery = monotonicSeconds();
+          ++recoveries;
+          LOG(INFO) << "SYNC recovery generation=" << generation << " target=" << recovery_target;
+        }
+        late_since = 0;
+      }
+      if (sync_trace_ && monotonicSeconds() - trace_time >= 0.5) {
+        trace_time = monotonicSeconds();
+        LOG(INFO) << "SYNC decode time=" << std::fixed << std::setprecision(6) << trace_time << " generation=" << generation
+                  << " lag=" << video_lag << " decode_seconds=" << video_decoder_->DecodeSeconds()
+                  << " callback_seconds=" << video_decoder_->CallbackSeconds()
+                  << " callback_drops=" << callback_drops_.load() << " present_drops=" << present_drops_.load()
+                  << " render_drops=" << render_drops_.load() << " preroll_drops=" << preroll_drops
+                  << " decoded_frames=" << decoded_frames << " skip_level=" << video_decoder_->GetSkipLevel()
+                  << " nonref_drops=" << nonref_drops << " packet_drops=" << packet_drops << " recoveries=" << recoveries;
+      }
 
       // ─── 硬解运行期故障：切软解并重放当前 GOP ───
       if (video_decoder_->NeedsFallback()) {
         if (!video_decoder_->FallbackToSoftware()) {
           LOG(ERROR) << "Video decoding unavailable, dropping video stream";
           video_dead = true;
-          gop.Reset();
           video_drained_serial_.store(last_seek_serial, std::memory_order_release);
           continue;
         }
         notifyVideoDecoderChanged();
+        ctx = video_decoder_->GetContext();
 
         ret = 0;
         replay_until_pts = last_output_pts;
-        if (gop.valid()) {
-          for (AVPacket *p : gop.packets()) {
-            if (!is_running_.load(std::memory_order_relaxed) ||
-                seek_serial_.load(std::memory_order_acquire) !=
-                    last_seek_serial)
-              break;
-            video_decoder_->Decode(p, on_frame);
-          }
-        } else {
+        if (!packet_cache_.ReplayVideo(last_seek_serial)) {
+          // Local caches may no longer retain this GOP. Wait for the next
+          // video keyframe instead of seeking and discarding continuous audio.
           wait_keyframe = true;
         }
-        gop.Reset();
+        else
+          continue;
         if (is_flush)
           ret = video_decoder_->Decode(nullptr, on_frame);
       }
@@ -1453,14 +1795,24 @@ private:
 #endif
 
     // 嵌入式默认输出最多立体声，多声道在滤镜内下混。
-    AudioDevice audio_out(48000, std::min(2, std::max(1, source_channels)));
+    AudioDevice audio_out(48000, std::min(2, std::max(1, source_channels)),
+        [this] { return playback_controller_.IsPaused() || buffer_hold_.load(); },
+        [this](bool paused, double latency) {
+          std::lock_guard<std::mutex> lock(clock_update_mutex_);
+          if (is_running_.load() && !playback_controller_.IsSeekRequested())
+            audio_clock_.ConfirmAudioPause(paused || buffer_hold_.load() || seeking_.load(), latency);
+        });
     if (!audio_out.IsValid()) {
       postPlaybackError(QStringLiteral("Cannot open ALSA audio output"));
       return;
     }
     AudioTempo tempo;
+    AudioSourceTimeline source_timeline;
     bool tempo_ready = false;
+    bool first_audio = true;
     double output_pts = 0.0;
+    int64_t source_pts = AV_NOPTS_VALUE, output_samples = 0;
+    double trace_time = 0;
     double rate = playbackRate();
     int last_seek_serial = seek_serial_.load(std::memory_order_acquire);
     const auto cancelled = [&]() {
@@ -1469,6 +1821,13 @@ private:
              seek_serial_.load(std::memory_order_acquire) != last_seek_serial;
     };
     const auto output = [&](AVFrame *frame) -> bool {
+      if (cancelled()) return false;
+      if (frame->nb_samples <= 0 || frame->sample_rate <= 0) return true;
+      audio_output_serial_.store(last_seek_serial, std::memory_order_release);
+      audio_waiting_.store(false, std::memory_order_release);
+      while (buffer_hold_.load(std::memory_order_acquire) && !cancelled())
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      if (!has_video_ && !cancelled()) completeSeek(last_seek_serial);
       while (playback_controller_.IsPaused() && !cancelled()) {
         audio_out.Pause(true);
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1480,24 +1839,54 @@ private:
       if (!audio_out.Feed(frame->data[0], bytes, cancelled))
         return false;
       const double output_duration = static_cast<double>(frame->nb_samples) / frame->sample_rate;
-      output_pts += output_duration * rate;
+      const double previous_pts = output_pts;
+      output_pts = std::max(previous_pts, source_timeline.At(tempo.OutputSourceEnd()));
+      const double clock_rate = (output_pts - previous_pts) / output_duration;
+      output_samples += frame->nb_samples;
+      const auto device = audio_out.GetPlaybackStats();
+#ifdef FFPLAYER_VALIDATION
+      if (validation_audio) validation_audio(output_pts, output_samples, frame->nb_samples, last_seek_serial);
+      if (validation_audio_device) validation_audio_device(device.dropped, device.underruns, device.flushes);
+#endif
       {
         std::lock_guard<std::mutex> lock(clock_update_mutex_);
         if (cancelled())
           return false;
-        audio_clock_.SetAudioClock(output_pts, output_duration, rate,
-                                   audio_out.GetCurrentLatencySeconds());
+        audio_clock_.SetAudioClock(output_pts, output_duration, clock_rate,
+                                   device.latency);
+      }
+      if (sync_trace_ && monotonicSeconds() - trace_time >= 0.5) {
+        trace_time = monotonicSeconds();
+        LOG(INFO) << "SYNC audio time=" << std::fixed << std::setprecision(6) << trace_time
+                  << " serial=" << last_seek_serial << " raw_pts=" << source_pts
+                  << " source_seconds=" << (source_pts == AV_NOPTS_VALUE ? -1 : source_pts * av_q2d(a_time_base_))
+                  << " output_samples=" << output_samples << " sample_rate=" << frame->sample_rate
+                  << " output_end=" << output_pts << " rate=" << rate << " clock_rate=" << clock_rate
+                  << " alsa_delay=" << device.latency << " audio_dropped=" << device.dropped
+                  << " audio_underruns=" << device.underruns << " audio_flushes=" << device.flushes
+                  << " clock=" << audio_clock_.GetClock();
       }
       return true;
     };
 
     const FrameCallback on_frame = [&](AVFrame *frame) -> bool {
+      if (first_audio) {
+        LOG(INFO) << "STARTUP stage=first-audio ms=" << (monotonicSeconds() - startup_at_) * 1000;
+        first_audio = false;
+      }
       if (cancelled())
         return false;
+      if (duration_ > 0 && discard_before_.load() >= duration_) return true;
       const int64_t raw_pts = frame->best_effort_timestamp != AV_NOPTS_VALUE
                                   ? frame->best_effort_timestamp : frame->pts;
+      source_pts = raw_pts;
+#ifdef FFPLAYER_VALIDATION
+      if (validation_audio_input && raw_pts != AV_NOPTS_VALUE)
+        validation_audio_input(raw_pts * av_q2d(a_time_base_),
+                               static_cast<double>(frame->nb_samples) / frame->sample_rate, last_seek_serial);
+#endif
       const double pts = raw_pts != AV_NOPTS_VALUE ? raw_pts * av_q2d(a_time_base_)
-                                                   : discard_before_.load();
+          : tempo_ready ? source_timeline.EndPts() : discard_before_.load();
       if (frame->sample_rate <= 0)
         return false;
       const double target = discard_before_.load();
@@ -1519,8 +1908,8 @@ private:
       }
       trimmed->nb_samples -= skip;
       // 滤镜以样本时间为基准，输出时钟由原始媒体 PTS 锚定。
-      trimmed->pts = av_rescale_q(raw_pts == AV_NOPTS_VALUE ? 0 : raw_pts,
-                                  a_time_base_, AVRational{1, frame->sample_rate}) + skip;
+      trimmed->pts = (raw_pts == AV_NOPTS_VALUE ? static_cast<int64_t>(std::llround(pts * frame->sample_rate))
+          : av_rescale_q(raw_pts, a_time_base_, AVRational{1, frame->sample_rate})) + skip;
       const double requested_rate = playbackRate();
       if (!tempo_ready) {
         rate = requested_rate;
@@ -1542,8 +1931,8 @@ private:
         }
         rate = requested_rate;
       }
-      if (!has_video_)
-        completeSeek(last_seek_serial);
+      source_timeline.Append(pts + static_cast<double>(skip) / frame->sample_rate,
+                             static_cast<double>(trimmed->nb_samples) / frame->sample_rate);
       const int ret = tempo.Process(trimmed, output);
       av_frame_free(&trimmed);
       if (ret < 0)
@@ -1565,18 +1954,29 @@ private:
       }
       AVPacket *pkt = nullptr;
       int packet_serial = 0;
-      if (!audio_pkt_queue_.Pop(pkt, true, 20, &packet_serial))
+      if (!packet_cache_.Pop(false, pkt, packet_serial, [this] {
+            return !is_running_.load() || playback_controller_.IsSeekRequested();
+          })) {
+        const bool empty = !eof_reached_.load() && !seeking_.load() &&
+            !playback_controller_.IsSeekRequested() && audio_out.GetCurrentLatencySeconds() <= 0.005;
+        audio_waiting_.store(empty, std::memory_order_release);
+        if (empty) audio_output_serial_.store(-1, std::memory_order_release);
         continue;
+      }
+      audio_waiting_.store(false, std::memory_order_release);
       if (packet_serial != seek_serial_.load(std::memory_order_acquire) ||
           playback_controller_.IsSeekRequested()) {
         av_packet_free(&pkt);
         continue;
       }
+      recordBufferedPacket(pkt, false, packet_serial);
       if (packet_serial != last_seek_serial) {
         audio_out.Flush();
         audio_decoder_->Flush();
         tempo.Reset();
+        source_timeline.Clear();
         tempo_ready = false;
+        output_samples = 0;
         last_seek_serial = packet_serial;
         audio_drained_serial_.store(-1);
       }
@@ -1603,11 +2003,9 @@ private:
   // 只负责音视频同步与交接帧，像素处理全部留给渲染线程/GPU。
   void presentThreadFunc() {
     double present_synthetic_pts = 0.0;
-    double frame_duration = (v_time_base_.num > 0 && v_time_base_.den > 0)
-                                ? av_q2d(v_time_base_)
-                                : 1.0 / 25.0;
+    const double frame_duration = v_packet_duration_ > 0 ? v_packet_duration_ : 1.0 / 25.0;
     int last_w = 0, last_h = 0;
-    auto last_present = std::chrono::steady_clock::now();
+    double trace_time = 0;
 
     while (is_running_.load(std::memory_order_acquire)) {
       // 暂停时休眠（但响应 seek）
@@ -1619,7 +2017,13 @@ private:
 
       AVFrame *frame = nullptr;
       int frame_serial = 0;
-      if (!ready_frames_.Pop(frame, true, 20, &frame_serial)) {
+      uint64_t frame_generation = 0;
+      if (!ready_frames_.Pop(frame, true, 20, &frame_serial, &frame_generation)) {
+        video_output_serial_.store(-1, std::memory_order_release);
+        video_waiting_.store(buffer_video_ && !video_recovering_.load() && !eof_reached_.load() &&
+            !seeking_.load() && !playback_controller_.IsSeekRequested() &&
+            video_drained_serial_.load() != seek_serial_.load() &&
+            packet_cache_.Empty(true), std::memory_order_release);
         const int eof_serial = seek_serial_.load(std::memory_order_acquire);
         // 解复用到达 EOF 且解码器已排空，才算真正播放完毕
         if (eof_reached_.load(std::memory_order_acquire) &&
@@ -1628,12 +2032,19 @@ private:
             !playback_controller_.IsSeekRequested() &&
             ready_frames_.Size() == 0) {
 
-          bool expected = false;
-          if (eof_signaled_.compare_exchange_strong(
-                  expected, true, std::memory_order_acq_rel)) {
+          bool notify = false;
+          {
+            // Serialize with the GUI seek reset. An old drain observation must
+            // not mark a new cached seek as already signaled or pause its output.
+            std::lock_guard<std::mutex> lock(clock_update_mutex_);
+            bool expected = false;
+            if (eof_serial == seek_serial_.load() && !playback_controller_.IsSeekRequested())
+              notify = eof_signaled_.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+          }
+          if (notify) {
             // 通知主线程处理 EOF（暂停而不是停止）
             const auto session = session_id_.load();
-            const int serial = seek_serial_.load();
+            const int serial = eof_serial;
             QMetaObject::invokeMethod(this, [this, session, serial]() {
               if (session == session_id_.load() && serial == seek_serial_.load() &&
                   eof_reached_.load() && !playback_controller_.IsSeekRequested())
@@ -1655,14 +2066,26 @@ private:
       double pts =
           detail::GetFramePts(frame, v_time_base_, present_synthetic_pts,
                               frame_duration, &audio_clock_);
-      if (frame_serial != seek_serial_.load() || playback_controller_.IsSeekRequested() ||
+      if (frame_generation != video_generation_.load() || frame_serial != seek_serial_.load() || playback_controller_.IsSeekRequested() ||
           pts + frame_duration < discard_before_.load()) {
+        av_frame_free(&frame);
+        continue;
+      }
+      video_waiting_.store(false, std::memory_order_release);
+      video_output_serial_.store(frame_serial, std::memory_order_release);
+      while (buffer_hold_.load(std::memory_order_acquire) && is_running_.load() &&
+             frame_generation == video_generation_.load() &&
+             frame_serial == seek_serial_.load() && !playback_controller_.IsSeekRequested())
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      if (!is_running_.load() || frame_generation != video_generation_.load() || playback_controller_.IsSeekRequested() ||
+          frame_serial != seek_serial_.load()) {
         av_frame_free(&frame);
         continue;
       }
 
       // 正常播放要等音频时钟建立；暂停 seek 则允许先显示目标画面。
       while (has_audio_ && !audio_clock_.IsStarted() && audio_drained_serial_.load() != seek_serial_.load() &&
+             frame_generation == video_generation_.load() &&
              is_running_.load() && !playback_controller_.IsSeekRequested())
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
@@ -1674,23 +2097,22 @@ private:
       if (audio_clock_.IsStarted() && !playback_controller_.IsPaused() && !seeking_.load()) {
         double diff = pts - audio_clock_.GetClock();
         if (std::abs(diff) < 300.0) {
-          if (diff < -0.15 &&
-              std::chrono::steady_clock::now() - last_present <
-                  kMaxDisplayGap) {
+          if (diff < -0.15) {
+            ++present_drops_;
             av_frame_free(&frame);
             continue;
           }
-          if (diff > 1.0 && !has_audio_) {
+          if (diff > 1.0 && !has_audio_ && frame_generation == 0) {
             // 纯视频时间戳跳变：重新对齐时钟而不是长时间等待
             audio_clock_.SetClock(pts, 0.0);
             diff = 0.0;
           }
-          // 精确等待到显示时刻（最长 1 秒，超过视为时间戳异常）
-          while (diff > 0.004 && diff <= 1.0 &&
+          // 恢复取得的未来关键帧也必须等待主时钟，长 GOP 可静帧数秒。
+          while (diff > 0.004 && (has_audio_ || frame_generation != 0 || diff <= 1.0) &&
                  is_running_.load(std::memory_order_relaxed) &&
+                 frame_generation == video_generation_.load() &&
                  frame_serial == seek_serial_.load() && !seeking_.load() &&
-                 !playback_controller_.IsSeekRequested() &&
-                 !playback_controller_.IsPaused()) {
+                 !playback_controller_.IsSeekRequested()) {
             std::this_thread::sleep_for(std::chrono::duration<double>(
                 std::min((diff - 0.002) / playbackRate(), 0.010)));
             diff = pts - audio_clock_.GetClock();
@@ -1709,14 +2131,20 @@ private:
       while (playback_controller_.IsPaused() && !seeking_.load() &&
              is_running_.load() && !playback_controller_.IsSeekRequested())
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      if (!is_running_.load() || playback_controller_.IsSeekRequested() ||
+      if (!is_running_.load() || frame_generation != video_generation_.load() || playback_controller_.IsSeekRequested() ||
           frame_serial != seek_serial_.load()) {
         av_frame_free(&frame);
         continue;
       }
-      publishFrame(frame, frame_serial);
+      if (!publishFrame(frame, frame_serial, frame_generation)) continue;
+      video_recovering_.store(false);
+      if (sync_trace_ && monotonicSeconds() - trace_time >= 0.5) {
+        trace_time = monotonicSeconds();
+        LOG(INFO) << "SYNC video time=" << std::fixed << std::setprecision(6) << trace_time
+                  << " serial=" << frame_serial << " video_pts=" << pts
+                  << " generation=" << frame_generation << " clock=" << audio_clock_.GetClock() << " rate=" << playbackRate();
+      }
       completeSeek(frame_serial);
-      last_present = std::chrono::steady_clock::now();
 
       if (w != last_w || h != last_h) {
         last_w = w;
@@ -1739,16 +2167,26 @@ private:
   }
 
   // 把帧交给渲染线程；渲染线程来不及取的旧帧直接释放
-  void publishFrame(AVFrame *frame, int serial) {
+  bool publishFrame(AVFrame *frame, int serial, uint64_t generation) {
+    if (first_handoff_.exchange(false))
+      LOG(INFO) << "STARTUP stage=first-frame-handoff ms=" << (monotonicSeconds() - startup_at_) * 1000;
     AVFrame *dropped = nullptr;
     {
       std::lock_guard<std::mutex> lock(frame_mutex_);
-      if (playback_controller_.IsSeekRequested() || serial != seek_serial_.load()) {
+      if (generation != video_generation_.load() || playback_controller_.IsSeekRequested() || serial != seek_serial_.load()) {
         av_frame_free(&frame);
-        return;
+        return false;
       }
       dropped = pending_frame_;
+      if (dropped) ++render_drops_;
       pending_frame_ = frame;
+      pending_generation_ = generation;
+#ifdef FFPLAYER_VALIDATION
+      if (validation_video) {
+        const auto timestamp = frame->best_effort_timestamp != AV_NOPTS_VALUE ? frame->best_effort_timestamp : frame->pts;
+        validation_video(timestamp * av_q2d(v_time_base_), serial, generation, audio_clock_.GetClock());
+      }
+#endif
     }
     av_frame_free(&dropped);
 
@@ -1762,6 +2200,7 @@ private:
           },
           Qt::QueuedConnection);
     }
+    return true;
   }
 
   // ─── 成员变量 ─────────────────────────────
@@ -1806,6 +2245,23 @@ private:
   QString video_decoder_name_;
   bool hardware_decoding_ = false;
   double last_reported_pos_ = 0.0;
+  bool buffering_ = false, buffer_video_ = false;
+  qreal buffer_progress_ = 0, buffered_duration_ = 0, buffered_position_ = 0, download_speed_ = 0;
+  double starvation_since_ = 0;
+  PacketCache::Config cache_config_, active_cache_config_;
+  PacketCache packet_cache_;
+  qreal cached_start_ = 0, cached_end_ = 0;
+  qint64 cache_used_ = 0;
+  bool initial_network_buffer_pending_ = false;
+  BufferingStats buffer_stats_;
+  std::atomic<uint64_t> buffer_stats_generation_{0};
+  std::atomic<int> buffer_stats_serial_{-1};
+  bool sync_trace_ = false;
+  DownloadRate download_rate_;
+  std::atomic<bool> buffer_hold_{false};
+  std::atomic<bool> read_waiting_{false};
+  std::atomic<bool> audio_waiting_{false}, video_waiting_{false};
+  std::atomic<int> audio_output_serial_{-1}, video_output_serial_{-1};
 
   // FFmpeg 组件
   std::unique_ptr<Demuxer> demuxer_;
@@ -1814,9 +2270,10 @@ private:
   int video_stream_index_ = -1;
 
   // 队列
-  PacketQueue video_pkt_queue_;
-  PacketQueue audio_pkt_queue_;
   FrameQueue ready_frames_;
+  std::atomic<uint64_t> video_generation_{0}, callback_drops_{0}, present_drops_{0}, render_drops_{0};
+  std::atomic<bool> video_recovering_{false};
+  uint64_t pending_generation_ = 0;
 
   // 同步 & 控制
   Clock audio_clock_; // 主时钟：有音频时由音频驱动，纯视频时由首帧启动
@@ -1831,6 +2288,7 @@ private:
   // 时间基
   AVRational v_time_base_ = {1, 25};
   AVRational a_time_base_ = {1, 48000};
+  double v_packet_duration_ = 0, a_packet_duration_ = 0;
 
   // 呈现 → 渲染 交接
   std::mutex frame_mutex_;
@@ -1840,9 +2298,15 @@ private:
 
   // 定时器
   QTimer *position_timer_ = nullptr;
+  QTimer *buffer_timer_ = nullptr;
+  QTimer *download_speed_timer_ = nullptr;
 
   // 工作线程
   std::thread open_thread_;
+  double startup_at_ = 0;
+  std::atomic<bool> first_handoff_{true};
+  std::mutex seek_control_mutex_;
+  std::atomic<bool> input_seek_pending_{false};
   std::thread read_thread_;
   std::thread video_thread_;
   std::thread audio_thread_;

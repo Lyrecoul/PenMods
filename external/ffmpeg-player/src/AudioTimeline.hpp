@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <deque>
 
 namespace ffmpeg_player {
@@ -67,6 +68,42 @@ public:
         return result;
     }
     return result + elapsed * tail_rate;
+  }
+};
+
+// Map the tempo filter's sample progress back onto the source timestamps.
+// Container PTS need not equal a cumulative nb_samples/sample_rate counter.
+// Keep the old knots until their delayed PCM has actually left the filter.
+class AudioSourceTimeline {
+  struct Point { double samples; double pts; };
+  std::deque<Point> points_;
+  double input_ = 0, output_ = 0, end_pts_ = 0;
+
+public:
+  void Clear() {
+    points_.clear();
+    input_ = output_ = end_pts_ = 0;
+  }
+  void Append(double pts, double duration) {
+    if (duration <= 0) return;
+    if (!std::isfinite(pts)) pts = end_pts_;
+    points_.push_back({input_, pts});
+    input_ += duration;
+    end_pts_ = pts + duration;
+  }
+  double EndPts() const { return end_pts_; }
+  double At(double source_time) {
+    output_ = source_time;
+    // Retain a short prefix for overlap-window corrections during a rate change.
+    while (points_.size() > 1 && points_[1].samples < output_ - 0.25)
+      points_.pop_front();
+    if (points_.empty()) return output_;
+    const Point *point = &points_.front();
+    for (const auto &candidate : points_) {
+      if (candidate.samples > output_) break;
+      point = &candidate;
+    }
+    return point->pts + output_ - point->samples;
   }
 };
 

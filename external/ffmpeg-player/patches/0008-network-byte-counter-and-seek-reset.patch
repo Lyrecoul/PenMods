@@ -1,0 +1,103 @@
+--- a/libavformat/url.h
++++ b/libavformat/url.h
+@@ -48,5 +48,7 @@ typedef struct URLContext {
+     int64_t rw_timeout;         /**< maximum time to wait for (network) read/write operation completion, in mcs */
+     const char *protocol_whitelist;
+     const char *protocol_blacklist;
++    struct URLContext *parent;
++    int64_t network_bytes_read;
+     int min_packet_size;        /**< if non zero, the stream is packetized with this min packet size */
+ } URLContext;
+--- a/libavformat/avio.h
++++ b/libavformat/avio.h
+@@ -276,8 +276,9 @@ typedef struct AVIOContext {
+     /**
+      * Bytes read statistic
+      * This field is internal to libavformat and access from outside is not allowed.
+      */
+     int64_t bytes_read;
++    int64_t network_bytes_read;
+ 
+     /**
+      * seek statistic
+--- a/libavformat/avio.c
++++ b/libavformat/avio.c
+@@ -314,5 +314,6 @@ int ffurl_open_whitelist(URLContext **puc, const char *filename, int flags,
+     int ret = ffurl_alloc(puc, filename, flags, int_cb);
+     if (ret < 0)
+         return ret;
++    (*puc)->parent = parent;
+     if (parent)
+         av_opt_copy(*puc, parent);
+@@ -376,1 +377,7 @@ static inline int retry_transfer_wrapper(URLContext *h, uint8_t *buf,
+         ret = transfer_func(h, buf + len, size - len);
++        if (ret > 0 && (h->flags & AVIO_FLAG_READ) &&
++            av_strstart(h->prot->name, "http", NULL)) {
++            URLContext *parent;
++            for (parent = h; parent; parent = parent->parent)
++                parent->network_bytes_read += ret;
++        }
+--- a/libavformat/aviobuf.c
++++ b/libavformat/aviobuf.c
+@@ -46,2 +46,4 @@ typedef struct AVIOInternal {
+     URLContext *h;
++    AVIOContext *avio;
++    int64_t network_bytes_read;
+ } AVIOInternal;
+@@ -876,4 +878,10 @@ static int io_read_packet(void *opaque, uint8_t *buf, int buf_size)
+ {
+     AVIOInternal *internal = opaque;
+-    return ffurl_read(internal->h, buf, buf_size);
++    int ret = ffurl_read(internal->h, buf, buf_size);
++    const int64_t total = internal->h->network_bytes_read;
++    if (total > internal->network_bytes_read) {
++        internal->avio->network_bytes_read += total - internal->network_bytes_read;
++        internal->network_bytes_read = total;
++    }
++    return ret;
+ }
+@@ -937,6 +945,9 @@ int ffio_fdopen(AVIOContext **s, URLContext *h)
+     *s = avio_alloc_context(buffer, buffer_size, h->flags & AVIO_FLAG_WRITE,
+                             internal, io_read_packet, io_write_packet, io_seek);
+     if (!*s)
+         goto fail;
++    internal->avio = *s;
++    internal->network_bytes_read = h->network_bytes_read;
++    (*s)->network_bytes_read = 0;
+ 
+     (*s)->protocol_whitelist = av_strdup(h->protocol_whitelist);
+--- a/libavformat/hls.c
++++ b/libavformat/hls.c
+@@ -2112,8 +2112,12 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
+             ff_format_io_close(pls->parent, &pls->input);
+         av_packet_unref(&pls->pkt);
+         reset_packet(&pls->pkt);
++        pls->cur_seg_offset = 0;
++        pls->pb.error = 0;
+         pls->pb.eof_reached = 0;
+         /* Clear any buffered data */
+         pls->pb.buf_end = pls->pb.buf_ptr = pls->pb.buffer;
++        pls->pb.buf_ptr_max = pls->pb.buffer;
++        pls->pb.checksum_ptr = NULL;
+         /* Reset the pos, to let the mpegts demuxer know we've seeked. */
+         pls->pb.pos = 0;
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -1730,8 +1730,17 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t seek_pos_msec, int flags)
+ 
+     // single fragment mode
+     if (pls->n_fragments == 1) {
++        AVIOContext *pb = pls->ctx->pb;
+         pls->cur_timestamp = 0;
+         pls->cur_seg_offset = 0;
++        pls->is_restart_needed = 0;
++        if (pb) {
++            pb->error = 0;
++            pb->eof_reached = 0;
++            pb->buf_ptr = pb->buf_end = pb->buffer;
++            pb->buf_ptr_max = pb->buffer;
++            pb->checksum_ptr = NULL;
++        }
+         ff_read_frame_flush(pls->ctx);
+         return av_seek_frame(pls->ctx, -1, seek_pos_msec * 1000, flags);
+     }

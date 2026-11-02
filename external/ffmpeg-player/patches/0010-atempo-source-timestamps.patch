@@ -1,0 +1,48 @@
+--- a/libavfilter/af_atempo.c
++++ b/libavfilter/af_atempo.c
+@@ -43,6 +43,7 @@
+ #include "libavutil/avassert.h"
+ #include "libavutil/avstring.h"
+ #include "libavutil/channel_layout.h"
++#include "libavutil/dict.h"
+ #include "libavutil/eval.h"
+ #include "libavutil/opt.h"
+ #include "libavutil/samplefmt.h"
+@@ -147,6 +148,7 @@
+     uint8_t *dst_end;
+     uint64_t nsamples_in;
+     uint64_t nsamples_out;
++    int source_timestamps;
+ } ATempoContext;
+ 
+ #define OFFSET(x) offsetof(ATempoContext, x)
+@@ -155,6 +157,9 @@
+     { "tempo", "set tempo scale factor",
+       OFFSET(tempo), AV_OPT_TYPE_DOUBLE, { .dbl = 1.0 }, 0.5, 2.0,
+       AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_FILTERING_PARAM },
++    { "source_timestamps", "export source sample progress without changing output PTS",
++      OFFSET(source_timestamps), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1,
++      AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_FILTERING_PARAM },
+     { NULL }
+ };
+ 
+@@ -1068,6 +1073,19 @@
+                      (AVRational){ 1, outlink->sample_rate },
+                      outlink->time_base);
+ 
++    if (atempo->source_timestamps) {
++        /* A tempo command moves the origin inside an overlap window. The
++         * caller cannot reconstruct this from output samples * latest tempo.
++         * Keep normal output PTS and attach the source coordinate per frame. */
++        const double source_end = atempo->origin[0] +
++            ((double)atempo->nsamples_out + n_out - atempo->origin[1]) * atempo->tempo;
++        ret = av_dict_set_int(&atempo->dst_buffer->metadata,
++                              "lavfi.atempo.source_end_us",
++                              llrint(source_end * AV_TIME_BASE / outlink->sample_rate), 0);
++        if (ret < 0)
++            return ret;
++    }
++
+     ret = ff_filter_frame(outlink, atempo->dst_buffer);
+     atempo->dst_buffer = NULL;
+     atempo->dst        = NULL;

@@ -17,6 +17,15 @@ private:
   AudioTimeline buffered_audio_;
   bool paused = false;
   bool is_set = false;
+  bool audio_master_ = false;
+
+  double Advance(double elapsed) const {
+    // Once queued PCM runs out, wall time cannot prove that any more audio
+    // played. Pure-video clocks still extrapolate without an audio boundary.
+    if (audio_master_)
+      elapsed = std::min(elapsed, buffered_audio_.Duration());
+    return buffered_audio_.Advance(elapsed, rate_);
+  }
 
   double GetSystemTime() const {
     // 使用 steady_clock，不受系统时间调整影响
@@ -37,6 +46,7 @@ public:
     last_updated = GetSystemTime();
     last_latency = latency_seconds;
     buffered_audio_.Clear();
+    audio_master_ = false;
     is_set = true;
   }
 
@@ -44,12 +54,15 @@ public:
   void SetAudioClock(double end_pts, double duration, double rate,
                      double latency_seconds) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
+    const bool was_paused = paused;
     buffered_audio_.Append(duration, rate);
     buffered_audio_.TrimTo(latency_seconds);
-    last_pts = end_pts - buffered_audio_.MediaDuration();
+    if (!was_paused)
+      last_pts = end_pts - buffered_audio_.MediaDuration();
     last_updated = GetSystemTime();
     last_latency = latency_seconds;
     rate_ = rate;
+    audio_master_ = true;
     is_set = true;
   }
 
@@ -61,7 +74,7 @@ public:
       return 0; // 如果音频没开始，返回 0
     if (paused)
       return last_pts;
-    return last_pts + buffered_audio_.Advance(GetSystemTime() - last_updated, rate_);
+    return last_pts + Advance(GetSystemTime() - last_updated);
   }
 
   // 获取最新的音频缓冲区延迟（秒）
@@ -72,10 +85,11 @@ public:
 
   void SetRate(double rate) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
+    const double now = GetSystemTime();
     last_pts = GetClock();
+    buffered_audio_.TrimTo(buffered_audio_.Duration() - (paused ? 0 : now - last_updated));
     rate_ = rate;
-    last_updated = GetSystemTime();
-    buffered_audio_.Clear();
+    last_updated = now;
   }
 
   // 处理暂停/恢复时的时钟补偿
@@ -86,7 +100,7 @@ public:
     const double now = GetSystemTime();
     if (p && is_set) {
       const double elapsed = now - last_updated;
-      last_pts += buffered_audio_.Advance(elapsed, rate_);
+      last_pts += Advance(elapsed);
       buffered_audio_.TrimTo(buffered_audio_.Duration() - elapsed);
     }
     last_updated = now;
@@ -98,6 +112,18 @@ public:
     return is_set;
   }
 
+  void ConfirmAudioPause(bool pause, double latency) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (audio_master_ && is_set) {
+      const double before = buffered_audio_.MediaDuration();
+      buffered_audio_.TrimTo(latency);
+      last_pts += before - buffered_audio_.MediaDuration();
+      last_latency = latency;
+    }
+    last_updated = GetSystemTime();
+    paused = pause;
+  }
+
   // 重置时钟状态
   void Reset() {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
@@ -107,6 +133,7 @@ public:
     buffered_audio_.Clear();
     paused = false;
     is_set = false;
+    audio_master_ = false;
   }
 };
 

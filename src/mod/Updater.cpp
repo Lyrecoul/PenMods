@@ -238,7 +238,8 @@ void Updater::download() { UpdateCenter::getInstance().downloadComponent("core")
 
 namespace {
 const QStringList& otaProxies() {
-    static const QStringList proxies = {"https://gh-proxy.com/", "https://ghproxy.net/", "https://gh-proxy.org/"};
+    static const QStringList proxies =
+        {"https://gh-proxy.com/", "https://ghproxy.net/", "https://gh-proxy.org/", "https://githubproxy.cc/"};
     return proxies;
 }
 bool validSource(const QString& text) {

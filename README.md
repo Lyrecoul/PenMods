@@ -2,7 +2,7 @@
 > 一般来说，你不需要手动下载 PenMods  
 > **V2.7.0 / V2.7.1 用户请先阅读：[启动故障修复与 V2.7.3 迁移教程](doc/RECOVERY_2.7.3.md)**。旧更新启动器存在冷启动故障，仅更新 core 无法修复，需执行新版完整迁移包。
 
-> **全新安装** 👉[Installer](https://github.com/PenUniverse/Installer)，安装后按[迁移步骤](doc/UPDATE_SYSTEM.md#手动安装迁移包)补齐更新启动器<br>
+> 已安装 PenMods 的设备，请按[迁移步骤](doc/UPDATE_SYSTEM.md#手动安装迁移包)更新启动器。完整迁移包不负责原厂系统首次安装。<br>
 > **从旧版更新** 👉系统自带的 OTA
 
 这里是 PenMods[^1] 的发布仓库。
@@ -150,7 +150,7 @@ P5/X5 | 🔴 | N/A | N/A | -
    - OTA 更新 Mod
 
 ### Installation
- - 请移步 [Installer](https://github.com/PenUniverse/Installer)
+ - 已安装 PenMods：使用当前 Release 的完整迁移包，参阅[更新系统说明](doc/UPDATE_SYSTEM.md#手动安装迁移包)。原厂系统首次安装需要匹配本项目的底座安装方案，当前迁移包不提供此功能。
 
 ### Contact Us
  - [官方社区](https://github.com/orgs/PenUniverse/discussions)

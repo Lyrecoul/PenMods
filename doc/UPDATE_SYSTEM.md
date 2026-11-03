@@ -63,14 +63,14 @@ python3 tools/package_update.py --component core --version 2.7.0 --source build/
 
 ## 手动安装迁移包
 
-首次通过外部 Installer 安装、或曾只替换动态库的设备，需要额外运行完整 OTA 包一次来安装独立更新启动器。新版页面提示“更新启动器尚未安装”时也使用此方法；单独下载主库和资源库无法补齐它。旧版客户端正常通过软件更新安装则会自动完成迁移。
+已有 PenMods 底座、但曾只替换动态库的设备，需要额外运行完整 OTA 包一次来安装独立更新启动器。新版页面提示“更新启动器尚未安装”时也使用此方法；单独下载主库和资源库无法补齐它。V2.7.0 / V2.7.1 的启动器存在冷启动故障，已安装的设备也应手动执行一次新版完整包，参见[修复教程](RECOVERY_2.7.3.md)。迁移包不负责原厂系统首次安装。
 
-从[对应 Release](https://github.com/Lyrecoul/PenMods/releases/tag/V2.7.0)下载 `update_v2.7.0.zip`，连接 ADB 后执行：
+从[对应 Release](https://github.com/Lyrecoul/PenMods/releases/tag/V2.7.3)下载 `update_v2.7.3.zip`，连接 ADB 后执行：
 
 ```sh
-adb shell "mkdir -p /userdisk/PenMods/install-2.7.0"
-adb push update_v2.7.0.zip /userdisk/PenMods/install-2.7.0/
-adb shell "cd /userdisk/PenMods/install-2.7.0 && unzip -o update_v2.7.0.zip && sh _do_update.sh"
+adb shell "mkdir -p /userdisk/PenMods/install-2.7.3"
+adb push update_v2.7.3.zip /userdisk/PenMods/install-2.7.3/
+adb shell "cd /userdisk/PenMods/install-2.7.3 && unzip -o update_v2.7.3.zip && sh _do_update.sh"
 ```
 
 命令成功后更新只处于待生效状态，回到软件更新页面刷新并重启应用即可；缺少新版页面的旧客户端可通过正常关机开机生效。不要直接覆盖正在运行的动态库。路径和启动脚本不匹配时迁移会报错并停止，不应手动伪造成功标记。

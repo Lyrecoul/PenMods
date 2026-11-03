@@ -1,0 +1,48 @@
+# BEGIN PenMods guarded launcher v2
+(
+    # Test the open in a child shell: a failed exec redirection is fatal in dash.
+    if [ -n "${LOG_FILE:-}" ] && ( : >> "$LOG_FILE" ) 2>/dev/null; then
+        exec >> "$LOG_FILE" 2>&1
+    elif ( : >> /tmp/penmods-launch.log ) 2>/dev/null; then
+        exec >> /tmp/penmods-launch.log 2>&1
+    fi
+    # The vendor app normally stops this boot watchdog during initialization.
+    # Component verification runs before the app and can exhaust its boot budget.
+    # Move that same handoff ahead of the helper; if it fails, start the app now.
+    penmods_watchdog_ready=1
+    if [ -e /sys/devices/virtual/misc/watchdog/control ]; then
+        if /bin/echo stop > /sys/devices/virtual/misc/watchdog/control; then
+            echo "penmods-launch: vendor boot watchdog stopped before verification"
+        else
+            echo "penmods-launch: cannot stop boot watchdog; bypassing helper"
+            penmods_watchdog_ready=0
+        fi
+    fi
+    echo "penmods-launch: starting helper"
+    # stdbuf belongs to the app, not the helper (it injects an LD_PRELOAD).
+    if [ "$penmods_watchdog_ready" = 0 ]; then
+        penmods_result=125
+    elif /userdata/PenMods/penmods-update run -- stdbuf -o0 ./YoudaoDictPen -platform wayland; then
+        penmods_result=0
+    else
+        penmods_result=$?
+    fi
+    case "$penmods_result" in
+        0|129|130|131|143) ;;
+        *)
+            echo "penmods-launch: helper failed ($penmods_result); starting original app"
+            unset PENMODS_UPDATE_ROOT PENMODS_UPDATE_GENERATION PENMODS_UPDATE_TOKEN
+            if stdbuf -o0 ./YoudaoDictPen -platform wayland; then
+                penmods_result=0
+            else
+                penmods_result=$?
+            fi
+            ;;
+    esac
+    # Always wait using a relative timer: cold-boot clock synchronization can
+    # jump wall time forward and must not defeat the stock <15s crash counter.
+    echo "penmods-launch: exit ($penmods_result); guardian cooldown"
+    sleep 16
+    exit "$penmods_result"
+)
+# END PenMods guarded launcher v2

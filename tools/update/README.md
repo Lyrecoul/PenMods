@@ -75,7 +75,7 @@ once as runDictPen.pre-penmods-update and replaces exactly this full line:
 
     stdbuf -o0 ./YoudaoDictPen -platform wayland > $LOG_FILE 2>&1
 
-with a guarded shell block (`BEGIN/END PenMods guarded launcher v2`). The block
+with a guarded shell block (`BEGIN/END PenMods guarded launcher v3`). The block
 runs the helper without stdbuf and passes `stdbuf -o0 ./YoudaoDictPen -platform
 wayland` as the child command instead, keeping stdbuf's preload out of the helper.
 Before verification it stops the vendor boot watchdog through
@@ -101,7 +101,8 @@ escalation through this entry. The shell guard is necessary because native helpe
 exception handling cannot cover its own dynamic loader or an outer redirection.
 
 Unknown/ambiguous layouts fail before writing. Re-running an exact guarded hook
-succeeds. The exact v1 hook is upgraded while retaining the original stock backup.
+succeeds. The exact v1 hook and the released v2 guarded hook are upgraded while
+retaining the original stock backup. Modified v2 blocks are rejected by hash.
 Host tests use sh install-launcher.sh --rootfs-prefix DIR. Issue #32 was reproduced
 on-device with repeated cold-boot resets and slot fallback. With the watchdog
 handoff moved before verification, both slots booted successfully: the hook stopped
@@ -111,6 +112,37 @@ fault-injection cases covered by the shell guard. Native `run` also registers it
 app command before probing `disabled`, so a filesystem exception during that early
 probe enters independent-backup recovery rather than returning 1 immediately.
 A deterministic ELOOP regression test covers this previously unprotected path.
+
+## Boot-scoped stock safe mode
+
+The v3 shell hook counts consecutive abnormal helper exits whose elapsed runtime
+is less than 60 seconds (including verification and app runtime). On the third
+failure it immediately starts the stock backup; subsequent guardian relaunches
+stay in stock mode for this boot. Exit 0 and HUP/INT/QUIT/TERM statuses, or a run
+lasting at least 60 seconds, clear the sequence. Candidate failures recovered
+inside the supervisor do not count unless the recovered run also exits quickly.
+The count is independent of the vendor guardian counter: the 16-second cooldown
+continues to protect against firmware escalation.
+
+State lives in `/tmp/penmods-launch-failures` and `/tmp/penmods-safe-mode`, so a
+full reboot retries PenMods. This detects fast exits, not a permanently hung app
+or a hardware/power reset. It does not modify the application, generation pointers,
+partitions, or the persistent update-system disabled marker.
+
+`penmods-update stock -- APP ARGS...` works without accessing the version store.
+It searches `APP.original_bak` then `APP.bak`, accepting executable regular files
+(no symlinks), 64 bytes to 32 MiB, with a little-endian AArch64 executable ELF
+header and no `libPenMods` string anywhere in the file. This is a conservative
+check for a mod-patched backup, not cryptographic firmware authenticity validation.
+Arguments, cwd and vendor environment are preserved, except that LD_PRELOAD,
+LD_AUDIT and update heartbeat variables are cleared. LD_LIBRARY_PATH entries for
+`/userdisk/Qtlib`, `/userdata/PenMods`, and managed objects are removed to bypass
+optional OCR/library overrides as well. No managed library aliases are rewritten.
+
+A missing/rejected backup or failed stock exec is logged; the hook stays in safe
+mode and retains its cooldown rather than retrying the mod. Recovery requires a
+usable helper and a stock backup. This cannot rescue a helper whose own loader is
+broken; its loader failure still receives the shell cooldown protection.
 
 ## Recovery and durability
 

@@ -30,7 +30,7 @@ class LauncherTests(unittest.TestCase):
                 watchdog.symlink_to('/dev/full')
             elif watchdog_mode == 'ok':
                 watchdog.write_text('running\n')
-            launcher.write_text(launcher.read_text().replace('/userdata/PenMods', str(mod)).replace('/tmp/penmods-launch.log', str(root / 'launch.log')).replace('/sys/devices/virtual/misc/watchdog/control', str(watchdog)))
+            launcher.write_text(launcher.read_text().replace('/userdata/PenMods', str(mod)).replace('/tmp/penmods-launch-', str(root / 'penmods-launch-')).replace('/tmp/penmods-safe-mode', str(root / 'penmods-safe-mode')).replace('/tmp/penmods-launch.log', str(root / 'launch.log')).replace('/sys/devices/virtual/misc/watchdog/control', str(watchdog)))
             app = root / "YoudaoDictPen"
             app.write_text('#!/bin/sh\nprintf "app:%s:%s\\n" "$*" "$PRESERVED" >> app-runs\nexit 0\n')
             app.chmod(0o755)
@@ -54,6 +54,56 @@ class LauncherTests(unittest.TestCase):
             if successful:
                 self.assertNotIn('helper failed', (root / 'app.log').read_text())
             self.assertTrue(sleeps and int(sleeps.strip()) >= 16, 'fast return reaches guardian without cooldown')
+
+    def test_three_failures_enter_stock_until_next_boot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mod = root / 'userdata/PenMods'
+            mod.mkdir(parents=True)
+            helper = mod / 'penmods-update'
+            helper.write_text('#!/bin/sh\necho "$1" >> calls\nif [ "$1" = stock ]; then exit 0; fi\nexit "$(cat result)"\n')
+            helper.chmod(0o755)
+            launcher = root / 'usr/bin/runDictPen'
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text('#!/bin/sh\nset -eu\nstdbuf -o0 ./YoudaoDictPen -platform wayland > $LOG_FILE 2>&1\n')
+            subprocess.run(['sh', str(INSTALLER), '--rootfs-prefix', str(root)], check=True, capture_output=True)
+            clock = root / 'uptime'
+            clock.write_text('10.0 1.0\n')
+            launcher.write_text(launcher.read_text().replace('/userdata/PenMods', str(mod))
+                .replace('/tmp/penmods-', str(root / 'penmods-'))
+                .replace('/proc/uptime', str(clock))
+                .replace('/sys/devices/virtual/misc/watchdog/control', str(root / 'no-watchdog')))
+            app = root / 'YoudaoDictPen'
+            app.write_text('#!/bin/sh\nexit 42\n'); app.chmod(0o755)
+            bins = root / 'bin'; bins.mkdir()
+            sleep = bins / 'sleep'; sleep.write_text('#!/bin/sh\nexit 0\n'); sleep.chmod(0o755)
+            env = dict(os.environ, PATH=str(bins) + ':' + os.environ['PATH'], LOG_FILE=str(root / 'log'))
+            def run(code):
+                (root / 'result').write_text(str(code))
+                return subprocess.run(['sh', str(launcher)], cwd=root, env=env, timeout=5).returncode
+            count = root / 'penmods-launch-failures'
+            safe = root / 'penmods-safe-mode'
+            self.assertEqual(run(42), 42)
+            self.assertEqual(count.read_text().strip(), '1')
+            run(143)  # Intentional restart clears the sequence.
+            self.assertEqual(count.read_text().strip(), '0')
+            run(42); run(42)
+            self.assertFalse(safe.exists())
+            self.assertEqual(run(42), 0)
+            self.assertTrue(safe.exists())
+            before = (root / 'calls').read_text().count('run\n')
+            run(42)
+            self.assertEqual((root / 'calls').read_text().count('run\n'), before)
+            # Emulate reboot by clearing only boot-scoped state.
+            safe.unlink(); count.unlink()
+            run(42)
+            self.assertEqual(count.read_text().strip(), '1')
+            self.assertFalse(safe.exists())
+            # A long-lived process breaks the failure sequence.
+            helper.write_text(helper.read_text().replace('exit "$(cat result)"',
+                'echo "100.0 1.0" > uptime\nexit 42'))
+            run(42)
+            self.assertEqual(count.read_text().strip(), '0')
 
     def test_watchdog_stop_failure_bypasses_helper(self):
         self.run_hook(helper_body='touch helper-invoked; exit 0', watchdog_mode='failed')

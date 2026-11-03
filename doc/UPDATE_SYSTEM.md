@@ -77,6 +77,16 @@ adb shell "cd /userdisk/PenMods/install-2.7.0 && unzip -o update_v2.7.0.zip && s
 
 卸载后重装时，迁移先以 `init --reinstall-snapshot` 将当前安装的库重新快照为基线，清空旧 pending/trial，但保持实时别名与停用标记；只有新包暂存和启动入口安装均成功后才通过 `enable` 重新启用事务。失败时保持旁路启动。
 
+## 连续崩溃后的原厂安全模式
+
+v3 启动钩子独立于 Mod 记录快速异常退出：helper 返回异常退出码且运行不足 60 秒时加一，连续 3 次后立即运行同目录的原厂备份。正常退出、主动 HUP/INT/QUIT/TERM 重启，或运行满 60 秒后的退出会清零。该时长包含组件校验；内部候选回滚成功继续运行时不计一次失败。
+
+安全模式通过 `/tmp/penmods-safe-mode` 保持到本次关机；整机重启后重新尝试 Mod。计数 `/tmp/penmods-launch-failures` 与厂商 guardian 的计数独立，原有 16 秒退出冷却仍有效。安全模式不改系统槽位、应用文件、组件别名或持久 disabled 标记。
+
+原厂路径使用 `penmods-update stock -- APP ARGS...`，优先选择 `APP.original_bak`，其次 `APP.bak`；要求为可执行普通文件、AArch64 ELF、大小不超过 32 MiB，且文件内没有 `libPenMods` 字符串。链接、脚本、仍带 Mod 补丁的备份被拒绝；这不是原厂文件签名认证。启动时清除预加载和更新心跳变量，并排除 `/userdisk/Qtlib` 等 Mod 库覆盖路径，绕过可选 OCR。备份不可用时保留安全模式与冷却并记录错误，不转回崩溃的 Mod。
+
+该功能覆盖应用快速退出，不检测运行卡死或整机掉电，也依赖 helper 自身可运行。安装需同时更新独立 helper 并重新运行新版 `install-launcher.sh`；只更新 core 无法补齐。安装器支持严格验证后升级 v1/v2 钩子，并保留原启动脚本备份。
+
 ## 启动器与事务
 
 启动器路径为 `/userdata/PenMods/penmods-update`，存储根目录默认 `/userdisk/PenMods/update-system`。所有命令支持 `--root ROOT`；主机测试还可用 `--prefix PREFIX`。

@@ -237,6 +237,59 @@ int supervise(Store& store, char** argv) {
         // Keep guardian's watched process alive through the rollback/relaunch.
     }
 }
+int stockRun(char** argv) {
+    // Backups remain next to the vendor executable so its relative resources work.
+    // Never accept a symlink or a backup still containing the PenMods dependency.
+    auto     app = fs::absolute(argv[0]);
+    fs::path backup;
+    for (const auto& suffix : {".original_bak", ".bak"}) {
+        auto path = fs::path(app.string() + suffix);
+        try {
+            if (!fs::is_regular_file(fs::symlink_status(path)) || access(path.c_str(), X_OK) != 0) continue;
+            auto size = fs::file_size(path);
+            if (size < 64 || size > 32 * 1024 * 1024) continue;
+            std::ifstream              input(path, std::ios::binary);
+            std::vector<unsigned char> bytes(size);
+            if (!input.read(reinterpret_cast<char*>(bytes.data()), bytes.size())) continue;
+#ifdef PENMODS_UPDATE_TESTING
+            // Host integration tests execute real host ELF fixtures.
+            if (bytes.size() >= 20 && bytes[18] == 62 && bytes[19] == 0) bytes[18] = 183;
+#endif
+            validateElf(bytes, false);
+            const std::string dependency = "libPenMods";
+            if (std::search(bytes.begin(), bytes.end(), dependency.begin(), dependency.end()) != bytes.end()) continue;
+            backup = path;
+            break;
+        } catch (const std::exception& error) {
+            std::cerr << "penmods-update: rejected stock backup " << path << ": " << error.what() << '\n';
+        }
+    }
+    if (backup.empty()) fail("no executable unmodified stock backup; restore YoudaoDictPen.original_bak or .bak");
+    for (const auto* name :
+         {"LD_PRELOAD", "LD_AUDIT", "PENMODS_UPDATE_ROOT", "PENMODS_UPDATE_GENERATION", "PENMODS_UPDATE_TOKEN"})
+        unsetenv(name);
+    // Optional OCR uses a C++ replacement in this directory. A stock rescue must
+    // use vendor OCR and must not follow managed component aliases there.
+    std::string        libraries;
+    std::istringstream paths(getenv("LD_LIBRARY_PATH") ? getenv("LD_LIBRARY_PATH") : "");
+    std::string        path;
+    while (std::getline(paths, path, ':')) {
+        if (path.empty()) continue;
+        auto normalized = fs::path(path).lexically_normal();
+        if (normalized == "/userdisk/Qtlib/" || normalized == "/userdisk/Qtlib" || normalized == "/userdata/PenMods/"
+            || normalized == "/userdata/PenMods" || path.find("/PenMods/update-system/") != std::string::npos)
+            continue;
+        if (!libraries.empty()) libraries += ':';
+        libraries += path;
+    }
+    setenv("LD_LIBRARY_PATH", libraries.c_str(), 1);
+    std::cerr << "penmods-update: safe mode; launching stock backup " << backup << '\n';
+    // Preserve the original arguments. No store preparation or alias writes.
+    argv[0] = const_cast<char*>(backup.c_str());
+    execv(argv[0], argv);
+    perror("penmods-update exec stock backup");
+    return 127;
+}
 int emergencyRun(const fs::path& root, const fs::path& prefix, char** argv) {
     auto mod            = prefix.empty() ? fs::path("/userdata/PenMods") : prefix / "userdata/PenMods";
     auto mainBackup     = mod / "libPenMods.so.pre-update-system";
@@ -330,9 +383,13 @@ int main(int argc, char** argv) {
         if (i >= argc)
             fail(
                 "usage: penmods-update [--root DIR] [--prefix DIR] [--core-version X.Y.Z] status|init|stage DESCRIPTOR "
-                "ZIP|cancel|run -- APP ARGS..."
+                "ZIP|cancel|stock -- APP ARGS...|run -- APP ARGS..."
             );
         std::string command = argv[i++];
+        if (command == "stock" && i < argc && std::string(argv[i]) == "--") {
+            if (++i >= argc) fail("stock app command missing");
+            return stockRun(argv + i);
+        }
         Store       store(root, prefix);
         store.coreVersion = coreVersion;
         version(coreVersion);

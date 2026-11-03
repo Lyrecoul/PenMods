@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import stat
 import struct
 import subprocess
@@ -263,6 +264,14 @@ for seq in range(20):
         subprocess.run(command, check=True, capture_output=True)
         self.assertEqual(launcher.read_bytes(), snapshot)
         self.assertEqual(backup.read_text(), original)
+        # Upgrade the exact released v2 guarded block, retaining the stock backup.
+        old_block = Path(__file__).with_name("fixtures").joinpath("launcher-v2.block").read_text()
+        launcher.write_text(original.replace(original.splitlines()[2] + '\n', old_block))
+        subprocess.run(command, check=True, capture_output=True)
+        self.assertEqual(launcher.read_bytes(), snapshot)
+        self.assertEqual(backup.read_text(), original)
+        launcher.write_text(launcher.read_text().replace('sleep 16', 'sleep 1'))
+        self.assertNotEqual(subprocess.run(command, capture_output=True).returncode, 0)
         launcher.write_text(original.replace("wayland", "linuxfb"))
         result = subprocess.run(command, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
@@ -313,6 +322,39 @@ for seq in range(20):
         self.call("run", "--", *self.app("healthy"))
         self.assertEqual(self.status()["active"], pending)
         self.assertIsNone(self.status()["pending"])
+
+    def test_stock_backup_bypasses_mod_store_and_cleans_environment(self):
+        app = self.base / 'YoudaoDictPen'
+        backup = Path(str(app) + '.bak')
+        shutil.copyfile('/bin/sh', backup)
+        backup.chmod(0o755)
+        # Prefer the original_bak only when it is actually unmodified.
+        modified = Path(str(app) + '.original_bak')
+        shutil.copyfile(backup, modified)
+        with modified.open('ab') as output:
+            output.write(b'libPenMods.so')
+        modified.chmod(0o755)
+        (self.root / 'state.json').write_text('{')
+        before = (self.mod / 'libPenMods.so').readlink()
+        result = self.call('stock', '--', app, '-c',
+            'printf "%s|%s|%s|%s|%s|%s" "$LD_PRELOAD" "$LD_AUDIT" "$PENMODS_UPDATE_ROOT" "$PENMODS_UPDATE_TOKEN" "$LD_LIBRARY_PATH" "$1"',
+            'fixture', 'preserved-arg', env={
+                'LD_PRELOAD': '/missing-injected-library.so',
+                'LD_AUDIT': '/missing-audit.so',
+                'PENMODS_UPDATE_ROOT': 'bad-root', 'PENMODS_UPDATE_TOKEN': 'bad-token',
+                'PENMODS_UPDATE_GENERATION': 'bad-generation',
+                'LD_LIBRARY_PATH': '/userdisk/Qtlib/:/vendor/libs:/userdata/PenMods:/userdisk/PenMods/update-system/objects/test'})
+        self.assertEqual(result.stdout, '||||/vendor/libs|preserved-arg')
+        self.assertIn('safe mode; launching stock backup', result.stderr)
+        self.assertEqual((self.mod / 'libPenMods.so').readlink(), before)
+        self.assertEqual((self.root / 'state.json').read_text(), '{')
+        backup.unlink()
+        self.call('stock', '--', app, ok=False)
+        backup.symlink_to('/bin/sh')
+        self.call('stock', '--', app, ok=False)
+        backup.unlink()
+        backup.write_text('#!/bin/sh\nexit 0\n'); backup.chmod(0o755)
+        self.call('stock', '--', app, ok=False)
 
     def test_disabled_probe_error_still_uses_emergency_backup(self):
         # ELOOP models an inaccessible disabled marker before prepare() starts.

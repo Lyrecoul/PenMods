@@ -19,6 +19,7 @@
 
 #include "helper/BluetoothStorage.h"
 #include "helper/CaCertificates.h"
+#include "tweaker/ReadingLoop.h"
 
 #include "Version.h"
 
@@ -407,6 +408,7 @@ __attribute__((constructor)) static void BeforeMain() {
     INSTANCE(LoggerMonitor);
     INSTANCE(OcrBackend);
     INSTANCE(QueryTweaks);
+    INSTANCE(ReadingLoop);
     INSTANCE(TextBookHelper);
     INSTANCE(TouchCalibration);
     INSTANCE(VpuUnlock);

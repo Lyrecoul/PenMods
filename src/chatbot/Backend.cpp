@@ -297,6 +297,7 @@ ChatBot::ChatBot()
 }
 
 ChatBot::~ChatBot() {
+    cancelTitleRequest();
     finishSessionSaves();
     // 清理排队/待确认/正在执行的 shell 命令；进程组 kill 在 cleanupShellExec 中处理。
     m_pendingShellExecs.clear();
@@ -317,8 +318,10 @@ void ChatBot::reloadConfig() {
 
 // 仅重读 ai 配置并刷新内存状态；不创建任何新连接/单例，供 reloadConfig 与 resetService 复用。
 void ChatBot::applyAiConfigReload() {
+    cancelTitleRequest();
     auto& config = mod::Config::getInstance();
     config.reload();
+    emit autoTitleSettingsChanged();
 
     json aiCfg = config.read("ai");
     if (aiCfg.is_object()) {
@@ -351,9 +354,11 @@ void ChatBot::applyAiConfigReload() {
 }
 
 void ChatBot::sanitizeConfig() {
+    cancelTitleRequest();
     auto& config = mod::Config::getInstance();
     config.sanitize();
     config.reload();
+    emit autoTitleSettingsChanged();
 
     json aiCfg = config.read("ai");
     if (aiCfg.is_object()) {
@@ -728,7 +733,41 @@ static bool normalizeHistoryMessages(QVector<MessageData>& messages, int* droppe
 // 保存 sessions.json
 // -----------------------------------------------------------------------
 
+// QVector can detach on a non-const read. Compare values before treating a new backing store as a conversation edit.
+static bool sameConversation(const QVector<MessageData>& left, const QVector<MessageData>& right) {
+    if (left.size() != right.size()) return false;
+    if (left.constData() == right.constData()) return true;
+    for (int i = 0; i < left.size(); ++i) {
+        const auto& a = left[i];
+        const auto& b = right[i];
+        if (a.messageId != b.messageId || a.role != b.role || a.content != b.content || a.reasoning != b.reasoning
+            || a.toolCallId != b.toolCallId || a.toolCallsJson != b.toolCallsJson || a.toolStates != b.toolStates
+            || a.parts.size() != b.parts.size())
+            return false;
+        for (int j = 0; j < a.parts.size(); ++j) {
+            const auto& p = a.parts[j];
+            const auto& q = b.parts[j];
+            if (p.type != q.type || p.text != q.text || p.url != q.url || p.data != q.data || p.format != q.format
+                || p.localPath != q.localPath || p.name != q.name || p.mimeType != q.mimeType
+                || p.language != q.language || p.size != q.size)
+                return false;
+        }
+    }
+    return true;
+}
+
 void ChatBot::saveSessions() {
+    bool changed = false;
+    for (auto it = m_sessions.begin(); it != m_sessions.end(); ++it) {
+        const auto old = m_observedMessages.constFind(it.key());
+        if (old == m_observedMessages.constEnd() ? !it->messages.isEmpty()
+                                                 : !sameConversation(old.value(), it->messages)) {
+            it->lastConversationAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+            changed                = true;
+        }
+        m_observedMessages[it.key()] = it->messages;
+    }
+    if (changed) emit sessionsChanged();
     m_sessionsDirty = true;
     // Before QCoreApplication exists, there is no timer dispatcher.
     if (!QCoreApplication::instance()) return;
@@ -782,25 +821,43 @@ bool ChatBot::writeSessions(const QMap<QString, SessionData>& sessions, const QS
                 && file.commit();
         };
         json root;
-        root["activeSessionId"] = activeId.toStdString();
+        root["activeSessionId"] = sessions.contains(activeId) && !sessions[activeId].messages.isEmpty()
+                                    ? activeId.toStdString()
+                                    : std::string();
         root["sessions"]        = json::array();
         QMap<QString, QString> files;
         for (auto it = sessions.constBegin(); it != sessions.constEnd(); ++it) {
-            const auto& session   = it.value();
-            const auto  old       = m_persistedSessions.constFind(it.key());
-            QString     name      = m_sessionFiles.value(it.key());
-            const bool  unchanged = old != m_persistedSessions.constEnd() && old->title == session.title
-                                 && old->createdAt == session.createdAt && old->updatedAt == session.updatedAt
-                                 && old->messages.size() == session.messages.size()
-                                 && old->messages.constData() == session.messages.constData();
+            const auto& session = it.value();
+            if (session.messages.isEmpty()) continue;
+            const auto old       = m_persistedSessions.constFind(it.key());
+            QString    name      = m_sessionFiles.value(it.key());
+            const bool unchanged = old != m_persistedSessions.constEnd() && old->title == session.title
+                                && old->createdAt == session.createdAt && old->updatedAt == session.updatedAt
+                                && old->lastConversationAt == session.lastConversationAt
+                                && old->manualTitle == session.manualTitle
+                                && old->completedRounds == session.completedRounds
+                                && old->titleAttemptRound == session.titleAttemptRound
+                                && old->lastCompletedUserId == session.lastCompletedUserId
+                                && old->completedUserIds == session.completedUserIds
+                                && old->messages.size() == session.messages.size()
+                                && old->messages.constData() == session.messages.constData();
             if (!unchanged || name.isEmpty()) {
                 json data = {
-                    {"id",        session.id.toStdString()       },
-                    {"title",     session.title.toStdString()    },
-                    {"createdAt", session.createdAt.toStdString()},
-                    {"updatedAt", session.updatedAt.toStdString()},
-                    {"messages",  json::array()                  }
+                    {"id",                  session.id.toStdString()                 },
+                    {"title",               session.title.toStdString()              },
+                    {"createdAt",           session.createdAt.toStdString()          },
+                    {"updatedAt",           session.updatedAt.toStdString()          },
+                    {"lastConversationAt",  session.lastConversationAt.toStdString() },
+                    {"manualTitle",         session.manualTitle                      },
+                    {"completedRounds",     session.completedRounds                  },
+                    {"titleAttemptRound",   session.titleAttemptRound                },
+                    {"lastCompletedUserId", session.lastCompletedUserId.toStdString()},
+                    {"messages",            json::array()                            }
                 };
+                data["completedUserIds"] = json::array();
+                auto completedUserIds = session.completedUserIds.values();
+                std::sort(completedUserIds.begin(), completedUserIds.end());
+                for (const auto& id : completedUserIds) data["completedUserIds"].push_back(id.toStdString());
                 for (const auto& message : session.messages) data["messages"].push_back(messageDataToJson(message));
                 const auto payload = data.dump();
                 name =
@@ -863,6 +920,24 @@ void ChatBot::initSessions() {
                     session.title     = QString::fromStdString(sessionObj.value("title", "未命名对话"));
                     session.createdAt = QString::fromStdString(sessionObj.value("createdAt", ""));
                     session.updatedAt = QString::fromStdString(sessionObj.value("updatedAt", ""));
+                    session.lastConversationAt =
+                        QString::fromStdString(sessionObj.value("lastConversationAt", session.updatedAt.toStdString()));
+                    session.manualTitle =
+                        sessionObj.value("manualTitle", session.title != "新对话" && session.title != "未命名对话");
+                    session.completedRounds     = std::max(0, sessionObj.value("completedRounds", 0));
+                    session.titleAttemptRound   = std::max(0, sessionObj.value("titleAttemptRound", 0));
+                    session.lastCompletedUserId = QString::fromStdString(sessionObj.value("lastCompletedUserId", ""));
+                    const bool hasCompletedUserIds =
+                        sessionObj.contains("completedUserIds") && sessionObj["completedUserIds"].is_array();
+                    if (hasCompletedUserIds) {
+                        for (const auto& id : sessionObj["completedUserIds"]) {
+                            if (!id.is_string()) continue;
+                            const auto userId = QString::fromStdString(id.get<std::string>());
+                            if (!userId.isEmpty()) session.completedUserIds.insert(userId);
+                        }
+                    }
+                    if (!session.lastCompletedUserId.isEmpty())
+                        session.completedUserIds.insert(session.lastCompletedUserId);
 
                     if (sessionObj.contains("messages") && sessionObj["messages"].is_array()) {
                         for (const auto& msgObj : sessionObj["messages"]) {
@@ -931,7 +1006,34 @@ void ChatBot::initSessions() {
                     }
                     if (droppedOrphans > 0)
                         warn("会话 {} 丢弃了 {} 条找不到宿主的工具结果", session.id.toStdString(), droppedOrphans);
-                    if (!session.id.isEmpty()) m_sessions.insert(session.id, session);
+                    if (!hasCompletedUserIds) {
+                        // Old stores lack protocol status. Seed visible historical final answers once,
+                        // retaining the legacy last ID even when its messages have already been truncated.
+                        historySanitized = true;
+                        QString pendingUser;
+                        for (const auto& message : session.messages) {
+                            if (message.role == "user") pendingUser = message.messageId;
+                            else if (
+                                message.role == "assistant" && !pendingUser.isEmpty()
+                                && (message.toolCallsJson.isEmpty() || message.toolCallsJson == "[]")
+                                && (!message.content.isEmpty() || !message.parts.isEmpty())
+                            ) {
+                                session.completedUserIds.insert(pendingUser);
+                                if (!sessionObj.contains("completedRounds")) {
+                                    ++session.completedRounds;
+                                    session.lastCompletedUserId = pendingUser;
+                                }
+                                pendingUser.clear();
+                            }
+                        }
+                        // Historical rounds must not trigger a delayed first-round title after reload.
+                        if (!sessionObj.contains("completedRounds"))
+                            session.titleAttemptRound = session.completedRounds;
+                    }
+                    if (!session.id.isEmpty() && !session.messages.isEmpty()) {
+                        m_observedMessages[session.id] = session.messages;
+                        m_sessions.insert(session.id, session);
+                    }
                 }
             }
 
@@ -1668,11 +1770,11 @@ void ChatBot::persistPartialResponse() {
 QVariantList ChatBot::getToolStates() const {
     QVariantList states;
     for (const auto& message : currentMessages()) states += message.toolStates;
-    if (m_responseSessionId == m_currentSessionId && (!m_activeReplies.isEmpty() || !m_toolCallBatch.isEmpty())) {
+    if (m_responseSessionId == m_currentSessionId
+        && (m_activeReplies.size() > (m_titleReply ? 1 : 0) || !m_toolCallBatch.isEmpty())) {
         for (const auto& value : m_responseToolStates) {
             bool found = false;
-            for (const auto& stored : states)
-                found |= stored.toMap().value("key") == value.toMap().value("key");
+            for (const auto& stored : states) found |= stored.toMap().value("key") == value.toMap().value("key");
             if (!found) states.append(value);
         }
     }
@@ -2090,6 +2192,7 @@ QVariantList ChatBot::attachmentVariants(const QVector<MessagePart>& parts) cons
 // -----------------------------------------------------------------------
 
 void ChatBot::abortActiveReplies() {
+    cancelTitleRequest();
     const QList<QNetworkReply*> replies = m_activeReplies;
     m_activeReplies.clear();
 
@@ -2344,8 +2447,12 @@ void normalizeToolMessageSequence(QJsonArray& messages) {
 
 } // namespace
 
-void ChatBot::finishStream() {
+void ChatBot::finishStream(bool success) {
     if (m_streamEndEmitted) return;
+    flushEmbeddedContent();
+    // An unsuccessful terminal event/EOF still owns the text already shown to the user.
+    if (!success) persistPartialResponse();
+    if (success && !m_cancelled) completedRound();
     // Client tools continue after this response; only unfinished server tools end here.
     const auto states = m_responseToolStates;
     for (const auto& value : states) {
@@ -2356,7 +2463,6 @@ void ChatBot::finishStream() {
             publishTool(state);
         }
     }
-    flushEmbeddedContent();
     // A stream ending with incomplete client arguments must not leave a card
     // indefinitely preparing. Dispatched tools are pending/running by this point.
     const auto remaining = m_responseToolStates;
@@ -2480,6 +2586,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
 
     m_cancelled        = false;
     m_streamEndEmitted = false;
+    m_streamProtocolCompleted = false;
     m_responseMessageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
     m_responseSessionId = m_currentSessionId;
     m_responseToolStates.clear();
@@ -2657,7 +2764,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                     m_currentStreamBuffer.clear();
                     m_currentReasoningBuffer.clear();
                     m_toolCallsBuffer.clear();
-                    finishStream();
+                    finishStream(m_streamProtocolCompleted);
                     continue;
                 }
 
@@ -2762,9 +2869,10 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                         const auto response = obj.value("response").toObject();
                         const auto error = response.value("error").toObject();
                         const auto reason = error.value("message").toString(obj.value("message").toString("响应未完成"));
-                        emit errorOccurred("API 请求失败\n" + reason);
+                        flushEmbeddedContent();
+                        emit       errorOccurred("API 请求失败\n" + reason);
                         m_toolCallsBuffer.clear();
-                        finishStream();
+                        finishStream(false);
                     } else if (eventType == "response.completed") {
                         const QJsonObject response = obj["response"].toObject();
                         if (!obj["usage"].isObject() && response["usage"].isObject())
@@ -2778,12 +2886,13 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                             const QString detail = response["error"].toObject()["message"].toString(
                                 response["incomplete_details"].toObject()["reason"].toString("响应未完成")
                             );
+                            flushEmbeddedContent();
                             emit errorOccurred("API 请求失败\n" + detail);
-                            m_currentStreamBuffer.clear();
                             m_toolCallsBuffer.clear();
-                            finishStream();
+                            finishStream(false);
                             continue;
                         }
+                        m_streamProtocolCompleted = true;
                         if (m_serverToolCallActive) {
                             emit toolCallProgress(
                                 QString("已完成：%1")
@@ -2860,7 +2969,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                         m_currentReasoningBuffer.clear();
                         m_toolCallsBuffer.clear();
                         m_responseToolItemIndexes.clear();
-                        finishStream();
+                        finishStream(m_streamProtocolCompleted);
                     }
                     continue;
                 }
@@ -2869,6 +2978,8 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
                 QJsonArray choices = obj["choices"].toArray();
                 if (choices.isEmpty()) continue;
                 QJsonObject choice = choices[0].toObject();
+                if (choice["finish_reason"].isString())
+                    m_streamProtocolCompleted = choice["finish_reason"].toString() == "stop";
                 if (!choice.contains("delta")) continue;
 
                 QJsonObject delta = choice["delta"].toObject();
@@ -2968,7 +3079,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                 m_serverToolCallActive = false;
                 m_serverToolCallName.clear();
             }
-            finishStream();
+            finishStream(m_streamProtocolCompleted);
         } else {
             QByteArray    response = reply->readAll();
             QJsonDocument doc      = QJsonDocument::fromJson(response);
@@ -3033,6 +3144,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                     if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
                     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
                     saveSessions();
+                    completedRound();
                     emit messageReceived(content, true);
                     if (!generatedImages.isEmpty()) emit imageAttachmentsReceived(attachmentVariants(generatedImages));
                     emit messagesChanged();
@@ -3097,6 +3209,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                     if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
                     m_sessions[m_currentSessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
                     saveSessions();
+                    if (choice["finish_reason"].toString() == "stop") completedRound();
                     emit messageReceived(content, true);
                     emit messagesChanged();
                 }
@@ -3109,7 +3222,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
             return;
         }
 
-        if (isStream) finishStream();
+        if (isStream) finishStream(false);
 
         int        httpStatus   = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         QByteArray responseBody = reply->readAll();
@@ -4458,6 +4571,266 @@ QString ChatBot::getActivePrompt() {
 // 多会话管理
 // -----------------------------------------------------------------------
 
+json ChatBot::autoTitleConfig() const {
+    const auto ai = mod::Config::getInstance().read("ai");
+    if (!ai.is_object() || !ai.contains("auto_title") || !ai["auto_title"].is_object()) return json::object();
+    return ai["auto_title"];
+}
+
+bool ChatBot::getAutoTitleEnabled() const {
+    const auto cfg = autoTitleConfig();
+    return cfg.contains("enabled") && cfg["enabled"].is_boolean() && cfg["enabled"].get<bool>();
+}
+
+QString ChatBot::getAutoTitleModelId() const {
+    const auto cfg = autoTitleConfig();
+    return cfg.contains("modelId") && cfg["modelId"].is_string()
+             ? QString::fromStdString(cfg["modelId"].get<std::string>())
+             : QString();
+}
+
+int ChatBot::getAutoTitleFrequency() const {
+    const auto cfg = autoTitleConfig();
+    return cfg.contains("frequency") && cfg["frequency"].is_number_integer() && cfg["frequency"] == 3 ? 3 : 0;
+}
+
+void ChatBot::setAutoTitleConfig(const char* key, const json& value) {
+    auto ai = mod::Config::getInstance().read("ai");
+    if (!ai.is_object()) return;
+    auto cfg         = autoTitleConfig();
+    cfg[key]         = value;
+    ai["auto_title"] = cfg;
+    if (mod::Config::getInstance().write("ai", ai, true)) {
+        cancelTitleRequest();
+        emit autoTitleSettingsChanged();
+    }
+}
+
+void ChatBot::setAutoTitleEnabled(bool enabled) { setAutoTitleConfig("enabled", enabled); }
+void ChatBot::setAutoTitleModelId(const QString& id) { setAutoTitleConfig("modelId", id.toStdString()); }
+void ChatBot::setAutoTitleFrequency(int frequency) { setAutoTitleConfig("frequency", frequency == 3 ? 3 : 0); }
+
+void ChatBot::cancelTitleRequest() {
+    auto* reply  = m_titleReply;
+    m_titleReply = nullptr;
+    if (!reply) return;
+    m_activeReplies.removeAll(reply);
+    disconnect(reply, nullptr, this, nullptr);
+    if (!reply->isFinished()) reply->abort();
+    reply->deleteLater();
+}
+
+void ChatBot::completedRound() {
+    if (m_cancelled || m_responseSessionId != m_currentSessionId || !m_sessions.contains(m_currentSessionId)) return;
+    auto& session = m_sessions[m_currentSessionId];
+    if (session.messages.isEmpty()) return;
+    const auto& answer = session.messages.last();
+    if (answer.role != "assistant" || answer.messageId != m_responseMessageId
+        || (!answer.toolCallsJson.isEmpty() && answer.toolCallsJson != "[]")
+        || (answer.content.isEmpty() && answer.parts.isEmpty()))
+        return;
+    QString userId;
+    for (auto it = session.messages.crbegin(); it != session.messages.crend(); ++it) {
+        if (it->role == "user") {
+            userId = it->messageId;
+            break;
+        }
+    }
+    if (userId.isEmpty() || session.completedUserIds.contains(userId)) return;
+    session.completedUserIds.insert(userId);
+    session.lastCompletedUserId = userId;
+    ++session.completedRounds;
+    saveSessions();
+    const auto id  = m_currentSessionId;
+    const int  seq = m_requestSeq;
+    info("Auto-title round completed: session={}, round={}, user={}", id.toStdString(), session.completedRounds,
+         userId.toStdString());
+    QTimer::singleShot(0, this, [this, id, seq] { requestAutoTitle(id, seq); });
+}
+
+void ChatBot::requestAutoTitle(const QString& sessionId, int requestSeq) {
+    if (requestSeq != m_requestSeq || sessionId != m_currentSessionId || !m_sessions.contains(sessionId)
+        || !getAutoTitleEnabled() || m_cancelled)
+        return;
+    auto&     session   = m_sessions[sessionId];
+    const int round     = session.completedRounds;
+    const int frequency = getAutoTitleFrequency();
+    if (session.manualTitle || round <= session.titleAttemptRound
+        || (frequency == 0 ? round != 1 : round % frequency != 0))
+        return;
+    const auto modelId = getAutoTitleModelId().toStdString();
+    json       model;
+    for (const auto& candidate : m_modelsData["models"])
+        if (candidate.value("id", "") == modelId) {
+            model = candidate;
+            break;
+        }
+    if (!model.is_object()) {
+        warn("Auto-title skipped: selected model is missing (session={}, round={})", sessionId.toStdString(), round);
+        return;
+    }
+    const QString endpoint = QString::fromStdString(model.value("endpoint", ""));
+    const QString key      = QString::fromStdString(model.value("apiKey", ""));
+    if (endpoint.isEmpty() || key.isEmpty()) {
+        warn("Auto-title skipped: model endpoint/key is not configured (session={}, round={})",
+             sessionId.toStdString(), round);
+        return;
+    }
+
+    // Plain text only: never resolve attachments or copy inline image/audio payloads.
+    QString transcript;
+    for (const auto& message : session.messages) {
+        if (message.role != "user" && message.role != "assistant") continue;
+        if (!message.toolCallsJson.isEmpty() && message.toolCallsJson != "[]") continue;
+        QString text = message.content;
+        for (const auto& part : message.parts)
+            if (part.type == "text") text += "\n" + part.text;
+        if (text.contains("data:", Qt::CaseInsensitive) || text.contains("base64", Qt::CaseInsensitive)) continue;
+        transcript += message.role + ": " + text.left(1024) + "\n";
+        if (transcript.size() > 8000) transcript = transcript.right(8000);
+    }
+    if (transcript.trimmed().isEmpty()) return;
+    const QString prompt =
+        "请根据以下对话生成一个简短标题，不超过16个汉字。只输出标题，不要解释、引号或工具调用。\n\n" + transcript;
+    const bool  responses = model.value("apiProtocol", "chat_completions") == "responses";
+    const bool  anthropic = !responses && endpoint.contains("/messages");
+    QJsonObject body;
+    // Preserve provider-specific model parameters, then enforce a bounded text-only request.
+    if (model.contains("extraParams")) {
+        const auto       extra = model["extraParams"];
+        const QByteArray bytes = QByteArray::fromStdString(extra.is_string() ? extra.get<std::string>() : extra.dump());
+        body                   = QJsonDocument::fromJson(bytes).object();
+    }
+    for (const auto& field :
+         {"tools",
+          "tool_choice",
+          "parallel_tool_calls",
+          "stream_options",
+          "messages",
+          "input",
+          "instructions",
+          "response_format",
+          "text",
+          "modalities",
+          "audio",
+          "max_tokens",
+          "max_completion_tokens",
+          "max_output_tokens",
+          "previous_response_id",
+          "conversation",
+          "prompt",
+          "store"})
+        body.remove(field);
+    body["model"]  = QString::fromStdString(model.value("modelId", ""));
+    body["stream"] = false;
+    if (responses) {
+        body["input"]             = prompt;
+        body["store"]             = false;
+        body["max_output_tokens"] = 256;
+    } else {
+        body["messages"] = QJsonArray{
+            QJsonObject{{"role", "user"}, {"content", prompt}}
+        };
+        const auto name = body["model"].toString();
+        const bool completionLimit =
+            !anthropic
+            && (name.startsWith("o1") || name.startsWith("o3") || name.startsWith("o4") || name.startsWith("gpt-5"));
+        body[completionLimit ? "max_completion_tokens" : "max_tokens"] = 256;
+    }
+    QNetworkRequest request{QUrl(endpoint)};
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    if (anthropic) {
+        request.setRawHeader("x-api-key", key.toUtf8());
+        request.setRawHeader("anthropic-version", "2023-06-01");
+    } else request.setRawHeader("Authorization", ("Bearer " + key).toUtf8());
+    cancelTitleRequest();
+    session.titleAttemptRound = round; // Failures are bounded to one attempt per scheduled round.
+    saveSessions();
+    const auto configSnapshot       = autoTitleConfig();
+    const auto conversationSnapshot = session.messages;
+    auto*      reply = m_networkManager->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
+    m_titleReply     = reply;
+    m_activeReplies.append(reply); // Track every reply; title work emits no foreground stream signals.
+    info("Auto-title request started: session={}, round={}, protocol={}", sessionId.toStdString(), round,
+         responses ? "responses" : (anthropic ? "anthropic" : "chat-completions"));
+    auto payload = std::make_shared<QByteArray>();
+    connect(reply, &QNetworkReply::readyRead, this, [reply, payload] {
+        if (payload->size() + reply->bytesAvailable() > 64 * 1024) {
+            reply->abort();
+            return;
+        }
+        *payload += reply->readAll();
+    });
+    QTimer::singleShot(20000, reply, [reply] {
+        if (!reply->isFinished()) reply->abort();
+    });
+    connect(
+        reply,
+        &QNetworkReply::finished,
+        this,
+        [this,
+         reply,
+         payload,
+         sessionId,
+         requestSeq,
+         round,
+         configSnapshot,
+         conversationSnapshot,
+         model,
+         modelId,
+         responses,
+         anthropic] {
+            if (m_titleReply != reply) {
+                reply->deleteLater();
+                return;
+            }
+            m_titleReply = nullptr;
+            m_activeReplies.removeAll(reply);
+            const bool ok =
+                reply->error() == QNetworkReply::NoError && payload->size() + reply->bytesAvailable() <= 64 * 1024;
+            if (ok) *payload += reply->readAll();
+            reply->deleteLater();
+            if (!ok || requestSeq != m_requestSeq || sessionId != m_currentSessionId || !m_sessions.contains(sessionId)
+                || configSnapshot != autoTitleConfig()) {
+                warn("Auto-title reply rejected: session={}, round={}, networkOk={}, requestCurrent={}, sessionCurrent={}, configCurrent={}",
+                     sessionId.toStdString(), round, ok, requestSeq == m_requestSeq,
+                     sessionId == m_currentSessionId && m_sessions.contains(sessionId),
+                     configSnapshot == autoTitleConfig());
+                return;
+            }
+            bool sameModel = false;
+            for (const auto& candidate : m_modelsData["models"])
+                if (candidate.value("id", "") == modelId && candidate == model) sameModel = true;
+            auto& target = m_sessions[sessionId];
+            if (!sameModel || target.manualTitle || target.completedRounds != round
+                || !sameConversation(target.messages, conversationSnapshot))
+                return;
+            const auto object = QJsonDocument::fromJson(*payload).object();
+            QString    title;
+            if (responses) {
+                if (object["status"].toString() != "completed") return;
+                title = responseOutputText(object["output"].toArray());
+            } else if (anthropic) {
+                if (object["stop_reason"].toString() != "end_turn") return;
+                for (const auto& block : object["content"].toArray())
+                    if (block.toObject()["type"].toString() == "text") title += block.toObject()["text"].toString();
+            } else {
+                const auto choices = object["choices"].toArray();
+                if (choices.isEmpty()) return;
+                const auto choice = choices.first().toObject();
+                if (choice["finish_reason"].toString() != "stop") return;
+                title = choice["message"].toObject()["content"].toString();
+            }
+            title = splitEmbeddedContent(title).answer.simplified();
+            if (title.isEmpty() || title.size() > 80 || title.contains("data:", Qt::CaseInsensitive)) return;
+            target.title     = title.left(32);
+            target.updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+            saveSessions();
+            emit sessionsChanged();
+        }
+    );
+}
+
 QString ChatBot::getCurrentSessionId() { return m_currentSessionId; }
 
 QString ChatBot::getSessions() {
@@ -4467,12 +4840,14 @@ QString ChatBot::getSessions() {
 
     for (auto it = m_sessions.constBegin(); it != m_sessions.constEnd(); ++it) {
         const SessionData& session = it.value();
-        json               sessionObj;
-        sessionObj["id"]           = session.id.toStdString();
-        sessionObj["title"]        = session.title.toStdString();
-        sessionObj["createdAt"]    = session.createdAt.toStdString();
-        sessionObj["updatedAt"]    = session.updatedAt.toStdString();
-        sessionObj["messageCount"] = session.messages.size();
+        if (session.messages.isEmpty()) continue;
+        json sessionObj;
+        sessionObj["id"]                 = session.id.toStdString();
+        sessionObj["title"]              = session.title.toStdString();
+        sessionObj["createdAt"]          = session.createdAt.toStdString();
+        sessionObj["lastConversationAt"] = session.lastConversationAt.toStdString();
+        sessionObj["updatedAt"]          = session.updatedAt.toStdString();
+        sessionObj["messageCount"]       = session.messages.size();
         sessionsArr.push_back(sessionObj);
     }
     result["sessions"] = sessionsArr;
@@ -4487,11 +4862,17 @@ bool ChatBot::switchSession(const QString& sessionId) {
     if (m_currentSessionId == sessionId) return true;
 
     // 先收尾旧会话进行中的请求与工具调用
+    cancelTitleRequest();
     if (!m_activeReplies.isEmpty() || !m_toolCallBatch.isEmpty() || !m_pendingShellExecs.isEmpty()
         || !m_activeShellExecs.isEmpty() || !m_queuedShellExecs.isEmpty()) {
         cancelRequest();
     }
 
+    cancelTitleRequest();
+    if (m_sessions.contains(m_currentSessionId) && currentMessages().isEmpty()) {
+        m_observedMessages.remove(m_currentSessionId);
+        m_sessions.remove(m_currentSessionId);
+    }
     m_currentSessionId = sessionId;
     saveSessions();
     emit messagesChanged();
@@ -4503,6 +4884,11 @@ bool ChatBot::switchSession(const QString& sessionId) {
 }
 
 QString ChatBot::createSession(const QString& title) {
+    if (m_sessions.contains(m_currentSessionId) && currentMessages().isEmpty()) {
+        cancelRequest();
+        return m_currentSessionId;
+    }
+    cancelTitleRequest();
     SessionData session;
     session.id        = QUuid::createUuid().toString(QUuid::WithoutBraces);
     session.title     = title.isEmpty() ? "新对话" : title;
@@ -4525,6 +4911,7 @@ QString ChatBot::createSession(const QString& title) {
 }
 
 bool ChatBot::deleteSession(const QString& sessionId) {
+    if (sessionId == m_currentSessionId) cancelTitleRequest();
     // 删除当前会话前先收尾进行中的请求
     if (sessionId == m_currentSessionId
         && (!m_activeReplies.isEmpty() || !m_toolCallBatch.isEmpty() || !m_pendingShellExecs.isEmpty()
@@ -4536,15 +4923,13 @@ bool ChatBot::deleteSession(const QString& sessionId) {
         warn("删除会话失败：未找到 id={}", sessionId.toStdString());
         return false;
     }
-    if (m_sessions.size() <= 1) {
-        warn("不能删除唯一的会话");
-        return false;
-    }
-
+    m_observedMessages.remove(sessionId);
     m_sessions.remove(sessionId);
     AttachmentManager::removeSession(QFileInfo(sessionsFilePath()).absolutePath(), sessionId);
     if (m_currentSessionId == sessionId) {
-        m_currentSessionId = m_sessions.firstKey();
+        cancelTitleRequest();
+        m_currentSessionId.clear();
+        ensureCurrentSession();
         emit messagesChanged();
         emit sessionSwitched(m_currentSessionId);
     }
@@ -4554,13 +4939,27 @@ bool ChatBot::deleteSession(const QString& sessionId) {
     return true;
 }
 
+bool ChatBot::setSessionPreviewTitle(const QString& sessionId, const QString& newTitle) {
+    if (!m_sessions.contains(sessionId) || newTitle.trimmed().isEmpty()) return false;
+    auto& session = m_sessions[sessionId];
+    if (session.manualTitle || !session.title.startsWith("新对话")) return false;
+    session.title     = newTitle.trimmed();
+    session.updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+    saveSessions();
+    emit sessionsChanged();
+    return true;
+}
+
 bool ChatBot::renameSession(const QString& sessionId, const QString& newTitle) {
     if (!m_sessions.contains(sessionId)) {
         warn("重命名会话失败：未找到 id={}", sessionId.toStdString());
         return false;
     }
-    m_sessions[sessionId].title     = newTitle;
-    m_sessions[sessionId].updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+    if (newTitle.trimmed().isEmpty()) return false;
+    if (sessionId == m_currentSessionId) cancelTitleRequest();
+    m_sessions[sessionId].manualTitle = true;
+    m_sessions[sessionId].title       = newTitle.trimmed();
+    m_sessions[sessionId].updatedAt   = QDateTime::currentDateTime().toString(Qt::ISODate);
     saveSessions();
     emit sessionsChanged();
     info("会话已重命名: {} -> {}", sessionId.toStdString(), newTitle.toStdString());

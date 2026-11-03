@@ -69,6 +69,12 @@ struct SessionData {
     QString              title;
     QString              createdAt;
     QString              updatedAt;
+    QString              lastConversationAt;
+    bool                 manualTitle       = false;
+    int                  completedRounds   = 0;
+    int                  titleAttemptRound = 0;
+    QString              lastCompletedUserId;
+    QSet<QString>        completedUserIds; // Survives message truncation and regeneration.
     QVector<MessageData> messages;
 };
 
@@ -87,6 +93,13 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
     Q_PROPERTY(QString responseMessageId READ responseMessageId NOTIFY streamStart)
     Q_PROPERTY(QVariantList toolStates READ getToolStates NOTIFY toolStatesChanged)
     Q_PROPERTY(QString currentSessionId READ getCurrentSessionId NOTIFY sessionSwitched)
+    Q_PROPERTY(bool autoTitleEnabled READ getAutoTitleEnabled WRITE setAutoTitleEnabled NOTIFY autoTitleSettingsChanged)
+    Q_PROPERTY(
+        QString autoTitleModelId READ getAutoTitleModelId WRITE setAutoTitleModelId NOTIFY autoTitleSettingsChanged
+    )
+    Q_PROPERTY(
+        int autoTitleFrequency READ getAutoTitleFrequency WRITE setAutoTitleFrequency NOTIFY autoTitleSettingsChanged
+    )
     Q_PROPERTY(QVariantMap apiCacheStats READ getApiCacheStats NOTIFY apiCacheStatsChanged)
 
     // 当前活动模型的能力标志（只读，随模型切换更新）
@@ -181,7 +194,15 @@ public:
     Q_INVOKABLE QString      createSession(const QString& title = QString());
     Q_INVOKABLE bool         deleteSession(const QString& sessionId);
     Q_INVOKABLE bool         renameSession(const QString& sessionId, const QString& newTitle);
+    Q_INVOKABLE bool         setSessionPreviewTitle(const QString& sessionId, const QString& newTitle);
     Q_INVOKABLE QVariantList getSessionMessages(const QString& sessionId);
+
+    bool    getAutoTitleEnabled() const;
+    QString getAutoTitleModelId() const;
+    int     getAutoTitleFrequency() const;
+    void    setAutoTitleEnabled(bool enabled);
+    void    setAutoTitleModelId(const QString& id);
+    void    setAutoTitleFrequency(int frequency);
 
     // 多模型管理
     // getModels()/getActiveModel() 保留给旧版外部资源库（libPenModsResources.so 可能先于主库被替换）：
@@ -306,6 +327,7 @@ signals:
     void apiCacheStatsChanged();
     void modelsChanged();
     void promptsChanged();
+    void autoTitleSettingsChanged();
     void sessionsChanged();
     void sessionSwitched(const QString& sessionId);
     void activeModelCapabilitiesChanged();
@@ -348,6 +370,7 @@ private:
     bool                   m_cancelled        = false;
     bool                   m_resetting        = false; // resetService 防重入
     bool                   m_streamEndEmitted = false;
+    bool                   m_streamProtocolCompleted = false;
     int                    m_requestSeq       = 0;
     QString                m_responseMessageId;
     QString                m_responseSessionId;
@@ -411,6 +434,13 @@ private:
     bool    writeSessions(const QMap<QString, SessionData>& sessions, const QString& activeId, const QString& path);
     QString sessionsFilePath();
     void    ensureCurrentSession();
+    QMap<QString, QVector<MessageData>> m_observedMessages;
+    void                                completedRound();
+    void                                requestAutoTitle(const QString& sessionId, int requestSeq);
+    void                                cancelTitleRequest();
+    json                                autoTitleConfig() const;
+    void                                setAutoTitleConfig(const char* key, const json& value);
+    QNetworkReply*                      m_titleReply = nullptr;
 
     // 将 MessageData 序列化为 OpenAI API 格式的 QJsonObject
     QJsonObject messageToJson(const MessageData& msg) const;
@@ -423,7 +453,7 @@ private:
 
     void       makeApiRequest(const QJsonArray& messages);
     void       handleNetworkReply(QNetworkReply* reply, bool isStream);
-    void       finishStream();
+    void       finishStream(bool success);
     void       emitContentChunk(const QString& content);
     void       appendAnswerChunk(const QString& text);
     void       appendReasoningChunk(const QString& text);

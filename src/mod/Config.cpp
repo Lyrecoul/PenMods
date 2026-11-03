@@ -197,6 +197,11 @@ Config::Config() : Logger("Config") {
                 }
             })},
             {"activeModelId", "deepseek-flash"},
+            {"auto_title", {
+                {"enabled", false},
+                {"modelId", ""},
+                {"frequency", 0} // 0: first completed round only; 3: every three completed rounds
+            }},
             {"prompts", json::array({
                 json{
                     {"id",      "default"},

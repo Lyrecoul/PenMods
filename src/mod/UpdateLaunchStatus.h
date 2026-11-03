@@ -3,6 +3,7 @@
 
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonObject>
 
 namespace mod {
 // Check the actual next-start invocation even with an older helper that only
@@ -13,12 +14,19 @@ inline bool updateLaunchHookReady(const QString& launcher = "/usr/bin/runDictPen
     QFile file(launcher);
     if (!file.open(QIODevice::ReadOnly)) return false;
     const QByteArray original = "stdbuf -o0 ./YoudaoDictPen -platform wayland > $LOG_FILE 2>&1";
-    const QByteArray managed = "stdbuf -o0 /userdata/PenMods/penmods-update run -- ./YoudaoDictPen -platform wayland > $LOG_FILE 2>&1";
+    const QByteArray managed =
+        "stdbuf -o0 /userdata/PenMods/penmods-update run -- ./YoudaoDictPen -platform wayland > $LOG_FILE 2>&1";
     int originals = 0, hooks = 0;
     for (const auto& line : file.readAll().split('\n')) {
         originals += line == original;
-        hooks += line == managed;
+        hooks     += line == managed;
     }
     return originals == 0 && hooks == 1;
+}
+inline bool updateLaunchStatusReady(const QJsonObject& status, const QString& launcher = "/usr/bin/runDictPen") {
+    // The helper owns modern hook formats. Only older helpers need the local
+    // legacy-command probe; requiring both parsers rejects valid guarded hooks.
+    if (status.contains("launcher_ready")) return status.value("launcher_ready").toBool(false);
+    return updateLaunchHookReady(launcher);
 }
 } // namespace mod

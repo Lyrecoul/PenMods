@@ -338,12 +338,14 @@ int main(int argc, char** argv) {
         version(coreVersion);
         if (command == "run" && i < argc && std::string(argv[i]) == "--") {
             if (++i >= argc) fail("app command missing");
+            // Even probing the store can throw (I/O, permissions, symlink loops).
+            // Arm emergency recovery before the first filesystem access.
+            originalApp = argv + i;
             if (fs::exists(store.root / "disabled")) {
                 execvp(argv[i], argv + i);
                 perror("disabled launcher exec");
                 return 127;
             }
-            originalApp = argv + i;
             store.prepare();
             return supervise(store, argv + i);
         }

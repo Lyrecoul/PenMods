@@ -252,10 +252,17 @@ for seq in range(20):
         backup = launcher.with_name("runDictPen.pre-penmods-update")
         self.assertEqual(backup.read_text(), original)
         self.assertEqual(launcher.stat().st_mode & 0o777, 0o751)
-        self.assertIn("/userdata/PenMods/penmods-update run -- ./YoudaoDictPen", launcher.read_text())
+        self.assertIn("/userdata/PenMods/penmods-update run -- stdbuf -o0 ./YoudaoDictPen", launcher.read_text())
+        self.assertTrue(self.status()["launcher_ready"])
         snapshot = launcher.read_bytes()
         subprocess.run(command, check=True, capture_output=True)
         self.assertEqual(launcher.read_bytes(), snapshot)
+        # Upgrade the exact v1 hook without changing the independent stock backup.
+        launcher.write_text(original.replace('stdbuf -o0 ./YoudaoDictPen',
+            'stdbuf -o0 /userdata/PenMods/penmods-update run -- ./YoudaoDictPen'))
+        subprocess.run(command, check=True, capture_output=True)
+        self.assertEqual(launcher.read_bytes(), snapshot)
+        self.assertEqual(backup.read_text(), original)
         launcher.write_text(original.replace("wayland", "linuxfb"))
         result = subprocess.run(command, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
@@ -306,6 +313,12 @@ for seq in range(20):
         self.call("run", "--", *self.app("healthy"))
         self.assertEqual(self.status()["active"], pending)
         self.assertIsNone(self.status()["pending"])
+
+    def test_disabled_probe_error_still_uses_emergency_backup(self):
+        # ELOOP models an inaccessible disabled marker before prepare() starts.
+        (self.root / "disabled").symlink_to("disabled")
+        result = self.call("run", "--", "/bin/true")
+        self.assertIn("independent userdata backup", result.stderr)
 
     def test_unavailable_store_uses_independent_userdata_backup(self):
         # Both journals are unreadable; no candidate can establish recovery.

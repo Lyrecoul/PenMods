@@ -541,13 +541,15 @@ public:
             return {false, "/userdata/PenMods/penmods-update is missing or not executable"};
         const std::string hooked =
             "stdbuf -o0 /userdata/PenMods/penmods-update run -- ./YoudaoDictPen -platform wayland > $LOG_FILE 2>&1";
+        const std::string guarded =
+            "    elif /userdata/PenMods/penmods-update run -- stdbuf -o0 ./YoudaoDictPen -platform wayland; then";
         const std::string stock = "stdbuf -o0 ./YoudaoDictPen -platform wayland > $LOG_FILE 2>&1";
         std::ifstream     input(launcher);
         std::string       line;
         unsigned          matches  = 0;
         bool              hasStock = false;
         while (std::getline(input, line)) {
-            if (line == hooked) ++matches;
+            if (line == hooked || line == guarded) ++matches;
             if (line == stock) hasStock = true;
         }
         if (!input.eof()) return {false, "cannot read /usr/bin/runDictPen"};

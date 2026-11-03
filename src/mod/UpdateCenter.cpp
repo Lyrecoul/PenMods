@@ -374,13 +374,12 @@ void UpdateCenter::refresh() {
         if (*done) return;
         *done = true;
         mStatusProcess.clear();
-        const auto status = readObject(process->readAllStandardOutput());
+        const auto status     = readObject(process->readAllStandardOutput());
         const bool storeReady = ok && !status.isEmpty() && status.value("installed").toBool(false)
                              && !status.value("disabled").toBool(false)
                              && !QFile::exists(QDir(rootPath()).filePath("disabled"));
-        mLauncherReady = storeReady && updateLaunchHookReady()
-                      && (!status.contains("launcher_ready") || status.value("launcher_ready").toBool(false));
-        mTrialActive = status.value("trial").isObject();
+        mLauncherReady        = storeReady && updateLaunchStatusReady(status);
+        mTrialActive          = status.value("trial").isObject();
         if (storeReady) {
             const auto installed = status.value("components").toObject();
             const auto pending   = status.value("pending_components").toObject();

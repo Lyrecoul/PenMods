@@ -1,5 +1,7 @@
 # PenMods
 > 一般来说，你不需要手动下载 PenMods  
+> **V2.7.0 / V2.7.1 用户请先阅读：[启动故障修复与 V2.7.3 迁移教程](doc/RECOVERY_2.7.3.md)**。旧更新启动器存在冷启动故障，仅更新 core 无法修复，需执行新版完整迁移包。
+
 > **全新安装** 👉[Installer](https://github.com/PenUniverse/Installer)，安装后按[迁移步骤](doc/UPDATE_SYSTEM.md#手动安装迁移包)补齐更新启动器<br>
 > **从旧版更新** 👉系统自带的 OTA
 

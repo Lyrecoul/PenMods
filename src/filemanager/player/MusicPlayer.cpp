@@ -68,9 +68,10 @@ MusicPlayer::MusicPlayer() : Logger("MusicPlayer") {
     // 兜底：连扫/点查/被 mod 拦下的扫描不一定都发 ocrStop，扫描窗口必须有硬上限（见 onOcrStarted）。
     mScanGuardTimer.setSingleShot(true);
     connect(&mScanGuardTimer, &QTimer::timeout, this, &MusicPlayer::onOcrStopped);
+    mShutdownTimer.setSingleShot(true);
     connect(&mShutdownTimer, &QTimer::timeout, this, [this]() {
         // 倒计时结束：定时关机；"播放结束关机" 模式不使用该定时器（见 setShutdownAfterPlaylist）。
-        mShutdownTimerMinutes = 0;
+        cancelShutdownTimer();
         ScreenManager::getInstance().requestPowerOff();
     });
     connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView& view, QQmlContext* context) {
@@ -355,10 +356,9 @@ void MusicPlayer::onSoundEnd() {
     mCurrentPlaying.mIsEnd = true;
     if (mShutdownPending && getCurrentAudioSequence() == AudioSequence::ORDER
         && mCurrentPlaying.mIndex + 1 >= mPlayList.size()) {
-        mShutdownPending = false;
+        cancelShutdownTimer();
         clearLyrics();
         ScreenManager::getInstance().requestPowerOff();
-        emit shutdownTimerChanged();
         return;
     }
     switch (getCurrentAudioSequence()) {
@@ -446,16 +446,18 @@ void MusicPlayer::setShutdownTimerMinutes(int minutes) {
         cancelShutdownTimer();
         return;
     }
-    mShutdownPending = false;
-    mShutdownTimerMinutes = minutes;
+    mShutdownAfterPlaylist = false;
+    mShutdownPending       = false;
+    mShutdownTimerMinutes  = minutes;
     mShutdownTimer.start(minutes * 60 * 1000);
     emit shutdownTimerChanged();
 }
 
 void MusicPlayer::cancelShutdownTimer() {
     mShutdownTimer.stop();
-    mShutdownPending = false;
-    mShutdownTimerMinutes = 0;
+    mShutdownPending       = false;
+    mShutdownAfterPlaylist = false;
+    mShutdownTimerMinutes  = 0;
     emit shutdownTimerChanged();
 }
 

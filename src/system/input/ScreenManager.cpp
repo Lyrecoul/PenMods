@@ -54,7 +54,7 @@ ScreenManager::ScreenManager() : Logger("ScreenManager") {
 
     connect(&AudioDaemon::getInstance(), &AudioDaemon::stateChanged, this, &ScreenManager::onAudioDaemonStateChanged);
     mInactivityTimer.setSingleShot(true);
-    connect(&mInactivityTimer, &QTimer::timeout, this, &ScreenManager::requestPowerOff);
+    connect(&mInactivityTimer, &QTimer::timeout, this, &ScreenManager::onInactivityTimeout);
     if (mAutoShutdownDuration > 0) mInactivityTimer.start(mAutoShutdownDuration * 1000);
 }
 
@@ -192,15 +192,18 @@ void ScreenManager::resetInactivityTimer() {
     else mInactivityTimer.stop();
 }
 
-void ScreenManager::requestPowerOff() {
-    // The audio lock keeps the whole device awake while something is playing,
-    // so a pending auto-shutdown must not cut the audio output either.
+void ScreenManager::onInactivityTimeout() {
+    // Only inactivity shutdown is deferred by playback. A music sleep timer is
+    // an explicit request to stop listening and must still be able to power off.
     if (mAudioLockActive) {
         qInfo() << "inactivity shutdown timer expired but audio lock is active; deferring";
         resetInactivityTimer();
         return;
     }
-    qInfo() << "inactivity shutdown timer expired";
+    requestPowerOff();
+}
+
+void ScreenManager::requestPowerOff() {
     if (mSystemBase == nullptr) {
         qWarning() << "cannot power off: YSystemBase is not captured";
         return;
@@ -334,10 +337,10 @@ void ScreenManager::rtSetAutoScreenOff(bool val) {
 
 } // namespace mod
 
-// MusicPlayer
-PEN_HOOK(void*, _ZN11YSystemBase16onPowerLongPressEv, void* self) {
-    mod::ScreenManager::getInstance().setSystemBase(reinterpret_cast<YSystemBase*>(self));
-    return origin(self);
+// Capture the power controller at startup, not only after a long power-key press.
+PEN_HOOK(void, _ZN11YSystemBaseC2EP7QObject, YSystemBase* self, QObject* parent) {
+    origin(self, parent);
+    mod::ScreenManager::getInstance().setSystemBase(self);
 }
 
 // Screen state transitions are reliable user-activity signals: waking the pen

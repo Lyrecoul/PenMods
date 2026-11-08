@@ -86,6 +86,7 @@ signals:
 private:
     friend Singleton<ScreenManager>;
     explicit ScreenManager();
+    void onInactivityTimeout();
 
     std::string mClassName = "screen";
 

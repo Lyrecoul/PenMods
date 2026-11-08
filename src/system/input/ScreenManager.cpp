@@ -13,6 +13,7 @@
 #include "base/YEnum.h"
 
 #include "common/Event.h"
+#include "tweaker/ReadingLoop.h"
 
 #include <QCoreApplication>
 #include <QDebug>
@@ -53,6 +54,7 @@ ScreenManager::ScreenManager() : Logger("ScreenManager") {
     });
 
     connect(&AudioDaemon::getInstance(), &AudioDaemon::stateChanged, this, &ScreenManager::onAudioDaemonStateChanged);
+    connect(&ReadingLoop::getInstance(), &ReadingLoop::activeChanged, this, &ScreenManager::onAudioDaemonStateChanged);
     mInactivityTimer.setSingleShot(true);
     connect(&mInactivityTimer, &QTimer::timeout, this, &ScreenManager::onInactivityTimeout);
     if (mAutoShutdownDuration > 0) mInactivityTimer.start(mAutoShutdownDuration * 1000);
@@ -274,11 +276,10 @@ void ScreenManager::setIntelSleepAudioLock(bool val) {
 
 void ScreenManager::onAudioDaemonStateChanged() {
     bool audioActive = AudioDaemon::getInstance().state() == AudioDaemonState::PLAYING;
-    // The same switch guards every idle action that would cut audio output:
-    // screen off (host stop_auto_screen_off) and system suspend (the
-    // system_suspend idle action of input-event-daemon). Suspend powers down
-    // the radio, so Bluetooth playback would not resume after a wake-up.
+    // A reading session owns suspend protection even between utterances. It
+    // does not itself pause screen-off: the user may keep listening in the dark.
     bool shouldLock = mIntelSleepAudioLock && audioActive;
+    InputDaemon::getInstance().setSystemSuspendOverride(shouldLock || ReadingLoop::getInstance().active());
     if (shouldLock != mAudioLockActive) {
         info(
             "audio lock {}：state={} charging={} screen_on={} suspend_override={}",
@@ -286,7 +287,7 @@ void ScreenManager::onAudioDaemonStateChanged() {
             static_cast<int>(AudioDaemon::getInstance().state()),
             BatteryInfo::getInstance().isCharging(),
             mScreenOn,
-            shouldLock
+            shouldLock || ReadingLoop::getInstance().active()
         );
     }
     if (shouldLock && !mAudioLockActive) {
@@ -295,12 +296,10 @@ void ScreenManager::onAudioDaemonStateChanged() {
         // input-event-daemon. The host pause is delivered with SIGUSR1 to the
         // running process (plus a /tmp marker), and a freshly started daemon
         // starts unpaused, so re-apply the screen pause after the restart.
-        InputDaemon::getInstance().setSystemSuspendOverride(true);
         rtSetAutoScreenOff(false);
     } else if (mAudioLockActive && !shouldLock) {
         mAudioLockActive = false;
         rtSetAutoScreenOff(true);
-        InputDaemon::getInstance().setSystemSuspendOverride(false);
     }
 }
 
@@ -352,7 +351,10 @@ PEN_HOOK(void, _ZN11YSystemBase10onScreenOnEv, void* self) {
 
 PEN_HOOK(void, _ZN11YSystemBase11onScreenOffEv, void* self) {
     mod::ScreenManager::getInstance().onScreenOff();
+    auto& reading = mod::ReadingLoop::getInstance();
+    reading.beginScreenOff();
     origin(self);
+    reading.endScreenOff();
 }
 
 PEN_HOOK(uint64, _ZN7YGlobal27isInPlayerCenterPageChangedEv, uint64 self, uint64 a2, uint64 a3, uint64 a4, uint64 a5) {

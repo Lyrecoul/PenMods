@@ -99,16 +99,38 @@ a vendor change rather than a proven configuration switch. The vendor HFP
 (the pen's own battery), not a measured headset battery. PenMods therefore does
 not reinterpret that value or replace/restart the vendor Bluetooth stack.
 The GATT fallback works without the disabled battery plugin when a connected
-accessory exposes the standard Battery Service. Classic headphones that expose
-neither Battery1 nor that service remain explicitly unknown; private HFP/vendor
-battery protocols are not inferred from the headset's name.
+accessory exposes the standard Battery Service.
+
+For paired classic headsets advertising Hands-Free (`111e`), `helper/HfpBattery`
+registers an HFP Audio Gateway (`111f`) through BlueZ's
+[`ProfileManager1`](https://github.com/bluez/bluez/blob/5.50/doc/profile-api.txt).
+BlueZ discovers the remote RFCOMM channel; the local listener uses a dynamically
+allocated channel. Qt socket notifiers process the control connection without
+blocking the UI. This does not open SCO, implement calls, restart BlueZ, or change
+pairing data. It does add an HFP connection, which may compete with another
+phone's HFP connection on accessories without multipoint support.
+
+The AG enables HF battery indicator 2 and accepts `AT+BIEV=2,0..100` reports.
+Apple `AT+IPHONEACCEV` reports are accepted as 10–100% deciles, only until a
+precise BIEV measurement arrives. Malformed reports do not overwrite a reading;
+RFCOMM loss, device disconnect and BlueZ owner loss clear it. No private Xiaomi
+payload is parsed. Battery1 remains preferred. Accessories exposing none of these
+sources stay explicitly unknown. On the connected REDMI Buds 8 Pro, SDP reports
+HFP 1.9 on channel 3 and a real control handshake produced `AT+BIEV=2,100`.
+
+The settings page uses `bluetoothBattery.names`, also keyed by address. A remote
+alias equal to its adapter's name/alias is treated as vendor local-name pollution
+and falls back to the remote `Device1.Name`; intentional custom aliases remain.
+This repairs presentation without rewriting the Bluetooth database.
 
 The Bluetooth settings device row adds `已连接 · N%` (or `电量未知`) without
 changing its height. The existing status-bar headphone icon gains a narrow
 vertical level bar; unknown is `?`, not an empty 0% bar. It uses the host Bluetooth
-manager's active device address rather than an arbitrary connected device and
-does not attach Bluetooth battery information to the wired-headset indicator.
-The shared indicator also appears in quick settings.
+manager's active device address rather than an arbitrary connected device. It is
+visible while Bluetooth is linked, even when `systemBase.digHeadset` is also true:
+the tested device reports both with the actual playback route `bt`. A wired-only
+connection still has no Bluetooth battery. The shared indicator also appears in
+quick settings.
 
 Run `python tools/test_bluetooth_battery.py` for the host regression test (requires
 Qt5Core/Qt5DBus development files, Qt5 moc, g++ and dbus-run-session). It compiles
@@ -121,6 +143,20 @@ loaded the actual settings page/delegate, `YConnectionIndicators` and
 and rendered 320×170 known/unknown/zero/wired/disconnected states. The indicator
 row measured 65 px with battery, 58 px without; the actual 320 px title bar fit all
 connection icons, 23:59, 100% and the charging icon without overlapping the
-portrait. No physical accessory battery
-measurement or deployment was performed for this change; the existing REDMI
-connection record above does not prove that headset exposes a battery source.
+portrait. The host regression also passes real Unix socket descriptors through
+the Profile1 D-Bus boundary and checks fragmented/coalesced HFP reports, invalid
+indicators, real zero, transport loss, reconnect and precise/decile precedence.
+The previous UI-only checks did not prove accessory battery support; the real
+REDMI HFP exchange above establishes that source.
+
+On-device follow-up: the settings row displays `REDMI Buds 8 Pro` and
+`已连接 · 100%`. HFP result codes must be separately framed (`CRLF OK CRLF`):
+omitting the leading CRLF after an information response made this headset stop
+after `BRSF` and disconnect after three seconds. The receiver regression checks
+this boundary, not just transmitted command parsing.
+
+The final managed deployment was confirmed with no pending/trial generation and
+matching host/device hashes for both libraries. The settings measurement changed
+from 100% to 95% on the actual REDMI headset, and the home title bar visibly shows
+the vertical battery bar. No matching QML binding errors were found. Temporary
+runtime diagnostics were removed before this verification.

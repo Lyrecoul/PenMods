@@ -25,9 +25,12 @@ def main():
         generated = work / "moc_BluetoothBattery.cpp"
         executable = work / "bluetooth-battery-test"
         subprocess.run([moc, str(ROOT / "src/helper/BluetoothBattery.h"), "-o", str(generated)], check=True)
+        hfp_moc = work / "moc_HfpBattery.cpp"
+        subprocess.run([moc, str(ROOT / "src/helper/HfpBattery.h"), "-o", str(hfp_moc)], check=True)
         subprocess.run([
             "g++", "-std=c++17", "-fPIC", "-Wall", "-Wextra", "-I" + str(ROOT / "src"),
             str(ROOT / "src/helper/BluetoothBattery.cpp"), str(generated),
+            str(ROOT / "src/helper/HfpBattery.cpp"), str(hfp_moc),
             str(ROOT / "tools/bluetooth_battery_test.cpp"), "-o", str(executable), *flags,
         ], check=True)
         subprocess.run(["dbus-run-session", "--", str(executable)], check=True)

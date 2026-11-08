@@ -14,6 +14,7 @@
 #include <QVariantMap>
 
 namespace mod {
+class HfpBattery;
 
 using BluetoothInterfaces = QMap<QString, QVariantMap>;
 using BluetoothObjects    = QMap<QDBusObjectPath, BluetoothInterfaces>;
@@ -23,20 +24,24 @@ using BluetoothObjects    = QMap<QDBusObjectPath, BluetoothInterfaces>;
 class BluetoothBattery : public QObject, public Singleton<BluetoothBattery> {
     Q_OBJECT
     Q_PROPERTY(QVariantMap percentages READ percentages NOTIFY percentagesChanged)
+    Q_PROPERTY(QVariantMap names READ names NOTIFY namesChanged)
 
 public:
     void               start(const QDBusConnection& bus);
     const QVariantMap& percentages() const { return mPercentages; }
+    const QVariantMap& names() const { return mNames; }
+    ~BluetoothBattery() override;
 
 signals:
     void percentagesChanged();
+    void namesChanged();
 
 private slots:
     void onBluezSignal(const QDBusMessage& message);
 
 private:
     friend Singleton<BluetoothBattery>;
-    BluetoothBattery() = default;
+    BluetoothBattery();
 
     void    reload();
     void    consumeSignal(const QDBusMessage& message);
@@ -50,11 +55,14 @@ private:
     bool    currentRequest(const QString& key, quint64 token, quint64 epoch) const;
 
     std::unique_ptr<QDBusConnection>   mBus;
+    std::unique_ptr<HfpBattery>        mHfp;
+    QMap<QString, int>                 mHfpLevels;
     QMap<QString, BluetoothInterfaces> mObjects;
     QMap<QString, quint64>             mRequests;
     QSet<QString>                      mReadAttempted;
     QSet<QString>                      mNotifyAttempted;
     QVariantMap                        mPercentages;
+    QVariantMap                        mNames;
     QList<QDBusMessage>                mQueuedSignals;
     quint64                            mEpoch       = 0;
     quint64                            mNextRequest = 0;

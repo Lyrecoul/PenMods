@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "helper/BluetoothBattery.h"
+#include "helper/HfpBattery.h"
 
 #include <QDBusArgument>
 #include <QDBusMetaType>
@@ -34,11 +35,20 @@ QDBusMessage call(const QString& path, const QString& interface, const QString& 
 }
 } // namespace
 
+BluetoothBattery::BluetoothBattery()  = default;
+BluetoothBattery::~BluetoothBattery() = default;
+
 void BluetoothBattery::start(const QDBusConnection& bus) {
     if (mBus) return;
     qDBusRegisterMetaType<BluetoothInterfaces>();
     qDBusRegisterMetaType<BluetoothObjects>();
     mBus = std::make_unique<QDBusConnection>(bus);
+    mHfp = std::make_unique<HfpBattery>(bus);
+    connect(mHfp.get(), &HfpBattery::batteryChanged, this, [this](const QString& path, int level) {
+        if (level >= 0 && connected(path)) mHfpLevels.insert(path, level);
+        else mHfpLevels.remove(path);
+        if (!mLoading) publish();
+    });
     mBus->connect(
         QStringLiteral("org.bluez"),
         QStringLiteral("/"),
@@ -76,6 +86,9 @@ void BluetoothBattery::start(const QDBusConnection& bus) {
 
 void BluetoothBattery::reload() {
     const quint64 epoch = ++mEpoch;
+    mLoading            = true;
+    mHfpLevels.clear();
+    mHfp->reset();
     mObjects.clear();
     mRequests.clear();
     mReadAttempted.clear();
@@ -84,6 +97,10 @@ void BluetoothBattery::reload() {
     if (!mPercentages.isEmpty()) {
         mPercentages.clear();
         emit percentagesChanged();
+    }
+    if (!mNames.isEmpty()) {
+        mNames.clear();
+        emit namesChanged();
     }
     mLoading      = true;
     auto* watcher = new QDBusPendingCallWatcher(
@@ -139,6 +156,7 @@ QString BluetoothBattery::batteryDevice(const QString& characteristic) const {
 }
 
 void BluetoothBattery::clearDevice(const QString& path) {
+    mHfpLevels.remove(path);
     for (auto it = mRequests.begin(); it != mRequests.end();) {
         if (it.key().startsWith(path + QLatin1Char('/')) || it.key().startsWith(path + QLatin1Char('|')))
             it = mRequests.erase(it);
@@ -263,12 +281,43 @@ void BluetoothBattery::notifyGatt(const QString& path) {
 
 void BluetoothBattery::publish() {
     QVariantMap values;
-    QStringList reads, notifications;
+    QVariantMap names;
+    for (auto it = mObjects.cbegin(); it != mObjects.cend(); ++it) {
+        if (!it.value().contains(kDevice)) continue;
+        const auto    props       = it.value().value(kDevice);
+        const QString address     = props.value(QStringLiteral("Address")).toString().toUpper();
+        const QString remoteName  = props.value(QStringLiteral("Name")).toString();
+        QString       displayName = props.value(QStringLiteral("Alias")).toString();
+        const QString adapter     = qvariant_cast<QDBusObjectPath>(props.value(QStringLiteral("Adapter"))).path();
+        const auto    local       = mObjects.value(adapter).value(QStringLiteral("org.bluez.Adapter1"));
+        // Vendor bt_set_device_name can copy the adapter alias onto remote devices.
+        // Preserve deliberate remote aliases; do not rewrite pairing data to repair presentation.
+        if (displayName.isEmpty()
+            || (!remoteName.isEmpty()
+                && (displayName == local.value(QStringLiteral("Alias")).toString()
+                    || displayName == local.value(QStringLiteral("Name")).toString())))
+            displayName = remoteName;
+        if (!address.isEmpty() && !displayName.isEmpty()) names.insert(address, displayName);
+    }
+    if (names != mNames) {
+        mNames = names;
+        emit namesChanged();
+    }
+    QStringList   reads, notifications;
+    QSet<QString> hfpDevices;
     for (auto it = mObjects.cbegin(); it != mObjects.cend(); ++it) {
         if (!it.value().contains(kDevice) || !connected(it.key())) continue;
         const QString address = it.value().value(kDevice).value(QStringLiteral("Address")).toString().toUpper();
         const int     level   = percentage(it.value().value(kBattery).value(QStringLiteral("Percentage")));
         if (!address.isEmpty() && level >= 0) values.insert(address, level);
+        const auto props = it.value().value(kDevice);
+        if (props.value(QStringLiteral("Paired")).toBool()
+            && props.value(QStringLiteral("UUIDs"))
+                   .toStringList()
+                   .contains(QStringLiteral("0000111e-0000-1000-8000-00805f9b34fb")))
+            hfpDevices.insert(it.key());
+        if (!address.isEmpty() && level < 0 && mHfpLevels.contains(it.key()))
+            values.insert(address, mHfpLevels.value(it.key()));
     }
     for (auto it = mObjects.cbegin(); it != mObjects.cend(); ++it) {
         if (!it.value().contains(kCharacteristic)) continue;
@@ -292,6 +341,7 @@ void BluetoothBattery::publish() {
         mPercentages = values;
         emit percentagesChanged();
     }
+    mHfp->sync(hfpDevices);
     for (const auto& path : reads) readGatt(path);
     for (const auto& path : notifications) notifyGatt(path);
 }

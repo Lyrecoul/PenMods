@@ -124,8 +124,10 @@ and falls back to the remote `Device1.Name`; intentional custom aliases remain.
 This repairs presentation without rewriting the Bluetooth database.
 
 The Bluetooth settings device row adds `已连接 · N%` (or `电量未知`) without
-changing its height. The existing status-bar headphone icon gains a narrow
-vertical level bar; unknown is `?`, not an empty 0% bar. It uses the host Bluetooth
+changing its height. The existing status-bar headphone icon gains a compact
+7×11 px rounded battery outline with a top terminal and an inset level fill.
+The outline is subdued white, the fill turns red at 20% or below, and unknown is
+`?` inside the outline rather than a false empty 0% battery. It uses the host Bluetooth
 manager's active device address rather than an arbitrary connected device. It is
 visible while Bluetooth is linked, even when `systemBase.digHeadset` is also true:
 the tested device reports both with the actual playback route `bt`. A wired-only

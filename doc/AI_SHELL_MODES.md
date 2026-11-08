@@ -22,6 +22,10 @@
 
 AI 自动审批可以后续作为单独的审批策略，与执行权限组合；模型判断不构成系统安全边界，也无法保证抵御网页提示注入。目前未提供此模式，不会把主模型生成命令视作独立审查通过。
 
+## 工具调用历史
+
+重新打开会话或重启后，工具调用仍按工具卡片显示；旧记录没有状态快照时，从 `toolCallsJson` 恢复工具名称和调用参数，并按 `toolCallId` 匹配结果。Shell 结果继续拆分退出码、标准输出和错误输出，不退化为普通文本。旧记录未保存执行状态时仍标为「状态未记录」，不会根据输出推断成功，也不会重新执行命令。
+
 ## 验证
 
 主机策略回归（包括旧模式兼容、黑名单、大小/NUL 限制、复杂脚本和网页抓取策略）：
@@ -32,3 +36,11 @@ g++ -std=c++17 -Isrc tools/shell-policy/check.cpp src/shell/ShellCommandPolicy.c
 ```
 
 设备验证可用 Zig 交叉编译同一文件，普通运行检查策略；以 root 启动并传入 --drop 检查实际 UID/GID、附加组、no_new_privs、无法恢复 root 和 /etc/passwd 不可写。此探针不修改系统文件。
+
+历史渲染回归（需要主机 PySide6；包含旧记录、已保存快照、缺失结果和真实工具卡片渲染）：
+
+```sh
+python3 tools/test_chat_tool_history.py
+python3 tools/test_chat_tool_history.py --resources
+node tools/check-tool-details.cjs
+```

@@ -17,6 +17,7 @@
 #include "common/Utils.h"
 #include "common/util/System.h"
 
+#include "helper/BluetoothBattery.h"
 #include "helper/BluetoothStorage.h"
 #include "helper/CaCertificates.h"
 #include "tweaker/ReadingLoop.h"
@@ -77,6 +78,9 @@ Mod::Mod() {
 
         // 将 WallpaperManager 注册到 QML 上下文
         context->setContextProperty("wallpaperManager", &WallpaperManager::getInstance());
+        auto& bluetoothBattery = BluetoothBattery::getInstance();
+        bluetoothBattery.start(QDBusConnection::systemBus());
+        context->setContextProperty("bluetoothBattery", &bluetoothBattery);
 
         // 发射属性变更信号，确保 QML 能正确获取初始值
         emit versionChanged();
@@ -375,6 +379,7 @@ __attribute__((constructor)) static void BeforeMain() {
     // helper
     INSTANCE(AntiEmbs);
     INSTANCE(BluetoothStorage);
+    INSTANCE(BluetoothBattery);
     INSTANCE(CaCertificates);
     INSTANCE(DeveloperSettings);
     INSTANCE(FontCache);

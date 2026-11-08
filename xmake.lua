@@ -85,6 +85,7 @@ target('PenMods')
     add_files('src/**.h')
     add_frameworks(
         'QtNetwork',
+        'QtDBus',
         'QtQuick',
         'QtQml',
         'QtGui',

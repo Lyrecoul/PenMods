@@ -1783,6 +1783,21 @@ QVariantList ChatBot::getToolStates() const {
 
 void ChatBot::publishTool(QVariantMap state) {
     if (m_responseSessionId != m_currentSessionId) return;
+    // One card represents this response's tool batch. Anchor it where the first
+    // tool appeared; later status updates must not move it past the answer.
+    auto anchor = m_responseToolStates.isEmpty() ? QVariantMap{} : m_responseToolStates.first().toMap();
+    if (anchor.isEmpty()) {
+        // Non-streaming local calls are published after their assistant message
+        // is saved, without going through the streaming text buffers.
+        for (const auto& message : currentMessages()) {
+            if (message.messageId != m_responseMessageId) continue;
+            anchor["answerOffset"] = message.content.size();
+            anchor["reasoningOffset"] = message.reasoning.size();
+            break;
+        }
+    }
+    state["answerOffset"] = anchor.value("answerOffset", m_currentStreamBuffer.size());
+    state["reasoningOffset"] = anchor.value("reasoningOffset", m_currentReasoningBuffer.size());
     bool found = false;
     for (auto& value : m_responseToolStates) {
         const auto old = value.toMap();
@@ -2635,7 +2650,7 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
 
     // 注入本地函数工具和 Responses API 图片生成工具。
     if (searchToolAvailable() || (m_capToolCall && m_shellToolEnabled)
-        || (usesResponsesApi() && (m_capImageGeneration || m_nativeWebSearchEnabled))) {
+        || (getNativeSearchActive() && m_nativeSearchEnabled) || (usesResponsesApi() && m_capImageGeneration)) {
         injectToolDefinitions(requestBody);
     }
 
@@ -4979,7 +4994,7 @@ QVariantList ChatBot::getSessionMessages(const QString& sessionId) {
 }
 
 // -----------------------------------------------------------------------
-// 网络搜索（Tavily / DeepSeek）
+// 网络搜索（厂商 / Tavily / DeepSeek）
 // -----------------------------------------------------------------------
 
 void ChatBot::initSearch() {
@@ -5002,6 +5017,7 @@ void ChatBot::initSearch() {
     QString provider = QString::fromStdString(strOf(s, "provider", "off"));
     if (provider != "off" && provider != "tavily" && provider != "deepseek") provider = "off";
 
+    m_nativeSearchEnabled   = boolOf(s, "native_enabled", true);
     m_searchProvider        = provider;
     m_searchEnabled         = boolOf(s, "enabled", false);
     m_searchCount           = qBound(1, intOf(s, "count", 5), 50);
@@ -5044,6 +5060,7 @@ void ChatBot::saveSearchConfig() {
     if (!aiCfg.contains("search") || !aiCfg["search"].is_object()) aiCfg["search"] = json::object();
 
     json& s                  = aiCfg["search"];
+    s["native_enabled"]      = m_nativeSearchEnabled;
     s["provider"]            = m_searchProvider.toStdString();
     s["enabled"]             = m_searchEnabled;
     s["count"]               = m_searchCount;
@@ -5070,7 +5087,19 @@ bool ChatBot::searchConfigured() const {
     return false;
 }
 
-bool ChatBot::searchToolAvailable() const { return m_capToolCall && m_searchEnabled && searchConfigured(); }
+bool ChatBot::getNativeSearchActive() const { return usesResponsesApi() && m_nativeWebSearchEnabled; }
+
+void ChatBot::setNativeSearchEnabled(bool v) {
+    if (m_nativeSearchEnabled == v) return;
+    m_nativeSearchEnabled = v;
+    saveSearchConfig();
+    emit searchConfigChanged();
+}
+
+bool ChatBot::searchToolAvailable() const {
+    // 厂商搜索接管当前模型的搜索；保留外部服务配置，供切回其他模型时使用。
+    return !getNativeSearchActive() && m_capToolCall && m_searchEnabled && searchConfigured();
+}
 
 QString ChatBot::effectiveSearchKey() const {
     if (m_searchProvider == "deepseek") return m_searchDeepseekKey.isEmpty() ? m_apiKey : m_searchDeepseekKey;
@@ -5114,6 +5143,7 @@ void ChatBot::setTavilyEnabled(bool v) {
 
 QString ChatBot::getSearchConfig() {
     json obj;
+    obj["nativeEnabled"]   = m_nativeSearchEnabled;
     obj["provider"]        = m_searchProvider.toStdString();
     obj["enabled"]         = m_searchEnabled;
     obj["count"]           = m_searchCount;
@@ -5129,6 +5159,7 @@ void ChatBot::setSearchConfig(const QString& configJson) {
     if (!doc.isObject()) return;
 
     QJsonObject obj = doc.object();
+    if (obj.contains("nativeEnabled")) m_nativeSearchEnabled = obj["nativeEnabled"].toBool();
     if (obj.contains("provider")) {
         const QString p = obj["provider"].toString();
         if (p == "off" || p == "tavily" || p == "deepseek") m_searchProvider = p;
@@ -5187,7 +5218,7 @@ void ChatBot::injectToolDefinitions(QJsonObject& requestBody) {
         }
         );
 
-    if (usesResponsesApi() && m_nativeWebSearchEnabled)
+    if (getNativeSearchActive() && m_nativeSearchEnabled)
         tools.append(
             QJsonObject{
                 {"type", "web_search"}

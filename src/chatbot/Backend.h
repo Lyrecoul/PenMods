@@ -118,7 +118,12 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
         QString proxyVisionPrompt READ getProxyVisionPrompt WRITE setProxyVisionPrompt NOTIFY proxyVisionSettingsChanged
     )
 
-    // 网络搜索（provider: off | tavily | deepseek）
+    // 厂商搜索模式由模型配置决定；开关独立保存，关闭后仍不回退到外部服务。
+    Q_PROPERTY(bool nativeSearchActive READ getNativeSearchActive NOTIFY activeModelCapabilitiesChanged)
+    Q_PROPERTY(
+        bool nativeSearchEnabled READ getNativeSearchEnabled WRITE setNativeSearchEnabled NOTIFY searchConfigChanged
+    )
+    // 外部网络搜索（provider: off | tavily | deepseek）
     Q_PROPERTY(QString searchProvider READ getSearchProvider WRITE setSearchProvider NOTIFY searchConfigChanged)
     Q_PROPERTY(bool searchEnabled READ getSearchEnabled WRITE setSearchEnabled NOTIFY searchConfigChanged)
     Q_PROPERTY(bool searchConfigured READ getSearchConfigured NOTIFY searchConfigChanged)
@@ -265,6 +270,9 @@ public:
     QString getProxyVisionPrompt() const { return m_proxyVisionPrompt; }
     void    setProxyVisionPrompt(const QString& v);
 
+    bool    getNativeSearchActive() const;
+    bool    getNativeSearchEnabled() const { return m_nativeSearchEnabled; }
+    void    setNativeSearchEnabled(bool v);
     QString getSearchProvider() const { return m_searchProvider; }
     bool    getSearchEnabled() const { return m_searchEnabled; }
     bool    getSearchConfigured() const { return searchConfigured(); }
@@ -508,6 +516,8 @@ private:
     void savePrompts();
 
     // 网络搜索
+    bool    m_nativeSearchEnabled = true;
+
     QString m_searchProvider    = "off"; // off | tavily | deepseek
     bool    m_searchEnabled     = false;
     int     m_searchCount       = 5;

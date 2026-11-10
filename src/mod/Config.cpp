@@ -213,6 +213,7 @@ Config::Config() : Logger("Config") {
             {"search", {
                 {"provider", "off"},
                 {"enabled", false},
+                {"native_enabled", true},
                 {"count", 5},
                 {"need_content", false},
                 {"max_chars", 6000},

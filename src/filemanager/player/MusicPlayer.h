@@ -28,12 +28,19 @@ class MusicPlayer : public QObject, public Singleton<MusicPlayer>, private Logge
     Q_OBJECT
 
     Q_PROPERTY(bool pauseOnScan READ getPauseOnScan WRITE setPauseOnScan NOTIFY pauseOnScanChanged);
-    Q_PROPERTY(bool hideFloatingWindow READ getHideFloatingWindow WRITE setHideFloatingWindow NOTIFY hideFloatingWindowChanged);
+    Q_PROPERTY(
+        bool hideFloatingWindow READ getHideFloatingWindow WRITE setHideFloatingWindow NOTIFY hideFloatingWindowChanged
+    );
     // 下拉面板上次停留的视图: true = 音乐控制, false = 快捷设置
-    Q_PROPERTY(bool quickPanelMusicView READ getQuickPanelMusicView WRITE setQuickPanelMusicView NOTIFY quickPanelMusicViewChanged);
+    Q_PROPERTY(
+        bool quickPanelMusicView READ getQuickPanelMusicView WRITE setQuickPanelMusicView NOTIFY
+            quickPanelMusicViewChanged
+    );
     Q_PROPERTY(bool shutdownTimerEnabled READ shutdownTimerEnabled NOTIFY shutdownTimerChanged);
     Q_PROPERTY(int shutdownTimerMinutes READ shutdownTimerMinutes NOTIFY shutdownTimerChanged);
-    Q_PROPERTY(bool shutdownAfterPlaylist READ shutdownAfterPlaylist WRITE setShutdownAfterPlaylist NOTIFY shutdownTimerChanged);
+    Q_PROPERTY(
+        bool shutdownAfterPlaylist READ shutdownAfterPlaylist WRITE setShutdownAfterPlaylist NOTIFY shutdownTimerChanged
+    );
 
     Q_PROPERTY(bool lyricBusy READ lyricBusy NOTIFY onlineLyricsChanged);
     Q_PROPERTY(QString lyricStatus READ lyricStatus NOTIFY onlineLyricsChanged);
@@ -88,19 +95,21 @@ public:
 
     [[nodiscard]] bool isPausedByScan() const { return mPausedByScan; }
     int64_t            normalizePositionDuringScan(int64_t requestedPosition);
-    void                  onPlaybackResumedAfterScan();
-    Q_INVOKABLE bool      isScanPauseActive() const { return mPausedByScan; }
-    Q_INVOKABLE bool      shouldPreserveMusicOnScanResultClose();
-    Q_INVOKABLE void      finishScanPause();
+    void               onPlaybackResumedAfterScan();
+    Q_INVOKABLE bool   isScanPauseActive() const { return mPausedByScan; }
+    Q_INVOKABLE bool   shouldPreserveMusicOnScanResultClose();
+    Q_INVOKABLE void   finishScanPause();
+    /// Only the verified native scan-start suspend may use this predicate; never explicit pause/TTS.
+    bool shouldPreventNativeScanSuspend(void* soundCenter) const;
 
     [[nodiscard]] bool getPauseOnScan() const;
-    void setPauseOnScan(bool enabled);
+    void               setPauseOnScan(bool enabled);
 
     [[nodiscard]] bool getHideFloatingWindow() const;
-    void setHideFloatingWindow(bool hidden);
+    void               setHideFloatingWindow(bool hidden);
 
     [[nodiscard]] bool getQuickPanelMusicView() const;
-    void setQuickPanelMusicView(bool showMusicControls);
+    void               setQuickPanelMusicView(bool showMusicControls);
 
     /// 供 QML 调用：将当前音频定位到指定的毫秒位置
     Q_INVOKABLE void seekToPosition(qint64 position);
@@ -115,10 +124,10 @@ public:
     Q_INVOKABLE void releaseAudioAfterHide();
     Q_INVOKABLE void setShutdownTimerMinutes(int minutes);
     Q_INVOKABLE void cancelShutdownTimer();
-    bool shutdownTimerEnabled() const { return mShutdownTimer.isActive() || mShutdownPending; }
-    int shutdownTimerMinutes() const { return mShutdownTimerMinutes; }
-    bool shutdownAfterPlaylist() const { return mShutdownAfterPlaylist; }
-    void setShutdownAfterPlaylist(bool enabled);
+    bool             shutdownTimerEnabled() const { return mShutdownTimer.isActive() || mShutdownPending; }
+    int              shutdownTimerMinutes() const { return mShutdownTimerMinutes; }
+    bool             shutdownAfterPlaylist() const { return mShutdownAfterPlaylist; }
+    void             setShutdownAfterPlaylist(bool enabled);
 
     /// 清理当前临时软链接
     void cleanupTempSymlinks();
@@ -191,21 +200,14 @@ private:
     bool    mScanResultClosed{false};
     int64_t mScanPausePosition{0};
 
-    /// 开关关闭时的"扫描播放保护"：厂商 QML 的扫描流程会关播放器并暂停（main.qml onOcrStart →
-    /// closeAudioPlayer()），且释放 MUSIC 引用会让 AudioDaemon 关掉 ALSA 设备；窗口内只救 PAUSED 那一次。
-    bool    mScanInProgress{false};
-    bool    mResumeAfterScan{false};
-    bool    mScanLockHeld{false};
-    int64_t mScanResumePosition{0};
-    QTimer  mScanGuardTimer;
+    /// Bounded page-navigation window only; decoder continuity is enforced at the native scan call site.
+    bool   mScanInProgress{false};
+    QTimer mScanGuardTimer;
 
     void onOcrStarted();
     void onOcrStopped();
     /// 宿主播放器此刻是否在播（扫描窗口结束时据此决定要不要补一次释放）。
     bool isHostPlaying() const;
-    void resumeAfterScan();
-    void acquireScanLock();
-    void releaseScanLock();
     void restoreScanPausePosition();
 };
 } // namespace mod::filemanager

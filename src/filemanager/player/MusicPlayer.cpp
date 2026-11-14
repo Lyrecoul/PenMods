@@ -18,8 +18,8 @@
 
 #include "media/MediaSession.h"
 
-#include "system/sound/AudioDaemon.h"
 #include "system/input/ScreenManager.h"
+#include "system/sound/AudioDaemon.h"
 
 #include <QCryptographicHash>
 #include <QFile>
@@ -37,6 +37,18 @@ static QString hostLocalFile(void* manager) {
     const auto holder = *(uintptr_t*)((uintptr_t)manager + 0x20);
     if (!holder) return {};
     return PEN_CALL(QString, "_ZNK12YMediaEntity9localFileEv", void*)((void*)(holder + 0x10));
+}
+
+// The manager's PLAYING notification is queued: TTS may already own the decoder while the UI still
+// says PLAYING. Never protect that pronunciation using a stale music state.
+static bool hostOwnsDecoder(void* soundCenter) {
+    auto* manager = YPointer<YMediaPlayerManager>::getInstance();
+    if (!manager || !soundCenter) return false;
+    const auto holder = *reinterpret_cast<uintptr_t*>(reinterpret_cast<uintptr_t>(manager) + 0x20);
+    if (!holder) return false;
+    const auto musicSequence = *reinterpret_cast<uint32_t*>(holder + 100);
+    return musicSequence != 0
+        && musicSequence == PEN_CALL(uint32_t, "_ZNK12YSoundCenter13currentPlayIdEv", void*)(soundCenter);
 }
 
 /**
@@ -384,7 +396,8 @@ void MusicPlayer::onSoundEnd() {
 
 AudioSequence MusicPlayer::getCurrentAudioSequence() {
     return PEN_CALL(AudioSequence, "_ZNK15YSettingManager13audioSequenceEv", void*)(
-        YPointer<YSettingManager>::getInstance());
+        YPointer<YSettingManager>::getInstance()
+    );
 }
 
 bool MusicPlayer::getPauseOnScan() const { return mPauseOnScan; }
@@ -465,7 +478,7 @@ void MusicPlayer::onOcrStarted() {
     if (!mIsTakeOver) {
         return;
     }
-    // 扫描窗口：开关开不开都要开窗，扫描结束（ocrStopped）或 15s 兜底超时后关闭。
+    // Bound page-navigation protection even when an intercepted scan never emits ocrStop.
     mScanInProgress = true;
     mScanGuardTimer.start(15 * 1000);
 
@@ -473,36 +486,8 @@ void MusicPlayer::onOcrStarted() {
     const auto state   = PEN_CALL(PlayState, "_ZNK19YMediaPlayerManager9playStateEv", void*)(manager);
 
     if (!mPauseOnScan) {
-        // 开关关闭：mod 不主动暂停，但厂商扫描流程会暂停并释放 MUSIC 引用（AudioDaemon 随即关
-        // 音频设备），所以记下"扫描前在播"、窗口内被暂停了再抢回来。连扫时保留上一次的恢复意图。
-        const bool chainedScan = mScanInProgress && mResumeAfterScan;
-        if (!chainedScan) {
-            mResumeAfterScan = false;
-        }
-        if (state != PlayState::PLAYING) {
-            if (chainedScan) {
-                QTimer::singleShot(1500, this, [this]() {
-                    if (!mScanInProgress) {
-                        return;
-                    }
-                    resumeAfterScan();
-                });
-            }
-            return;
-        }
-        mScanResumePosition = PEN_CALL(int64_t, "_ZNK19YMediaPlayerManager10currentPosEv", void*)(manager);
-        mResumeAfterScan    = true;
-        acquireScanLock();
-        info("扫描开始（开关关闭）：已在播 pos={}ms，扫描窗口内被暂停会恢复", mScanResumePosition);
-        // 厂商暂停发生在扫描开始的同步处理里（毫秒级），1.5s 后再看状态；这段窗口也是
-        // "用户手动暂停不抢回来"的隔离带。
-        QTimer::singleShot(1500, this, [this]() {
-            // 窗口已关（扫描很快结束/被放弃）就别再恢复：那多半是用户自己按下的暂停。
-            if (!mScanInProgress) {
-                return;
-            }
-            resumeAfterScan();
-        });
+        // Do not pause, seek, restart or acquire a second MUSIC reference. The native scan-start
+        // suspend hook prevents the interruption itself, rather than trying to undo it later.
         return;
     }
 
@@ -525,71 +510,28 @@ void MusicPlayer::onOcrStopped() {
         return;
     }
     mScanGuardTimer.stop();
-    releaseScanLock();
+    mScanInProgress = false;
     if (mPauseOnScan) {
         // 开关打开时暂停/恢复由 YDictPage 的 finishScanPause() 负责，这里不插手；暂停期间保持
         // MUSIC 引用是既有设计（用户可能在结果页恢复播放）。
-        mScanInProgress = false;
         return;
     }
-    // 先按需恢复再关窗：resumeAfterScan 的 1.5s 兜底回调会看这个标记。
-    resumeAfterScan();
-    mScanInProgress = false;
-    // 窗口内"隐藏播放器"会跳过释放（见 releaseAudioAfterHide），这里补一次，否则音频设备永远不会关。
+    // Hidden navigation retained the existing MUSIC reference. Release it only if music really
+    // stopped; an explicit pause must remain paused, never become an automatic scan resume.
     if (!isHostPlaying()) {
         releaseAudio();
     }
 }
 
 bool MusicPlayer::isHostPlaying() const {
-    const auto state =
-        PEN_CALL(PlayState, "_ZNK19YMediaPlayerManager9playStateEv", void*)(YPointer<YMediaPlayerManager>::getInstance());
+    const auto state = PEN_CALL(PlayState, "_ZNK19YMediaPlayerManager9playStateEv", void*)(
+        YPointer<YMediaPlayerManager>::getInstance()
+    );
     return state == PlayState::PLAYING;
 }
 
-void MusicPlayer::resumeAfterScan() {
-    if (!mResumeAfterScan) {
-        return;
-    }
-    mResumeAfterScan = false;
-
-    auto*      manager = YPointer<YMediaPlayerManager>::getInstance();
-    const auto state   = PEN_CALL(PlayState, "_ZNK19YMediaPlayerManager9playStateEv", void*)(manager);
-    if (state != PlayState::PAUSED) {
-        // 还在播（厂商没打断）或已被用户 stop（STOPPED）—— 都不该动。
-        debug("扫描结束：playState={} 且非 PAUSED，无需恢复", static_cast<int>(state));
-        return;
-    }
-
-    if (mod::AudioDaemon::getInstance().sourceRefCount(AudioSource::MUSIC) == 0) {
-        // 引用可能被厂商侧放干净（releaseAudio 只保留扫描锁那一份），恢复前补一份，
-        // 否则 AudioDaemon 会在 3s 后关掉设备 —— 界面在走、声音没了。
-        mod::AudioDaemon::getInstance().acquire(AudioSource::MUSIC);
-        info("恢复播放前重新持有 MUSIC 引用");
-    }
-
-    // 页面切换会把播放位置清 0，先回到扫描前的位置再播，避免从头开始。
-    PEN_CALL(void, "_ZN19YMediaPlayerManager13setCurrentPosERKx", void*, int64_t const&)(manager,
-                                                                                        mScanResumePosition);
-    PEN_CALL(void, "_ZN19YMediaPlayerManager13onClickedPlayEv", void*)(manager);
-    info("扫描结束：开关关闭，已恢复扫描前的播放 pos={}ms", mScanResumePosition);
-}
-
-void MusicPlayer::acquireScanLock() {
-    if (mScanLockHeld) {
-        return;
-    }
-    // 扫描期间厂商会 open/closeAudioOutput：MUSIC 引用还在，AudioDaemon 就会拦下 closeAudioOutput。
-    mod::AudioDaemon::getInstance().acquire(AudioSource::MUSIC);
-    mScanLockHeld = true;
-}
-
-void MusicPlayer::releaseScanLock() {
-    if (!mScanLockHeld) {
-        return;
-    }
-    mScanLockHeld = false;
-    mod::AudioDaemon::getInstance().release(AudioSource::MUSIC);
+bool MusicPlayer::shouldPreventNativeScanSuspend(void* soundCenter) const {
+    return mIsTakeOver && !mPauseOnScan && isHostPlaying() && hostOwnsDecoder(soundCenter);
 }
 
 void MusicPlayer::restoreScanPausePosition() {
@@ -597,8 +539,7 @@ void MusicPlayer::restoreScanPausePosition() {
         return;
     }
     auto* manager = YPointer<YMediaPlayerManager>::getInstance();
-    PEN_CALL(void, "_ZN19YMediaPlayerManager13setCurrentPosERKx", void*, int64_t const&)(manager,
-                                                                                         mScanPausePosition);
+    PEN_CALL(void, "_ZN19YMediaPlayerManager13setCurrentPosERKx", void*, int64_t const&)(manager, mScanPausePosition);
 }
 
 int64_t MusicPlayer::normalizePositionDuringScan(int64_t requestedPosition) {
@@ -607,7 +548,8 @@ int64_t MusicPlayer::normalizePositionDuringScan(int64_t requestedPosition) {
     }
     if (mPlaybackResumedDuringScan) {
         return PEN_CALL(int64_t, "_ZNK19YMediaPlayerManager10currentPosEv", void*)(
-            YPointer<YMediaPlayerManager>::getInstance());
+            YPointer<YMediaPlayerManager>::getInstance()
+        );
     }
     return mScanPausePosition > 0 ? mScanPausePosition : requestedPosition;
 }
@@ -632,8 +574,8 @@ void MusicPlayer::onPlaybackResumedAfterScan() {
 
 bool MusicPlayer::shouldPreserveMusicOnScanResultClose() {
     if (mPausedByScan && mPlaybackResumedDuringScan) {
-        // 扫描暂停过、用户又手动恢复：明确要听，别 forceStop。
-        return true;
+        // A manually resumed music session is protected only while it still owns the decoder.
+        return isHostPlaying() && hostOwnsDecoder(YPointer<YSoundCenter>::getInstance());
     }
     if (mPauseOnScan || !mIsTakeOver) {
         // 开关打开（暂停由 mod 接管）或播放不是 mod 起的：沿用厂商原来的判断。
@@ -641,9 +583,7 @@ bool MusicPlayer::shouldPreserveMusicOnScanResultClose() {
     }
     // 开关关闭时 mPausedByScan 恒为 false，只看它会把用户正在听的后台音乐 forceStop 掉，
     // 所以现场看宿主状态。判据必须是"现在还在播"，不能是"扫描窗口开着"（返回可能晚于扫描结束）。
-    const auto state =
-        PEN_CALL(PlayState, "_ZNK19YMediaPlayerManager9playStateEv", void*)(YPointer<YMediaPlayerManager>::getInstance());
-    return state == PlayState::PLAYING;
+    return isHostPlaying() && hostOwnsDecoder(YPointer<YSoundCenter>::getInstance());
 }
 
 void MusicPlayer::finishScanPause() {
@@ -684,11 +624,9 @@ void MusicPlayer::stop() {
     cancelOnlineLyrics();
     emit stopRequested();
 
-    // 用户主动停止：恢复意图作废，扫描锁还给 AudioDaemon。
-    mScanInProgress  = false;
-    mResumeAfterScan = false;
+    // Explicit stop ends the navigation window; nothing will automatically resume it.
+    mScanInProgress = false;
     mScanGuardTimer.stop();
-    releaseScanLock();
 
     auto* manager = YPointer<YMediaPlayerManager>::getInstance();
     if (!manager) {
@@ -696,8 +634,8 @@ void MusicPlayer::stop() {
         return;
     }
 
-    mCurrentPlaying.mIsEnd = true;
-    auto state = PlayState::STOPPED;
+    mCurrentPlaying.mIsEnd                    = true;
+    auto state                                = PlayState::STOPPED;
     *(uint32*)(*((uint64*)manager + 4) + 100) = 0;
     // 清除状态/曲目并不会停止解码器，必须先通知 YSoundCenter 停掉实际音频。
     PEN_CALL(void, "_ZN12YSoundCenter9forceStopEv", void*)(YPointer<YSoundCenter>::getInstance());
@@ -711,18 +649,12 @@ void MusicPlayer::stop() {
 }
 
 void MusicPlayer::releaseAudio() {
-    if (!mScanInProgress) {
-        // 只有不在扫描窗口内的 releaseAudio 才代表用户真的不想播了（窗口内的来自厂商页面切换）。
-        mResumeAfterScan = false;
-    }
-    mPausedByScan = false;
+    mPausedByScan              = false;
     mPlaybackResumedDuringScan = false;
     mScanResultClosed          = false;
     info("QML 请求释放 MUSIC 引用");
     auto& audioDaemon = mod::AudioDaemon::getInstance();
-    // 扫描保护期间至少留一份引用，否则厂商的 closeAudioOutput 会关掉 ALSA 设备（后台音频"死在设备层"）。
-    const int keep = mScanLockHeld ? 1 : 0;
-    while (audioDaemon.sourceRefCount(AudioSource::MUSIC) > keep) {
+    while (audioDaemon.sourceRefCount(AudioSource::MUSIC) > 0) {
         audioDaemon.release(AudioSource::MUSIC);
     }
 }
@@ -754,6 +686,27 @@ void releaseSessionForHostPlayback() {
 }
 
 } // namespace
+
+PEN_HOOK(void, _ZN12YSoundCenter7suspendEv, void* self) {
+#if defined(__aarch64__)
+    // YDP02X: onScanStart+0x118 is BL suspend, returning to +0x11c. Match the relocated symbol
+    // and validate that instruction, not an absolute address or a broad "scan in progress" flag.
+    // Other firmware/layouts fail open; explicit onClickedPause, QML suspend and TTS are untouched.
+    static const auto scanStart = reinterpret_cast<uintptr_t>(PEN_SYM("_ZN11YSystemBase11onScanStartEv"));
+    static const auto suspend   = reinterpret_cast<uintptr_t>(PEN_SYM("_ZN12YSoundCenter7suspendEv"));
+    const auto        caller = reinterpret_cast<uintptr_t>(__builtin_extract_return_addr(__builtin_return_address(0)));
+    if (scanStart && suspend && caller == scanStart + 0x11c) {
+        const auto callSite     = scanStart + 0x118;
+        const auto expectedCall = 0x94000000u | static_cast<uint32_t>(((suspend - callSite) >> 2) & 0x03ffffffu);
+        if (*reinterpret_cast<const uint32_t*>(callSite) == expectedCall
+            && MusicPlayer::getInstance().shouldPreventNativeScanSuspend(self)) {
+            spdlog::info("[MusicPlayer] Prevented native scan-start suspend; decoder music continues");
+            return;
+        }
+    }
+#endif
+    origin(self);
+}
 
 PEN_HOOK(void*, _ZN13YMediaManager9playAudioERK18YColumnMediaEntityb, void* self, const void* entity, bool play) {
     if (play) releaseSessionForHostPlayback();

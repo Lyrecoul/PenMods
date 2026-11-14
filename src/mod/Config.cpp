@@ -159,7 +159,10 @@ Config::Config() : Logger("Config") {
             {"last_wallpaper", ""}
         }},
         {"capture", {
-            {"enabled", false}
+            {"enabled", false},
+            {"default_stitch_direction", "vertical"},
+            {"default_crop_mode", "upper"},
+            {"region_defaults_version", 1}
         }},
         {"keyboard", {
             {"layout", "native"}
@@ -398,7 +401,19 @@ bool Config::_load() {
     }
     mData                       = std::move(tmp);
     const bool legacyAiUpgraded = _upgrade_legacy_ai_defaults(mData);
-    if (_fill_missing_defaults(mData, mDefaults) || legacyAiUpgraded) {
+    // Older capture defaults exported both native representations of the same scan.
+    // Migrate once; an explicit full-image choice made afterwards must survive restarts.
+    bool captureCropUpgraded = false;
+    if (mData.contains("capture") && mData["capture"].is_object()
+        && !mData["capture"].contains("region_defaults_version")) {
+        auto& capture = mData["capture"];
+        if (capture.value("default_crop_mode", std::string("none")) == "none") {
+            capture["default_crop_mode"] = "upper";
+        }
+        capture["region_defaults_version"] = 1;
+        captureCropUpgraded = true;
+    }
+    if (_fill_missing_defaults(mData, mDefaults) || legacyAiUpgraded || captureCropUpgraded) {
         info("Filling missing default keys, saving...");
         _save();
     }

@@ -227,7 +227,15 @@ static bool callYdstitchSaveImg(std::string& outPath) {
 
     StitchString result = fn();
 
-    if (!parseStitchString(result, outPath)) {
+    const bool valid = parseStitchString(result, outPath);
+    // The returned path owns libstdc++ storage. Destroy it with its own ABI,
+    // otherwise every continuous scan leaks the native path allocation.
+    using StringDestructor    = void (*)(StitchString*);
+    static auto destroyString = reinterpret_cast<StringDestructor>(
+        dlsym(RTLD_DEFAULT, "_ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEED1Ev")
+    );
+    if (destroyString) destroyString(&result);
+    if (!valid) {
         spdlog::warn("[CameraCapture] ydstitch_save_img returned empty/invalid path.");
         return false;
     }
@@ -238,8 +246,11 @@ static bool callYdstitchSaveImg(std::string& outPath) {
 // ── CameraCapture ──────────────────────────────────────────────────
 
 CameraCapture::CameraCapture() {
-    mCfg            = Config::getInstance().read(mClassName);
-    mCaptureEnabled = mCfg.value("enabled", false);
+    mCfg = Config::getInstance().read(mClassName);
+    // Capture is a page-owned runtime state, never a persisted preference.
+    mCaptureEnabled     = false;
+    const auto cropMode = mCfg.value("default_crop_mode", std::string("upper"));
+    mDefaultCropMode    = cropMode == "upper" ? 1 : cropMode == "lower" ? 2 : 0;
 
     connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView& view, QQmlContext* context) {
         context->setContextProperty("cameraCapture", this);
@@ -249,11 +260,31 @@ CameraCapture::CameraCapture() {
 bool CameraCapture::isCaptureEnabled() const { return mCaptureEnabled; }
 
 void CameraCapture::setCaptureEnabled(bool val) {
-    if (mCaptureEnabled != val) {
-        mCaptureEnabled = val;
-        UPDATE_CFG("enabled", val);
+    if (mCaptureEnabled.exchange(val) != val) {
         emit captureEnabledChanged();
     }
+}
+
+QString CameraCapture::defaultStitchDirection() const {
+    return mCfg.value("default_stitch_direction", std::string("vertical")) == "horizontal" ? "horizontal" : "vertical";
+}
+
+QString CameraCapture::defaultCropMode() const {
+    const int mode = mDefaultCropMode.load();
+    return mode == 1 ? "upper" : mode == 2 ? "lower" : "none";
+}
+
+void CameraCapture::setDefaultStitchDirection(const QString& direction) {
+    if ((direction != "horizontal" && direction != "vertical") || direction == defaultStitchDirection()) return;
+    UPDATE_CFG("default_stitch_direction", direction.toStdString());
+    emit defaultsChanged();
+}
+
+void CameraCapture::setDefaultCropMode(const QString& mode) {
+    if ((mode != "upper" && mode != "lower" && mode != "none") || mode == defaultCropMode()) return;
+    mDefaultCropMode = mode == "upper" ? 1 : mode == "lower" ? 2 : 0;
+    UPDATE_CFG("default_crop_mode", mode.toStdString());
+    emit defaultsChanged();
 }
 
 void CameraCapture::onScanComplete() {
@@ -263,17 +294,42 @@ void CameraCapture::onScanComplete() {
 
     std::string origPath;
     if (!callYdstitchSaveImg(origPath)) {
+        emit captureFailed("扫描图片保存失败，请重新扫描");
         return;
     }
 
     QImage img(QString::fromStdString(origPath));
     if (img.isNull()) {
         spdlog::warn("[CameraCapture] onScanComplete: failed to load image");
+        emit captureFailed("扫描图片读取失败，请重新扫描");
         return;
     }
     if (qint64(img.width()) * img.height() > MaxImagePixels) {
         spdlog::warn("[CameraCapture] onScanComplete: image resolution is too high");
+        emit captureFailed("扫描图片分辨率过高");
         return;
+    }
+
+    const int cropMode = mDefaultCropMode.load();
+    if (cropMode != 0) {
+        // Native save_img stacks crop_result above result_middle_line, not all_result.
+        // Only read cv::Mat's stable initial int fields; never cross its C++ ABI.
+        const auto* upper       = static_cast<const char*>(dlsym(RTLD_DEFAULT, "crop_result"));
+        const auto* lower       = static_cast<const char*>(dlsym(RTLD_DEFAULT, "result_middle_line"));
+        int         upperHeight = 0, upperWidth = 0, lowerHeight = 0, lowerWidth = 0;
+        if (upper && lower) {
+            std::memcpy(&upperHeight, upper + 8, sizeof(int));
+            std::memcpy(&upperWidth, upper + 12, sizeof(int));
+            std::memcpy(&lowerHeight, lower + 8, sizeof(int));
+            std::memcpy(&lowerWidth, lower + 12, sizeof(int));
+        }
+        if (upperHeight <= 0 || lowerHeight <= 0 || upperWidth <= 0 || lowerWidth <= 0
+            || qint64(upperHeight) + lowerHeight != img.height() || std::max(upperWidth, lowerWidth) != img.width()) {
+            emit captureFailed("无法确定原图与校正图区域，请在设置中选择不裁剪后重试");
+            return;
+        }
+        img =
+            cropMode == 1 ? img.copy(0, 0, upperWidth, upperHeight) : img.copy(0, upperHeight, lowerWidth, lowerHeight);
     }
 
     QByteArray ba;
@@ -281,6 +337,7 @@ void CameraCapture::onScanComplete() {
     buffer.open(QIODevice::WriteOnly);
     if (!img.save(&buffer, "JPEG", 85) || ba.size() > (MaxBase64Chars / 4) * 3) {
         spdlog::warn("[CameraCapture] onScanComplete: encoded image is too large");
+        emit captureFailed("扫描图片编码失败或图片过大");
         return;
     }
 

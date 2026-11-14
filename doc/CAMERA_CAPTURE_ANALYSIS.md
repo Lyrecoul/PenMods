@@ -165,14 +165,14 @@ int ydstitch_get_img(
 
 ## 5. ydstitch_save_img 接口说明
 
+```cpp
+// YDP02X 实机 libYoudaoStitch.so 导出；并不是 int(const char*)。
+std::string ydstitch_save_img();
 ```
-int ydstitch_save_img(
-    const char *filepath      // [输入] 保存路径
-);
-```
-
-- 直接将当前拼接结果保存为图像文件
-- 输出格式由库根据文件扩展名决定
+- 返回实际保存路径；运行时通过 ARM64 X8 隐藏返回指针接收 libstdc++ 字符串，不能直接跨 libc++ ABI 调用。
+- 2026-11-14 从实机读取库后反汇编确认：`ydstitch_save_img` 位于 `0x31a60`；保存路径为 `/userdata/DictPenData/CapData/result_<时间>_<序号>.jpg`。
+- `0x320c0–0x32300` 构造输出画布：宽度为两个源图宽度最大值，高度为两个源图高度之和；`crop_result` 放在 `(0, 0)`，`result_middle_line` 放在 `(0, crop_result.rows)`。用户所称“上部原图 / 下部校正图”对应这两个区域，**不是简单对半裁剪**；两图可以不同高、不同宽。此前把下部写成 `all_result` 是错误的：保存函数的 GOT 地址 `0x25ab80` 对应 `result_middle_line`，不是 `all_result` 所在的 `0x25abd0`。
+- 两个导出对象都是 `cv::Mat`，其开头的 `int rows/cols` 分别在 `+8/+12`。CameraCapture 只读取这四个整数，不调用 OpenCV C++ 对象；裁剪前校验总高度和最大宽度与实际 JPEG 一致。不匹配时明确报错，不猜测中点或静默保存错误区域。
 
 ---
 
@@ -225,3 +225,14 @@ camera_get_frame
 camera_init
 camera_set_sw_buff_timeout
 camera_reset_sw_buff
+```
+
+## 9. AI 助手连续拍摄
+
+- 进入“拍摄图片”即启动会话；每次扫描直接追加并按默认方向异步拼接，预览时不再需要点击“继续拍摄”。正在拼接时的新扫描进入有界队列，处理结束后按扫描顺序合入。
+- “裁剪”可手动编辑最新一帧；编辑时再次扫描会先异步确认当前裁剪，再加入新帧。取消裁剪保留已接受帧；页面返回则取消整个拍摄会话，晚到异步结果不会进入草稿。
+- “逐张保存”仍把各帧作为独立附件；“完成保存”返回拼图。最多 8 帧，已存帧和排队帧总计最多 16 MiB base64 字符，达到上限后停止接收并提示，保存或清空后再继续。
+- 助手设置中的 `capture.default_stitch_direction`（`vertical` / `horizontal`，默认 `vertical`）和 `capture.default_crop_mode`（`none` / `upper` / `lower`，默认 `upper`）持久化。默认仅输出上部原图，排除同一扫描的下部校正副本；完整上下两图仍可显式选择。默认区域在原生扫描图读取后、JPEG 编码前裁剪，后续手动裁剪基于该区域。`captureEnabled` 是页面拥有的临时状态，不随设置写盘。
+- `capture.region_defaults_version=1` 标记默认区域的一次性迁移：旧配置为 `none` 或缺少区域时改为 `upper`，已选 `upper` / `lower` 保留。迁移后主动选择 `none` 不会在重启时被覆盖。旧版无法区分主动选择 `none` 与旧默认值，因此首次均迁移。
+- 前次注入测试仅验证了给定区域后的裁剪编码，且把 `all_result` 同时当作下部测试对象，未覆盖厂商真实保存函数，无法证明真实扫描可用。随后用户扫描触发区域失配：原图 `crop_result=178×109`，校正图 `result_middle_line=161×55`，保存 JPEG 为 `178×164`，而 `all_result=244×109`。修复改为读取 `result_middle_line`，保留严格尺寸校验，不用猜测比例或退回完整重复图来掩盖错误。
+- 修复验证使用用户失败的公式 JPEG 和实测的三组矩阵尺寸，在设备内调用真实 OpenCV 矩阵构造、真实 `ydstitch_save_img` 和实际 `onScanComplete()`，未替换保存函数。旧库原图/校正图均报区域错误；修复后分别输出 178×109、161×55、178×164，三种模式通过。

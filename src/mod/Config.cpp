@@ -82,6 +82,11 @@ Config::Config() : Logger("Config") {
                 {"ASound", "info"}
             }}
         }},
+        {"ai_translation", {
+            {"enabled", false},
+            {"model_id", ""},
+            {"timeout_ms", 15000}
+        }},
         {"query", {
             {"lower_scan", false},
             {"type_by_hand", true}

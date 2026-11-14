@@ -5,6 +5,7 @@
  */
 
 #include "tweaker/QueryTweaks.h"
+#include "tweaker/AiTranslation.h"
 
 #include "common/Event.h"
 
@@ -23,6 +24,7 @@ QueryTweaks::QueryTweaks() {
 
     connect(&Event::getInstance(), &Event::beforeUiInitialization, [this](QQuickView& view, QQmlContext* context) {
         context->setContextProperty("queryTweaks", this);
+        context->setContextProperty("aiTranslation", &AiTranslation::getInstance());
     });
 }
 
@@ -62,11 +64,14 @@ PEN_HOOK(
     int     a6,
     bool    a7
 ) {
-    auto &qt = mod::QueryTweaks::getInstance();
+    auto& qt = mod::QueryTweaks::getInstance();
+    qt.queryStarting();
     if (qt.getLowerScan()) {
         what = what.toLower();
     }
     what.replace(QRegularExpression(QStringLiteral(" {2,}")), QStringLiteral(" "));
-    return origin(self, what, a3, a4, a5, a6, a7);
+    const auto result = origin(self, what, a3, a4, a5, a6, a7);
+    qt.queryReturned();
+    return result;
 }
 #endif

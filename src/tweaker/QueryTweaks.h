@@ -26,6 +26,8 @@ public:
     void setTypeByHand(bool);
 
 signals:
+    void queryStarting();
+    void queryReturned();
 
     void lowerScanChanged();
 

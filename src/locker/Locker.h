@@ -29,6 +29,8 @@ public:
 
     Q_INVOKABLE void setScene(const QString&, bool);
 
+    Q_INVOKABLE bool authorize(const QString& scene, const QString& password = {}) const;
+
 signals:
 
     void passwordChanged();

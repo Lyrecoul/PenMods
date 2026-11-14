@@ -11,6 +11,7 @@
 #include "common/Utils.h"
 #include "common/service/Logger.h"
 
+#include "locker/Locker.h"
 #include "mod/Mod.h"
 
 #include "tweaker/ColumnDBLimiter.h"
@@ -183,7 +184,7 @@ QHash<int, QByteArray> FileManager::roleNames() const {
         {(int)UserRoles::ExtensionName, "extName"     },
         {(int)UserRoles::ExtensionIcon, "extIcon"     },
         {(int)UserRoles::IsExecutable,  "isExecutable"},
-        {(int)UserRoles::IsSymLink,     "isSymLink"}
+        {(int)UserRoles::IsSymLink,     "isSymLink"   }
     };
 };
 
@@ -204,18 +205,37 @@ QDir const& FileManager::getCurrentPath() const { return mCurrentPath; }
 
 QString FileManager::getCurrentPathString() const { return mCurrentPath.path(); }
 
+QString FileManager::browseRoot() const { return mRootMode ? QStringLiteral("/") : mRoot; }
+
+bool FileManager::pathAllowed(const QString& path) const {
+    if (mRootMode) return true;
+    const QString canonical = QFileInfo(path).canonicalFilePath();
+    const QString root      = QFileInfo(mRoot).canonicalFilePath();
+    return !root.isEmpty() && (canonical == root || canonical.startsWith(root + '/'));
+}
+
+bool FileManager::setRootMode(bool enabled, const QString& password) {
+    if (enabled && !Locker::getInstance().authorize(QStringLiteral("filemanager_root"), password)) return false;
+    if (mRootMode == enabled) return true;
+    mRootMode = enabled;
+    cancelRemoval();
+    emit rootModeChanged();
+    changeDir({});
+    return true;
+}
+
 bool FileManager::changeDir(const QString& dir) {
     if (dir.isEmpty()) {
         emit directoryAboutToChange(true);
         // 返回根目录
         mPathHistory.clear();
-        mPathHistory.push_back(mRoot);
-        mCurrentPath.setPath(mRoot);
+        mPathHistory.push_back(browseRoot());
+        mCurrentPath.setPath(browseRoot());
     } else if (dir == "..") {
         // 返回上级目录
         if (mPathHistory.size() > 1) {
             emit directoryAboutToChange(true);
-            mPathHistory.pop_back(); // 弹出当前路径
+            mPathHistory.pop_back();                // 弹出当前路径
             QString prevPath = mPathHistory.back(); // 获取上一级路径
             mCurrentPath.setPath(prevPath);
         } else {
@@ -226,7 +246,7 @@ bool FileManager::changeDir(const QString& dir) {
         debug("Move to dir -> {}", dir.toStdString());
 
         // 检查是否是软链接目录
-        QString targetPath = mCurrentPath.absoluteFilePath(dir);
+        QString   targetPath = mCurrentPath.absoluteFilePath(dir);
         QFileInfo fileInfo(targetPath);
 
         QString nextPath;
@@ -244,7 +264,7 @@ bool FileManager::changeDir(const QString& dir) {
         }
 
         // 验证路径是否存在
-        if (!QDir(nextPath).exists()) {
+        if (!QDir(nextPath).exists() || !pathAllowed(nextPath)) {
             return false;
         }
 
@@ -260,6 +280,7 @@ bool FileManager::changeDir(const QString& dir) {
 
 void FileManager::finishDirectoryChange() {
     mRefreshTimer->stop();
+    cancelRemoval();
     QMutexLocker locker(&mInotifyMutex);
     addInotifyWatch(mCurrentPath.path());
     reset();
@@ -315,7 +336,7 @@ void FileManager::loadMore(int amount) {
 }
 
 void FileManager::reload() {
-    emit refreshing();
+    emit      refreshing();
     const int loadedCount = std::max(mProxyCount, 1500);
     reset();
     mCurrentPath.refresh();
@@ -333,9 +354,27 @@ void FileManager::reset() {
 }
 
 void FileManager::remove(const QString& fileName) {
-    if (!mCurrentPath.exists(fileName)) {
+    cancelRemoval();
+    if (fileName.isEmpty() || fileName == "." || fileName == ".." || fileName.contains('/')) return;
+    if (mRootMode) {
+        mPendingRemoval = mCurrentPath.absoluteFilePath(fileName);
+        emit rootRemovalConfirmationRequired(mPendingRemoval);
         return;
     }
+    removeEntry(fileName);
+}
+
+void FileManager::cancelRemoval() { mPendingRemoval.clear(); }
+
+void FileManager::confirmRemoval(const QString& path) {
+    if (!mRootMode || path.isEmpty() || path != mPendingRemoval) return;
+    cancelRemoval();
+    if (QFileInfo(path).absolutePath() != mCurrentPath.absolutePath()) return;
+    removeEntry(QFileInfo(path).fileName());
+}
+
+void FileManager::removeEntry(const QString& fileName) {
+    if (!pathAllowed(mCurrentPath.path())) return;
     int idx = 0;
     for (const auto& i : mEntities) {
         if (i->fileName() != fileName) {
@@ -346,13 +385,15 @@ void FileManager::remove(const QString& fileName) {
         QString   filePath = mCurrentPath.absoluteFilePath(fileName);
         QFileInfo fileInfo(filePath);
 
-        if (fileInfo.isSymLink()) {
-            // 如果是软链接，只需删除链接本身，而不删除目标
-            mCurrentPath.remove(fileName);
-        } else if (i->isDir()) {
-            exec(QString("rm -rf \"%1\"").arg(filePath));
+        bool removed;
+        if (fileInfo.isDir() && !fileInfo.isSymLink()) {
+            removed = QDir(filePath).removeRecursively();
         } else {
-            mCurrentPath.remove(fileName);
+            removed = QFile::remove(filePath);
+        }
+        if (!removed) {
+            emit exception("删除失败：文件只读、正在使用或权限不足");
+            return;
         }
         const bool visibleRow = idx < mProxyCount;
         if (visibleRow) beginRemoveRows(QModelIndex(), idx, idx);
@@ -368,6 +409,9 @@ void FileManager::remove(const QString& fileName) {
 }
 
 void FileManager::rename(const QString& fileName, const QString& newFileName) {
+    if (!pathAllowed(mCurrentPath.path()) || fileName.isEmpty() || fileName == "." || fileName == ".."
+        || fileName.contains('/'))
+        return;
     if (!judgeIsLegalFileName(newFileName)) {
         showToast("文件名不能包含特殊字符", "#E9900C");
         return;
@@ -451,7 +495,7 @@ QString FileManager::getCurrentTitle() const {
     }
 
     // 获取当前路径相对于根目录的部分
-    auto    path = mCurrentPath.path().remove(0, mRoot.size());
+    auto    path = mCurrentPath.path().mid(browseRoot() == "/" ? 0 : mRoot.size());
     QString ret  = "(根目录)";
     auto    list = path.split("/", Qt::SkipEmptyParts);
     for (auto i = 0; i < list.size(); i++) {
@@ -470,7 +514,7 @@ bool FileManager::isHasMore() const {
 
 void FileManager::_initCurrentDir() {
     // 1. 安全检查与重置
-    if (Mod::getInstance().isTrustedDevice() && shouldHiddenAll()) {
+    if (!mRootMode && Mod::getInstance().isTrustedDevice() && shouldHiddenAll()) {
         emit error("空文件夹");
         reset();
         return;
@@ -482,6 +526,7 @@ void FileManager::_initCurrentDir() {
     // 2. 准备标志位和排序参数
     auto order = getOrder();
     auto flags = QDir::Dirs | QDir::Files | QDir::NoDotAndDotDot;
+    if (mRootMode) flags |= QDir::System | QDir::Hidden;
     if (getShowHiddenFiles()) {
         flags |= QDir::Hidden;
     }
@@ -580,7 +625,7 @@ void FileManager::_initCurrentDir() {
 
     // 6. 处理同名歌词文件隐藏（先精确匹配，再模糊匹配）
     QSet<QString> filesToHide;
-    if (getHidePairedLyrics()) {
+    if (!mRootMode && getHidePairedLyrics()) {
         // 收集所有支持的侧挂歌词文件。
         QVector<QFileInfo> lrcFiles;
         for (const auto& i : list) {
@@ -590,17 +635,16 @@ void FileManager::_initCurrentDir() {
         const QStringList audioExts = {"mp3", "flac", "m4a", "wav", "ogg", "aac"};
         for (const auto& i : list) {
             const QString ext = i.suffix().toLower();
-            if (!audioExts.contains(ext))
-                continue;
+            if (!audioExts.contains(ext)) continue;
 
-            const QString baseName = i.completeBaseName();
-            double        bestScore  = 0.0;
+            const QString baseName  = i.completeBaseName();
+            double        bestScore = 0.0;
             QString       bestMatch;
 
             for (const auto& lrc : lrcFiles) {
                 const QString lrcBase = lrc.completeBaseName();
                 if (lrcBase == baseName) {
-                    bestScore  = 1.0;
+                    bestScore = 1.0;
                     bestMatch = lrc.absoluteFilePath();
                     break;
                 }
@@ -626,7 +670,7 @@ void FileManager::_initCurrentDir() {
         if (!filesToHide.empty() && filesToHide.contains(i.absoluteFilePath())) {
             continue;
         }
-        if (!getShowHiddenFiles() && i.fileName().startsWith('.')) {
+        if (!mRootMode && !getShowHiddenFiles() && i.fileName().startsWith('.')) {
             continue;
         }
         mEntities.emplace_back(std::make_shared<QFileInfo>(i));
@@ -818,8 +862,11 @@ void FileManager::addInotifyWatch(const QString& path) {
         }
 
         // 添加新的监视
-        mWatchFd = inotify_add_watch(mInotifyFd, path.toLocal8Bit().data(),
-                                   IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_MODIFY);
+        mWatchFd = inotify_add_watch(
+            mInotifyFd,
+            path.toLocal8Bit().data(),
+            IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_MODIFY
+        );
         if (mWatchFd < 0) {
             error("Failed to add inotify watch for path {}: {}", path.toStdString(), strerror(errno));
         } else {
@@ -871,7 +918,7 @@ void FileManager::stopInotifyThread() {
 }
 
 void FileManager::inotifyLoop() {
-    char buffer[4096];
+    char   buffer[4096];
     fd_set readfds;
 
     while (true) {
@@ -880,7 +927,7 @@ void FileManager::inotifyLoop() {
 
         // 使用 select 等待事件，超时时间为 1 秒，以便能够响应线程退出信号
         struct timeval timeout;
-        timeout.tv_sec = 1;
+        timeout.tv_sec  = 1;
         timeout.tv_usec = 0;
 
         int ret = select(mInotifyFd + 1, &readfds, nullptr, nullptr, &timeout);

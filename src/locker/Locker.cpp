@@ -28,7 +28,13 @@ bool Locker::getEnabled() const { return mEnabled; }
 
 QString Locker::getPassword() const { return mPassword; }
 
-bool Locker::getScene(const QString& val) const { return getEnabled() && mCfg["scene"][val.toStdString()]; }
+bool Locker::getScene(const QString& val) const {
+    return getEnabled() && mCfg["scene"].value(val.toStdString(), false);
+}
+
+bool Locker::authorize(const QString& scene, const QString& password) const {
+    return !getScene(scene) || password == mPassword;
+}
 
 void Locker::setEnabled(bool val) {
     if (mEnabled != val) {

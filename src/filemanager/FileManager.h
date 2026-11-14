@@ -33,6 +33,7 @@ class FileManager : public QAbstractListModel, public Singleton<FileManager>, pr
 
     // File visibility
     Q_PROPERTY(bool showHiddenFiles READ getShowHiddenFiles WRITE setShowHiddenFiles NOTIFY showHiddenFilesChanged);
+    Q_PROPERTY(bool rootMode READ getRootMode NOTIFY rootModeChanged);
 
 public:
     [[nodiscard]] int rowCount(const QModelIndex& parent) const override;
@@ -49,7 +50,7 @@ public:
 
     Q_INVOKABLE QString getCurrentPathString() const;
 
-    Q_INVOKABLE bool changeDir(const QString& dir);
+    Q_INVOKABLE bool    changeDir(const QString& dir);
     Q_INVOKABLE bool    navigateToAncestor(int depth);
     QStringList         getBreadcrumbs() const;
     Q_INVOKABLE QString fileNameAt(int row) const;
@@ -67,6 +68,11 @@ public:
     Q_INVOKABLE void reset();
 
     Q_INVOKABLE void remove(const QString& fileName);
+
+    Q_INVOKABLE bool setRootMode(bool enabled, const QString& password = {});
+    bool             getRootMode() const { return mRootMode; }
+    Q_INVOKABLE void confirmRemoval(const QString& path);
+    Q_INVOKABLE void cancelRemoval();
 
     Q_INVOKABLE void rename(const QString& fileName, const QString& newFileName);
 
@@ -132,6 +138,9 @@ signals:
 
     void showHiddenFilesChanged();
 
+    void rootModeChanged();
+    void rootRemovalConfirmationRequired(const QString& path);
+
 private:
     friend Singleton<FileManager>;
     explicit FileManager();
@@ -149,19 +158,24 @@ private:
     };
 
     // Natural language comparison function for semantic sorting
-    static bool naturalCompare(const QString &a, const QString &b);
+    static bool naturalCompare(const QString& a, const QString& b);
 
     std::string mClassName{"fm"};
     json        mCfg;
 
     const QString mRoot{"/userdisk/Music"};
+    bool          mRootMode{false};
+    QString       mPendingRemoval;
+    QString       browseRoot() const;
+    bool          pathAllowed(const QString& path) const;
+    void          removeEntry(const QString& fileName);
 
     // Inotify variables
-    int mInotifyFd{-1};
-    int mWatchFd{-1};
-    QThread* mInotifyThread{nullptr};
-    mutable QMutex mInotifyMutex;
-    std::atomic<bool>  mShouldNotifyDirChanged{true};
+    int               mInotifyFd{-1};
+    int               mWatchFd{-1};
+    QThread*          mInotifyThread{nullptr};
+    mutable QMutex    mInotifyMutex;
+    std::atomic<bool> mShouldNotifyDirChanged{true};
 
     int  mOrder;
     bool mOrderReversed;
@@ -171,9 +185,9 @@ private:
     int                                     mProxyCount{};
 
     // 路径历史栈，用于跟踪包括软链接在内的路径变化
-    std::vector<QString>                    mPathHistory;
+    std::vector<QString> mPathHistory;
 
-    void _initCurrentDir();
+    void    _initCurrentDir();
     void    finishDirectoryChange();
     QTimer* mRefreshTimer{nullptr};
 

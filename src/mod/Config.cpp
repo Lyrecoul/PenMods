@@ -125,6 +125,8 @@ Config::Config() : Logger("Config") {
                 {"reset_page", true},
                 {"dev_setting", false},
                 {"filemanager",false},
+                {"plugin_manager", true},
+                {"filemanager_root", true},
                 {"antiembs_deactivate", false}
             }}
         }},

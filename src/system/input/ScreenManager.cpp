@@ -17,7 +17,9 @@
 
 #include <QCoreApplication>
 #include <QDebug>
+#include <QFile>
 #include <QMouseEvent>
+#include <QProcess>
 #include <QQmlContext>
 #include <QTimer>
 
@@ -152,8 +154,37 @@ bool ScreenManager::eventFilter(QObject* watched, QEvent* event) {
 }
 
 void ScreenManager::onScreenOn() {
-    mScreenOn = true;
+    const bool wasScreenOn = mScreenOn;
+    mScreenOn              = true;
     InputDaemon::getInstance().onScreenStateChanged(true);
+    if (!wasScreenOn) {
+        const auto sequence = ++mScreenStateSeq;
+        // Power-key wake bypasses [Idle] reset. Finish the vendor off/on pair
+        // after onScreenOn returns, otherwise its screen_off press can leave
+        // the host's radio power-saving timer armed. Never wake a dark screen.
+        QTimer::singleShot(0, this, [this, sequence]() {
+            if (!mScreenOn || sequence != mScreenStateSeq || !QFile::exists("/tmp/screen_status")) {
+                return;
+            }
+            auto* process = new QProcess(this);
+            connect(process, &QProcess::errorOccurred, this, [this, process](QProcess::ProcessError) {
+                warn("补齐厂商屏幕唤醒失败：{}", process->errorString().toStdString());
+                process->deleteLater();
+            });
+            connect(
+                process,
+                QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                this,
+                [this, process](int code, QProcess::ExitStatus status) {
+                    if (code != 0 || status != QProcess::NormalExit) {
+                        warn("补齐厂商屏幕唤醒失败：exit={}", code);
+                    }
+                    process->deleteLater();
+                }
+            );
+            process->start("screen_onoff", {"on"});
+        });
+    }
     info(
         "screen on：charging={} external_power={}（重置关机计时；audio_lock={}）",
         BatteryInfo::getInstance().isCharging(),
@@ -179,6 +210,7 @@ void ScreenManager::onScreenOn() {
 }
 
 void ScreenManager::onScreenOff() {
+    ++mScreenStateSeq;
     mScreenOn = false;
     InputDaemon::getInstance().onScreenStateChanged(false);
     info(

@@ -94,6 +94,7 @@ private:
     // 等 onScreenOn 补做；mScreenOn 只用于这个判断。
     bool mScreenOn{true};
     bool mResumePending{false};
+    uint64      mScreenStateSeq{0}; // Invalidates queued wake completion after another transition.
     json        mCfg;
 
     int  mAutoSleepDuration;

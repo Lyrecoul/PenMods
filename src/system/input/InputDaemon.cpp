@@ -366,6 +366,27 @@ bool InputDaemon::_installConfig(const Config& cfg, const std::string& rendered,
     const QString effective    = QString::fromStdString(cfg.mEffectivePath);
     const bool    hasEffective = cfg.mEffectivePath != cfg.mPath && QFile::exists(effective);
 
+    // Preserve the pre-PenMods contents before touching either inode. A bind
+    // mount aliases the model file, so backing up after the write is too late.
+    // Existing backups are never refreshed; older releases may already have
+    // replaced the factory contents, which cannot be reconstructed here.
+    const auto backup = [this, reason](const std::string& path) {
+        const QString source = QString::fromStdString(path);
+        const QString saved  = source + ".factory-bak";
+        if (!QFile::exists(source) || QFile::exists(saved)) {
+            return true;
+        }
+        if (!QFile::copy(source, saved)) {
+            error("[{}] 无法备份 {} 到 {}，拒绝覆盖配置", reason, path, saved.toStdString());
+            return false;
+        }
+        info("[{}] 已保留首次修改前的配置：{}", reason, saved.toStdString());
+        return true;
+    };
+    if (!backup(cfg.mPath) || (hasEffective && !backup(cfg.mEffectivePath))) {
+        return false;
+    }
+
     // daemon 实际读取 /etc/input-event-daemon.conf；boot 时 init 脚本把它 `mount --bind`
     // 到每机型文件上，两者共享同一个 inode（正常状态）。
     bool sharedInode      = false;
@@ -705,9 +726,9 @@ reset = sleep 0.1; screen_onoff on; system_post_wakeup; sleep 1; killall -9 syst
 #
 
 [Global]
-listen = /dev/input/event2
-listen = /dev/input/event3
-listen = /dev/input/event4
+listen = /dev/input/by-path/platform-adc-keys-event
+listen = /dev/input/by-path/platform-led_control-event
+listen = /dev/input/by-path/platform-ff190000.i2c-event
 
 [Keys]
 #POWER        = system_sleep_wakeup auto
@@ -733,9 +754,9 @@ reset = screen_onoff on; sleep 1; killall -9 system_sleep_wakeup
 #
 
 [Global]
-listen = /dev/input/event2
-listen = /dev/input/event3
-listen = /dev/input/event4
+listen = /dev/input/by-path/platform-adc-keys-event
+listen = /dev/input/by-path/platform-led_control-event
+listen = /dev/input/by-path/platform-ff190000.i2c-event
 
 [Keys]
 #POWER        = system_sleep_wakeup auto

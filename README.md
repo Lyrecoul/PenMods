@@ -111,6 +111,12 @@ P5/X5 | 🔴 | N/A | N/A | -
  - 蓝牙耳机电量
    - 在蓝牙设置及状态栏显示耳机报告的电量，支持 HFP 电量上报与耳机名称恢复
  - Github Action CI 自动构建配置
+ - 自动熄屏与唤醒
+   - Exam/V4 使用稳定的物理输入设备路径，避免 `eventN` 编号漂移后监听到 `fake-keys`，造成自动熄屏后立即亮起（[#35](https://github.com/Lyrecoul/PenMods/issues/35)）。
+   - 屏幕由灭变亮后，若 `/tmp/screen_status` 仍存在，异步执行 `screen_onoff on` 补齐厂商 `screen_off release`；已经完成的唤醒不重复补发，过期的唤醒任务不点亮新熄灭的屏幕。
+   - 首次覆盖输入配置前保存同目录 `*.factory-bak`，以后不更新该备份；备份失败时拒绝覆盖。备份只代表首次修改前的内容，无法恢复旧版已覆盖的原厂配置。
+   - 主机回归：`python3 -B tools/test_input_daemon.py`（Qt Quick 开发包、spdlog、nlohmann_json、bubblewrap）；隔离 `/etc` 和 `/tmp`，覆盖 Exam/V4 编号漂移、唤醒配对、过期任务及备份失败保护。
+   - 2026-11-15 实机验证（Exam_V0，USB 供电）：自动熄屏后保持不自亮；向真实电源键输入节点注入短按唤醒后，状态标记清除，75 秒后 WiFi 扫描和蓝牙发现正常，ADB 指针操作可打开快捷面板。未验证电池供电、V4 实机、实体触摸及整夜循环。
 
 ### Features (1.2.0)
  - 增强 AI 助手

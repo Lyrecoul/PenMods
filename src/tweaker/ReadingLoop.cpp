@@ -2,6 +2,9 @@
 #include "tweaker/ReadingLoop.h"
 #include "common/Event.h"
 #include <QQmlContext>
+#if defined(__aarch64__)
+#include "filemanager/player/MusicPlayer.h"
+#endif
 
 namespace mod {
 namespace {
@@ -61,6 +64,23 @@ PEN_HOOK(void, _ZN12YSoundCenter9forceStopEv, void* self) {
     origin(self);
 }
 PEN_HOOK(void, _ZN12YSoundCenter7suspendEv, void* self) {
+#if defined(__aarch64__)
+    // YDP02X: onScanStart+0x118 is BL suspend, returning to +0x11c. Match the relocated symbol
+    // and validate that instruction, not an absolute address or a broad "scan in progress" flag.
+    // Other firmware/layouts fail open; explicit onClickedPause, QML suspend and TTS are untouched.
+    static const auto scanStart = reinterpret_cast<uintptr_t>(PEN_SYM("_ZN11YSystemBase11onScanStartEv"));
+    static const auto suspend   = reinterpret_cast<uintptr_t>(PEN_SYM("_ZN12YSoundCenter7suspendEv"));
+    const auto        caller = reinterpret_cast<uintptr_t>(__builtin_extract_return_addr(__builtin_return_address(0)));
+    if (scanStart && suspend && caller == scanStart + 0x11c) {
+        const auto callSite     = scanStart + 0x118;
+        const auto expectedCall = 0x94000000u | static_cast<uint32_t>(((suspend - callSite) >> 2) & 0x03ffffffu);
+        if (*reinterpret_cast<const uint32_t*>(callSite) == expectedCall
+            && filemanager::MusicPlayer::getInstance().shouldPreventNativeScanSuspend(self)) {
+            spdlog::info("[MusicPlayer] Prevented native scan-start suspend; decoder music continues");
+            return;
+        }
+    }
+#endif
     ReadingLoop::getInstance().interrupt();
     origin(self);
 }

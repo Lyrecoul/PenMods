@@ -219,7 +219,7 @@ struct QtMetaDataEntry {
 
 ### 11.2 PenMods 的精确拦截
 
-`MusicPlayer.cpp` 的 `YSoundCenter::suspend` hook 仅在全部条件成立时跳过原函数：
+`ReadingLoop.cpp` 统一注册 `YSoundCenter::suspend` hook，先执行音乐的精确扫描保护，放行时再中断循环朗读并调用原函数。不要在 `MusicPlayer.cpp` 重复注册同一符号：Dobby 拒绝第二次注册，会让其中一个功能失效。仅在全部条件成立时跳过原函数：
 
 - 返回地址恰好是已重定位的 `YSystemBase::onScanStart + 0x11c`；
 - `onScanStart + 0x118` 的机器指令仍是指向已解析 `suspend` 符号的 AArch64 `BL`；

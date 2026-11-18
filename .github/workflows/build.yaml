@@ -78,7 +78,7 @@ jobs:
           # 但装在容器里成本几乎为零，手动构建时不必再来一次 "no extractor found"
           pacman -S --noconfirm \
             base-devel git zig wget curl \
-            python3 ninja cmake nasm libxcrypt lame opencc qt5-tools qt5-base \
+            python3 ninja cmake nasm libxcrypt lame opencc qt5-tools qt5-base qt6-declarative \
             unzip perl openssl python-certifi
 
       - name: 安装 aarch64-linux-gnu 工具链
@@ -99,6 +99,9 @@ jobs:
 
       - name: 校验共享调色板与对比度
         run: python3 scripts/generate_palette.py --check
+
+      - name: 校验聊天草稿、工具卡片和搜索开关
+        run: python3 scripts/check_chatbot_qml.py
 
       # 内嵌 CA 包没有任何吊销检查（issue #18）：黑名单里的根或 hash 与 PEM 错位时直接失败；
       # certifi 跟 Mozilla 最快，比对只报 warning，提示该跑 scripts/update_ca_bundle.sh 了。

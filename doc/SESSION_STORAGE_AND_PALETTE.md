@@ -44,6 +44,29 @@ nlohmann_json headers, then checks single-session edits, deletion, active-sessio
 selection and failed writes against a 30-session/3000-message fixture. It does not
 exercise the app's event loop; verify migration, editing and reopening on-device.
 
+## Cached chatbot page and tool ordering (#33, #36)
+
+Leaving the cached assistant page retains its unsent draft text, attachments,
+editing target and send-failure rollback state in memory. Closing the page
+invalidates outstanding capture/file-read callbacks and stops capture; cancelling
+the draft or switching sessions still clears it. Drafts are not saved to disk and
+do not survive an app restart.
+
+Tool snapshots anchor the card at the first tool's answer/reasoning offsets.
+Streaming status updates do not split an answer again; completion and history
+reload preserve text segments before and after the card. Native search uses its
+own persisted switch in both the popup and settings, without enabling external
+search as a fallback.
+
+`python3 scripts/check_chatbot_qml.py` extracts production logic and the real
+search popup from the generated header, then exercises Qt ListModels and popup
+clicks using Qt Quick Test (Qt 5 or 6). It covers draft retention, session clearing,
+streaming tool updates, history projection, legacy tool anchors and both search
+switches. CI runs it against the bundled resources, not the ignored QML tree, so
+regenerating resources from stale sources cannot silently drop these fixes again.
+The harness does not load the vendor app; capture hardware and the complete page
+layout still need device verification.
+
 ## Shared palette (#24)
 
 `scripts/generate_palette.py` generates the ignored source

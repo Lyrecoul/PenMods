@@ -4,8 +4,13 @@ const os = require('os');
 const path = require('path');
 
 let Resvg;
+let renderAsync;
 try {
-    Resvg = require('@resvg/resvg-js').Resvg;
+    ({ Resvg, renderAsync } = require('@resvg/resvg-js'));
+    if (typeof renderAsync !== 'function') {
+        // 老版本 binding 没有异步入口：退回同步渲染（只是不再并行）。
+        renderAsync = null;
+    }
 } catch (err) {
     console.error('致命错误：无法加载 @resvg/resvg-js native 模块。');
     console.error('请确保已安装正确的平台原生包：');
@@ -420,8 +425,72 @@ class RateLimiter {
     }
 }
 
-const renderMutex = new Mutex();
 const rateLimiter = new RateLimiter(1000, RATE_LIMIT_PER_SECOND);
+
+// --- 光栅化并发 ---
+// 每次 new Resvg() 都会新建一个 fontdb 并 load_system_fonts()（解析 fonts.conf + 扫描
+// /usr/lib/fonts 里的 100+ 个字体），这是单次渲染里最贵的一段，而且完全同步。
+// resvg-js 的 renderAsync() 把「建 Resvg + 渲染」整套丢给 napi 的 worker 线程池
+// （libuv 默认 4 线程），所以并发几个请求是**真并行**，不是在一个 JS 线程上排队。
+// 以前整个 /render 被 renderMutex 串行化，客户端那 4 个并发请求实际只能一个接一个地渲染。
+// 这里改成只给"光栅化"这一步设上限，MathJax 转换仍在主线程（很快且做过去重）。
+// 上限默认 3：设备只有 4 个 A35 核、内存也紧，留一个核给主线程和 UI 服务。
+const RENDER_CONCURRENCY = Math.max(1, Math.min(4, parseInt(process.env.RENDER_CONCURRENCY || '', 10) || 3));
+const renderSlots = new Mutex(); // 只用来串行化"拿槽位"这件瞬时操作
+class Semaphore {
+    constructor(count) { this._free = count; this._waiters = []; }
+    async acquire() {
+        await renderSlots.acquire();
+        const available = this._free > 0;
+        if (available) this._free--;
+        const waiter = available ? null : new Promise(resolve => this._waiters.push(resolve));
+        renderSlots.release();
+        if (waiter) await waiter;
+    }
+    release() {
+        const next = this._waiters.shift();
+        if (next) next();
+        else this._free++;
+    }
+}
+const renderSemaphore = new Semaphore(RENDER_CONCURRENCY);
+const renderQueue = new Set();
+
+/// 在该请求的 worker 线程上把一张 SVG 光栅化成 PNG。返回 null 表示并发已满、调用方应改用同步路径。
+async function rasterizeAsync(svgText, options) {
+    const image = await renderAsync(svgText, options);
+    return image;
+}
+
+// --- 渲染结果 LRU 缓存（按请求输入） ---
+// 客户端每个进程维护自己的公式缓存，但应用重启、或另一条会话重新打开时，同一段回答里的
+// 公式会原样再请求一遍。这里按"影响输出的全部输入"缓存响应体，命中时直接回上次的响应，
+// 省掉一次 MathJax 转换和一次 resvg 光栅化 —— 后者最贵：resvg-js 2.6.2 的每个 Resvg 实例
+// 都要重新装载系统字体（实测 x86 上 loadSystemFonts:true 约 13ms，同一张图关掉后 0.2ms），
+// 设备上的字体文件更多、更慢。
+//
+// 键必须覆盖所有影响输出的输入：latex、display、屏幕宽高（决定 maxW 与 containerWidth）、
+// 颜色，以及字体状态（启动探测定下来之后就固定了，仍然放进键里，免得 pending 期间算出的
+// 结果在字体状态切换后被复用）。输出尺寸规则与 RENDERER_VERSION 都不受影响。
+const RENDER_CACHE_MAX = 160;      // 160 条响应；实测单条 1.2–24 KB，满盘约 1.5–3 MB
+const renderCache = new Map();     // Map 保持插入顺序：重插即"最近使用"，头部即最久未用
+function renderCacheKey(latex, display, sw, sh, color) {
+    return [latex, display ? 1 : 0, sw, sh, color, fontState.status, fontState.family || ''].join('\u0001');
+}
+function renderCacheGet(key) {
+    const hit = renderCache.get(key);
+    if (hit === undefined) return null;
+    renderCache.delete(key);
+    renderCache.set(key, hit);
+    return hit;
+}
+function renderCachePut(key, value) {
+    renderCache.set(key, value);
+    while (renderCache.size > RENDER_CACHE_MAX) {
+        renderCache.delete(renderCache.keys().next().value);
+    }
+    return value;
+}
 
 /**
  * 解析 SVG 中以 ex 为单位的原始宽高。
@@ -1095,6 +1164,9 @@ async function main() {
             status: 'ok',
             uptime: process.uptime(),
             renderer: RENDERER_VERSION,
+            // 并行渲染能力（1 = 串行）。新客户端据此决定发送节奏：
+            // 老服务端没有这个字段，客户端保持保守的约 8 请求/秒。
+            parallel: renderAsync ? RENDER_CONCURRENCY : 1,
             ...cjkReport()
         });
     });
@@ -1128,12 +1200,27 @@ async function main() {
         const sw = Math.max(Math.round(screenWidth), MIN_PNG_DIM);
         const sh = Math.max(Math.round(screenHeight), MIN_PNG_DIM);
 
-        await renderMutex.acquire();
+        // 完全相同的一次渲染（同式子/同宽度/同颜色/同字体状态）直接复用上次的响应体。
+        const cacheKey = renderCacheKey(latex, display, sw, sh, color);
+        const cachedResponse = renderCacheGet(cacheKey);
+        if (cachedResponse) {
+            log(`缓存命中：latex="${latex.slice(0, 30)}" (${clientIp})`);
+            return res.status(200).json(cachedResponse);
+        }
+
         try {
             const maxW = Math.min(sw - 20, MAX_RENDER_WIDTH);
 
             // MathJax 渲染成 SVG（尺寸度量与出图共用同一次转换）
+            // 同一次请求里同一个式子往往要转换好几次（换行算法按实测宽度反复量：实测一条
+            // 79 项的加法链调用 41 次，去重后只有 25 个不同输入）。转换是纯函数（只依赖
+            // latex、display 以及本请求的容器宽度/颜色/字体状态），所以按两者记忆即可，
+            // 输出与逐次转换字节一致，只是少算几遍。
+            const svgMemo = new Map();
             const renderSvg = (latexText, isDisplay) => {
+                const memoKey = (isDisplay ? 'D' : 'I') + '\u0000' + latexText;
+                const memoized = svgMemo.get(memoKey);
+                if (memoized !== undefined) return memoized;
                 const containerNode = mathjaxDocument.convert(latexText, {
                     display: isDisplay,
                     em: REF_EM,
@@ -1147,18 +1234,35 @@ async function main() {
                 // 只有显式字体文件才改写 <text> 的 font-family（指到该字体的真实 family）。
                 // 系统字体模式下保持 MathJax 原样：font-family="serif" 由 fontconfig 解析，
                 // 缺字时 resvg 还会逐字回退到装得下的中文字体（真机上实测正常）。
-                return fontState.status === 'file' ? applyCjkFamily(svg, fontState.family) : svg;
+                const out = fontState.status === 'file' ? applyCjkFamily(svg, fontState.family) : svg;
+                if (svgMemo.size < 512) svgMemo.set(memoKey, out);
+                return out;
             };
             const svgSize = (svg) => {
                 const size = getSvgExSize(svg);
                 if (!size) return null;
                 return { w: size.w_ex * REF_EM / 2, h: size.h_ex * REF_EM / 2 };
             };
-            const rasterize = (svg, size) => {
+            // 光栅化是整条链路里最贵的一段（见 RENDER_CONCURRENCY 的注释）：走 renderAsync，
+            // 让它在 napi 的 worker 线程上跑，主线程只负责 MathJax 转换与响应。
+            // 输出与同步的 new Resvg().render() 完全一致（同一个 Rust 实现，同一套参数）；
+            // 尺寸规则（fitTo / maxW）没有改动。
+            const rasterize = async (svg, size) => {
                 const fitTo = size && size.w > 0
                     ? { mode: 'width', value: Math.max(1, Math.round(Math.min(size.w, maxW))) }
                     : calcFitTo(svg, sw, sh);
-                const pngData = new Resvg(svg, { fitTo, font: resvgFontOptions() }).render();
+                const options = { fitTo, font: resvgFontOptions() };
+                let pngData;
+                if (renderAsync) {
+                    await renderSemaphore.acquire();
+                    try {
+                        pngData = await renderAsync(svg, options);
+                    } finally {
+                        renderSemaphore.release();
+                    }
+                } else {
+                    pngData = new Resvg(svg, options).render();
+                }
                 return {
                     data: pngData.asPng().toString('base64'),
                     width: pngData.width,
@@ -1178,33 +1282,37 @@ async function main() {
             };
 
             if (!wrapped.lines) {
-                const png = rasterize(wrapped.single, wrapped.size);
+                const png = await rasterize(wrapped.single, wrapped.size);
                 log(`渲染：${png.width}×${png.height}  latex="${latex.slice(0, 30)}" (${clientIp})`);
-                return res.status(200).json({
+                return res.status(200).json(renderCachePut(cacheKey, {
                     data: png.data,
                     width: png.width,
                     height: png.height,
                     naturalWidth,
                     naturalHeight,
                     renderer: RENDERER_VERSION,
+                    parallel: renderAsync ? RENDER_CONCURRENCY : 1,
                     ...cjkFields
-                });
+                }));
             }
 
-            const lines = wrapped.lines.map((line) => {
-                const png = rasterize(line.svg, line.size);
-                return {
+            // 多行按顺序渲染：一行占一个并发槽，避免一个长公式把设备上所有槽位全占满。
+            // 行与行之间只有 await，主线程仍然可以处理别的请求。
+            const lines = [];
+            for (const line of wrapped.lines) {
+                const png = await rasterize(line.svg, line.size);
+                lines.push({
                     data: png.data,
                     width: png.width,
                     height: png.height,
                     naturalWidth: line.size ? Math.round(line.size.w) : null,
                     latex: line.latex
-                };
-            });
+                });
+            }
             const width = lines.reduce((max, line) => Math.max(max, line.width), 0);
             const height = lines.reduce((sum, line) => sum + line.height, 0) + (lines.length - 1) * LINE_GAP;
             log(`换行渲染：${lines.length} 行 ${width}×${height}  latex="${latex.slice(0, 30)}" (${clientIp})`);
-            return res.status(200).json({
+            return res.status(200).json(renderCachePut(cacheKey, {
                 // data 保留首行，旧版客户端至少能显示一行
                 data: lines[0].data,
                 width,
@@ -1214,13 +1322,12 @@ async function main() {
                 naturalWidth,
                 naturalHeight,
                 renderer: RENDERER_VERSION,
+                parallel: renderAsync ? RENDER_CONCURRENCY : 1,
                 ...cjkFields
-            });
+            }));
         } catch (error) {
             console.error(`渲染失败 (${clientIp})：`, error.message);
             res.status(500).json({ error: '渲染失败', details: error.message });
-        } finally {
-            renderMutex.release();
         }
     });
 
@@ -1236,7 +1343,7 @@ async function main() {
             : (cjk.status === 'system'
                 ? `系统字体 family="${cjk.family}" (${cjk.verdict})`
                 : `不可用（${cjk.reason}），中文会显示为空白`)}`);
-        console.log(`  并发保护: 已启用 (单队列串行)`);
+        console.log(`  并发渲染: ${renderAsync ? `${RENDER_CONCURRENCY} 路并行 (worker 线程)` : '串行（binding 无 renderAsync）'}`);
         console.log(`  频率限制: ${RATE_LIMIT_PER_SECOND} req/s per IP`);
         console.log(`  调试日志: ${DEBUG ? '开启' : '关闭'} (设置 DEBUG=1 开启)`);
     });

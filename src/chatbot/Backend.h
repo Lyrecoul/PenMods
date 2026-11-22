@@ -71,6 +71,9 @@ struct SessionData {
     QString              updatedAt;
     QString              lastConversationAt;
     bool                 manualTitle       = false;
+    /// 标题是"发送时用用户原话前几十字兜出来的预览"（QML setSessionPreviewTitle），
+    /// 不是真正生成/用户改过的标题：原生会话标题到了以后应当覆盖它。
+    bool                 previewTitle      = false;
     int                  completedRounds   = 0;
     int                  titleAttemptRound = 0;
     QString              lastCompletedUserId;
@@ -118,6 +121,19 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
         QString proxyVisionPrompt READ getProxyVisionPrompt WRITE setProxyVisionPrompt NOTIFY proxyVisionSettingsChanged
     )
 
+    // DeepSeek 官方 API 适配。生效条件只有一处判定：模型开了适配开关 **且** endpoint 指向 api.deepseek.com
+    // （deepseekAdapterActive()）。QML 用它冻结上层配置，请求侧用它决定发不发扩展字段——两边同一判据，
+    // 不会出现“界面冻结了但请求仍在发”或反之的情况。
+    Q_PROPERTY(bool deepseekAdapterActive READ getDeepseekAdapterActive NOTIFY activeModelCapabilitiesChanged)
+    // 该模型的联网由 DeepSeek 原生工具接管（nativeSearchActive 为真且来自适配开关）
+    Q_PROPERTY(bool deepseekWebToolsActive READ getDeepseekWebToolsActive NOTIFY activeModelCapabilitiesChanged)
+    // 会话标题由 DeepSeek 原生生成（标题模型不可选，外层 auto_title.enabled 仍决定是否生成）
+    Q_PROPERTY(
+        bool deepseekSessionTitleActive READ getDeepseekSessionTitleActive NOTIFY activeModelCapabilitiesChanged
+    )
+    // 文件解析：引用文件不再按扩展名白名单拦截，交由服务端判断
+    Q_PROPERTY(bool fileParsingActive READ getFileParsingActive NOTIFY activeModelCapabilitiesChanged)
+
     // 厂商搜索模式由模型配置决定；开关独立保存，关闭后仍不回退到外部服务。
     Q_PROPERTY(bool nativeSearchActive READ getNativeSearchActive NOTIFY activeModelCapabilitiesChanged)
     Q_PROPERTY(
@@ -155,6 +171,11 @@ public:
     // #21-3 附件边界常量：QML 预检与 C++ 保持同一来源，避免两处硬编码漂移。
     Q_INVOKABLE int     maxImageBytes() const;
     Q_INVOKABLE int     maxMediaJsonBytes() const;
+    // 引用文件的扩展名策略：唯一来源在 C++（QML 只调用，不再各自维护一份列表）。
+    // attachmentExtensionAllowed 在 fileParsingActive() 时对任意扩展名返回 true。
+    Q_INVOKABLE bool        attachmentExtensionAllowed(const QString& fileName) const;
+    Q_INVOKABLE QStringList textAttachmentExtensions() const;
+
     Q_INVOKABLE bool    isAvailable();
     Q_INVOKABLE void    reloadConfig();
     Q_INVOKABLE void    sanitizeConfig();
@@ -280,6 +301,12 @@ public:
     void    setSearchProvider(const QString& provider);
     void    setSearchEnabled(bool v);
     void    setSearchCount(int count);
+
+    // DeepSeek 官方 API 适配（见 Backend.cpp 的 deepseekAdapterActive()）
+    bool getDeepseekAdapterActive() const;
+    bool getDeepseekWebToolsActive() const;
+    bool getDeepseekSessionTitleActive() const;
+    bool getFileParsingActive() const;
 
     bool getTavilyEnabled() const { return m_searchProvider == "tavily" && m_searchEnabled; }
     bool getTavilyConfigured() const { return !m_searchTavilyKey.isEmpty(); }
@@ -416,6 +443,18 @@ private:
     QString m_reasoningEffort;
     int     m_maxContextSize = 0;
 
+    // DeepSeek 官方 API 适配。缺省全 false：旧配置没有这些字段时一律按关闭处理，
+    // normalizeModel 只补默认值，不会把旧模型判成非法。
+    bool m_deepseekAdapter   = false;
+    bool m_capNativeWebTools = false; // 声明 deepseek_web_search
+    bool m_capFileParsing    = false; // 引用文件不再按扩展名拦截
+    bool m_capReadUrl        = false; // 声明 deepseek_read_url
+    bool m_capSessionTitle   = false; // 请求体带 title:{enabled:true}
+    bool m_capMetaMarker     = false; // 每轮插入 latest_reminder 元信息消息
+    // 已为该会话请求过原生标题：官方建议只在会话第一次请求上开 title（最多等 5 秒）。
+    // 纯内存态；重启后重发一次也无害，因为已有标题不会被覆盖。
+    QSet<QString> m_nativeTitleRequested;
+
     QString m_proxyVisionModelId;
     QString m_proxyVisionPrompt = "请详细描述这张图片的内容。如果图片中有文字，请完整转录。";
 
@@ -542,6 +581,17 @@ private:
     bool    searchConfigured() const;
     bool    searchToolAvailable() const;
     QString effectiveSearchKey() const;
+
+    // 适配开关与 endpoint 域名的双重判定：请求侧所有 DeepSeek 扩展字段都过这一关，
+    // 保证中转/第三方端点永远不会收到 DeepSeek 专有字段（否则 400）。
+    bool deepseekAdapterActive() const;
+    // 只有“联网工具/阅读链接”回答才需要剥内联引用角标，避免影响普通模型的数学/数组内容。
+    bool deepseekCitationStrippingActive() const;
+    // 本次请求是否该带 title:{enabled:true}
+    bool nativeTitleRequestWanted() const;
+    void applyNativeSessionTitle(const QString& title);
+    // 落库/渲染前的正文清洗：仅在 DeepSeek 联网适配生效时剥掉内联引用角标
+    QString sanitizeAnswerText(const QString& text) const;
     QString formatSearchResults(const QString& query, const QJsonArray& results, bool includeContent) const;
     void    injectToolDefinitions(QJsonObject& requestBody);
     QVector<MessagePart> persistGeneratedImages(const QJsonArray& output);

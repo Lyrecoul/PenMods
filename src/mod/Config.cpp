@@ -197,13 +197,19 @@ Config::Config() : Logger("Config") {
                     {"reasoningEffort", ""},
                     {"nativeWebSearchEnabled", false},
                     {"nativeWebSearchProvider", "auto"},
+                    {"deepseekAdapter", false},
                     {"capabilities", json{
                         {"text",      true},
                         {"vision",    false},
                         {"audio",     false},
                         {"toolCall",  false},
                         {"reasoning",       false},
-                        {"imageGeneration", false}
+                        {"imageGeneration", false},
+                        {"nativeWebTools",  false},
+                        {"fileParsing",     false},
+                        {"readUrl",         false},
+                        {"sessionTitle",    false},
+                        {"metaMarker",      false}
                     }},
                     {"extraParams", ""},
                     {"proxyVisionModelId", ""},

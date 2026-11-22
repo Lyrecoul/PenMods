@@ -281,6 +281,7 @@ PEN_HOOK(bool, license_verify) { return true; }
 #include "filemanager/viewer/ImageViewer.h"
 
 #include "helper/AntiEmbs.h"
+#include "helper/Contributors.h"
 #include "helper/DeveloperSettings.h"
 #include "helper/FontCache.h"
 #include "helper/NetworkSettings.h"
@@ -381,6 +382,7 @@ __attribute__((constructor)) static void BeforeMain() {
     INSTANCE(BluetoothStorage);
     INSTANCE(BluetoothBattery);
     INSTANCE(CaCertificates);
+    INSTANCE(Contributors);
     INSTANCE(DeveloperSettings);
     INSTANCE(FontCache);
     INSTANCE(NetworkSettings);

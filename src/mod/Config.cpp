@@ -176,6 +176,9 @@ Config::Config() : Logger("Config") {
         }},
         {"ai", {
             {"auto_send_scan", true},
+            // 扫描结束后的默认行为：send / input / capture / off
+            // （auto_send_scan 仅作为旧版回退兼容字段继续写，见 KeyBoard::setScanBehavior）
+            {"scan_behavior", "send"},
             {"speech_assistant", false},
             {"streaming", true},
             {"bubble_render_mode", "full"},
@@ -408,6 +411,9 @@ bool Config::_load() {
     }
     mData                       = std::move(tmp);
     const bool legacyAiUpgraded = _upgrade_legacy_ai_defaults(mData);
+    // ai.auto_send_scan(bool) → ai.scan_behavior(string)。必须在
+    // _fill_missing_defaults 之前跑：默认值一旦先写进去，老的"关闭"状态会被抹成 send。
+    const bool scanBehaviorUpgraded = _upgrade_scan_behavior(mData);
     // Older capture defaults exported both native representations of the same scan.
     // Migrate once; an explicit full-image choice made afterwards must survive restarts.
     bool captureCropUpgraded = false;
@@ -420,11 +426,29 @@ bool Config::_load() {
         capture["region_defaults_version"] = 1;
         captureCropUpgraded = true;
     }
-    if (_fill_missing_defaults(mData, mDefaults) || legacyAiUpgraded || captureCropUpgraded) {
+    if (_fill_missing_defaults(mData, mDefaults) || legacyAiUpgraded || captureCropUpgraded
+        || scanBehaviorUpgraded) {
         info("Filling missing default keys, saving...");
         _save();
     }
     info("Successfully loaded configuration.");
+    return true;
+}
+
+// 「扫描结果快速发送」布尔开关升级为四态「默认扫描行为」。
+// 老配置只有 auto_send_scan：true → send，false → off。已经存在 scan_behavior 的配置
+// 一律不碰（用户在新版里选过 input/capture 之后不能因为老字段被改回去）。
+bool Config::_upgrade_scan_behavior(json& data) {
+    if (!data.contains("ai") || !data["ai"].is_object()) return false;
+    auto& ai = data["ai"];
+    if (ai.contains("scan_behavior") && ai["scan_behavior"].is_string()) return false;
+
+    std::string behavior = "send";
+    if (ai.contains("auto_send_scan") && ai["auto_send_scan"].is_boolean()) {
+        behavior = ai["auto_send_scan"].get<bool>() ? "send" : "off";
+    }
+    ai["scan_behavior"] = behavior;
+    info("扫描结果处理方式已迁移为 scan_behavior={}", behavior);
     return true;
 }
 

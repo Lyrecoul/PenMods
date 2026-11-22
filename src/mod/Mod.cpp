@@ -316,6 +316,7 @@ PEN_HOOK(bool, license_verify) { return true; }
 
 #include "torch/Torch.h"
 
+#include "tweaker/AsrService.h"
 #include "tweaker/ColumnDBLimiter.h"
 #include "tweaker/KeyBoard.h"
 #include "tweaker/LoggerMonitor.h"
@@ -421,6 +422,7 @@ __attribute__((constructor)) static void BeforeMain() {
     INSTANCE(Torch);
 
     // tweaker
+    INSTANCE(AsrService);
     INSTANCE(ColumnDBLimiter);
     INSTANCE(KeyBoard);
     INSTANCE(LoggerMonitor);

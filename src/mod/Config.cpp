@@ -223,6 +223,20 @@ Config::Config() : Logger("Config") {
                 }
             })},
             {"activePromptId", "default"},
+            // 需求 10：DeepSeek 语音识别接管。
+            //   enabled           接管开关（默认关闭；关闭时不装任何 hook，行为与原生一致）
+            //   deepseek_api_key  本页专用 key；为空时依次回退到 ai.search.deepseek_api_key
+            //                     和当前活动模型（且其 endpoint 指向 api.deepseek.com）的 apiKey
+            //   model             仅作记录，接口路径固定是 /v1/tools/asr
+            //   timeout_ms        单次识别等待上限
+            //   max_record_ms     单次采集上限（DeepSeek 接口本身限制 120 秒）
+            {"asr", {
+                {"enabled", false},
+                {"deepseek_api_key", ""},
+                {"model", "deepseek-asr"},
+                {"timeout_ms", 20000},
+                {"max_record_ms", 45000}
+            }},
             {"search", {
                 {"provider", "off"},
                 {"enabled", false},

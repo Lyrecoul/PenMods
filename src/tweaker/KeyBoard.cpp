@@ -9,6 +9,7 @@
 #include "common/Event.h"
 #include "mod/Config.h"
 #include "system/input/ScreenManager.h"
+#include "tweaker/AsrService.h"
 
 #include "base/YPointer.h"
 
@@ -274,6 +275,12 @@ void KeyBoard::setScanBehavior(const QString& value) {
 }
 
 bool KeyBoard::startVoiceInput(QObject* speechManager) {
+    // 需求 10：DeepSeek 语音识别接管（默认关闭，只接管这个键盘语音键）。
+    // 关闭时 beginVoiceCapture() 立刻返回 false，这里不会碰麦克风，下面的原厂流程与以前
+    // 一模一样；开启且条件满足时由 AsrService 自己录音并返回 true，这时不调用厂商的
+    // startAsrRecord —— 两路麦克风采集不能同时开。
+    if (mod::AsrService::getInstance().beginVoiceCapture(speechManager)) return true;
+
     auto* startAsrRecord = PEN_SYM("_ZN14YSpeechManager14startAsrRecordEv");
     auto* setAsrResult   = PEN_SYM("_ZN14YSpeechManager12setAsrResultERK7QString");
     if (speechManager == nullptr || startAsrRecord == nullptr || setAsrResult == nullptr) return false;
@@ -288,6 +295,10 @@ bool KeyBoard::startVoiceInput(QObject* speechManager) {
 }
 
 bool KeyBoard::stopVoiceInput(QObject* speechManager) {
+    // 同上：接管中的停止由 AsrService 负责（停止采集 → 上传 → 注入文本 / 失败回退）。
+    // 长按语音那条路不经过这里，仍然完全由厂商处理。
+    if (mod::AsrService::getInstance().endVoiceCapture(speechManager)) return true;
+
     auto* stopAsrRecord = PEN_SYM("_ZN14YSpeechManager13stopAsrRecordEv");
     if (speechManager == nullptr || stopAsrRecord == nullptr) return false;
 

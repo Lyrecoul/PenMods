@@ -140,7 +140,8 @@ Config::Config() : Logger("Config") {
             {"low_voice", false},
             {"no_auto_pron", false},
             {"fast_hide_music", false},
-            {"fast_mute", false}
+            {"fast_mute", false},
+            {"boot_mute", false}
         }},
         {"serv", {
             {"ssh_autorun", false},

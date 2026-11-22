@@ -21,6 +21,7 @@ class AntiEmbs : public QObject, public Singleton<AntiEmbs> {
     Q_PROPERTY(bool active READ isActive NOTIFY activeChanged);
     Q_PROPERTY(bool lowVoiceMode READ getLowVoiceMode WRITE setLowVoiceMode NOTIFY lowVoiceModeChanged);
     Q_PROPERTY(bool fastMute READ getFastMute WRITE setFastMute NOTIFY fastMuteChanged);
+    Q_PROPERTY(bool bootMute READ getBootMute WRITE setBootMute NOTIFY bootMuteChanged);
 
 public:
     void onUiCompleted();
@@ -43,6 +44,8 @@ public:
 
     [[nodiscard]] bool getFastMute() const;
 
+    [[nodiscard]] bool getBootMute() const;
+
     // =================================
 
     void setAutoMute(bool);
@@ -54,6 +57,8 @@ public:
     void setLowVoiceMode(bool);
 
     void setFastMute(bool);
+
+    void setBootMute(bool);
 
 signals:
 
@@ -71,6 +76,8 @@ signals:
 
     void fastMuteChanged();
 
+    void bootMuteChanged();
+
 private:
     friend Singleton<AntiEmbs>;
     explicit AntiEmbs();
@@ -85,6 +92,7 @@ private:
     bool mFastHide;
     bool mLowVoiceMode;
     bool mFastMute;
+    bool mBootMute;
 };
 
 } // namespace mod

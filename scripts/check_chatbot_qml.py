@@ -38,6 +38,13 @@ functions = [
 # absence through duplicate row identities, rather than asserting source spelling.
 if "function _nextResponseRowId(" in source:
     functions.append("_nextResponseRowId")
+# Leaving the cached page (visibilityChanged below) also drops the dictionary
+# "ask AI" context, and entering it consumes that context, so both helpers must
+# be present in the harness. They are new: keep the check running against a header
+# generated before the feature existed.
+for helper in ("_consumeAiFollowupContext", "_dropAiFollowupContext", "_applyAiFollowupContext"):
+    if "function " + helper + "(" in source:
+        functions.append(helper)
 logic = "\n".join(block("function " + name + "(") for name in functions)
 logic += "\n    function visibilityChanged() " + block("onVisibleChanged:").split(":", 1)[1]
 logic += "\n" + block("function onToolStateChanged(")

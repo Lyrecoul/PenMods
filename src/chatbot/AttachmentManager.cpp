@@ -5,6 +5,7 @@
 #include "chatbot/Backend.h"
 
 #include <QCache>
+#include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
@@ -205,6 +206,8 @@ void AttachmentManager::pruneSession(
 }
 
 void AttachmentManager::warmCache(const QVector<MessagePart>& imageParts) {
+    // QThreadPool 需要 QCoreApplication：启动期（BeforeMain）调用会让线程池拿到空 application。
+    if (QCoreApplication::instance() == nullptr) return;
     QVector<MessagePart> pending;
     for (const auto& part : imageParts) {
         if (part.type != "image_url" || part.localPath.isEmpty() || !part.url.isEmpty()) continue;

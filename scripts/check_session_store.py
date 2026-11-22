@@ -37,6 +37,8 @@ template<class... T> void error(T...) {}
 class ChatBot { public:
 QMap<QString, SessionData> m_persistedSessions;
 QMap<QString, QString> m_sessionFiles;
+QSet<QString> m_retainedSessionFiles;
+bool m_sessionGcBlocked=false;
 bool m_sessionStoreReadFailed = false;
 bool writeSessions(const QMap<QString, SessionData>&,const QString&,const QString&);
 };

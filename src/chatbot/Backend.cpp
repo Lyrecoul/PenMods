@@ -873,11 +873,33 @@ bool ChatBot::writeSessions(const QMap<QString, SessionData>& sessions, const QS
                 {"file", name.toStdString()}
             });
         }
+        // 本次没能载入的会话文件仍写进索引：索引条目一消失，下一次启动就会把它的文件当孤儿
+        // 删掉，而那些内容只在磁盘上。下一次启动会照常再试一次加载。
+        auto retained = m_retainedSessionFiles.values();
+        std::sort(retained.begin(), retained.end());
+        for (const auto& name : retained) root["sessions"].push_back({{"file", name.toStdString()}});
         if (!writeJson(directory + "/index.json", root.dump())) return false;
-        const auto names = files.values();
-        const QSet<QString> liveFiles(names.constBegin(), names.constEnd());
-        for (const auto& name : QDir(directory).entryList({"*.json"}, QDir::Files)) {
-            if (name != "index.json" && !liveFiles.contains(name)) QFile::remove(directory + "/" + name);
+        // 保守 GC：只删"既不在新索引、也不在已知集合"的文件。本次没能加载的会话（坏 JSON /
+        // 归一化后为空 / id 缺失）的内容只存在于磁盘，删掉它的文件就是永久丢历史，所以它的
+        // 索引条目照旧保留（下一次启动会再试一次），上一次索引里的文件名只要其会话不在本次
+        // 快照里也一律保留。能立刻删的只有两种：被本次新文件取代的旧版本，以及用户显式删掉
+        // 的会话（在上一份已提交快照里、却不在本次快照里）。
+        QSet<QString> keep;
+        for (const auto& name : files.values()) keep.insert(name);
+        keep.unite(m_retainedSessionFiles);
+        for (auto it = m_sessionFiles.constBegin(); it != m_sessionFiles.constEnd(); ++it)
+            if (!sessions.contains(it.key())) keep.insert(it.value());
+        for (auto it = m_persistedSessions.constBegin(); it != m_persistedSessions.constEnd(); ++it)
+            if (!sessions.contains(it.key())) keep.remove(m_sessionFiles.value(it.key()));
+        if (m_sessionGcBlocked) {
+            warn("会话目录里有无法归属的旧文件，跳过本次 GC");
+        } else {
+            int removed = 0;
+            for (const auto& name : QDir(directory).entryList({"*.json"}, QDir::Files)) {
+                if (name == "index.json" || keep.contains(name)) continue;
+                if (QFile::remove(directory + "/" + name)) ++removed;
+            }
+            if (removed > 0) info("会话存储已清理 {} 个不再被引用的文件", removed);
         }
         m_persistedSessions = sessions;
         m_sessionFiles      = files;
@@ -892,12 +914,165 @@ bool ChatBot::writeSessions(const QMap<QString, SessionData>& sessions, const QS
 // 加载 sessions.json
 // -----------------------------------------------------------------------
 
+// 反序列化并归一化一条会话，返回是否改写过内容（需要重新落盘）。
+// 只处理一条会话：坏 JSON、字段类型不符、超长都由调用方捕获，不能影响其它会话。
+bool ChatBot::loadSession(const json& sessionObj, const QString& fileName) {
+    bool        sanitized = false;
+    SessionData session;
+    session.id        = QString::fromStdString(sessionObj.value("id", ""));
+    session.title     = QString::fromStdString(sessionObj.value("title", "未命名对话"));
+    session.createdAt = QString::fromStdString(sessionObj.value("createdAt", ""));
+    session.updatedAt = QString::fromStdString(sessionObj.value("updatedAt", ""));
+    session.lastConversationAt =
+        QString::fromStdString(sessionObj.value("lastConversationAt", session.updatedAt.toStdString()));
+    session.manualTitle =
+        sessionObj.value("manualTitle", session.title != "新对话" && session.title != "未命名对话");
+    session.completedRounds     = std::max(0, sessionObj.value("completedRounds", 0));
+    session.titleAttemptRound   = std::max(0, sessionObj.value("titleAttemptRound", 0));
+    session.lastCompletedUserId = QString::fromStdString(sessionObj.value("lastCompletedUserId", ""));
+    const bool hasCompletedUserIds =
+        sessionObj.contains("completedUserIds") && sessionObj["completedUserIds"].is_array();
+    if (hasCompletedUserIds) {
+        for (const auto& id : sessionObj["completedUserIds"]) {
+            if (!id.is_string()) continue;
+            const auto userId = QString::fromStdString(id.get<std::string>());
+            if (!userId.isEmpty()) session.completedUserIds.insert(userId);
+        }
+    }
+    if (!session.lastCompletedUserId.isEmpty())
+        session.completedUserIds.insert(session.lastCompletedUserId);
+
+    if (sessionObj.contains("messages") && sessionObj["messages"].is_array()) {
+        for (const auto& msgObj : sessionObj["messages"]) {
+            MessageData msg = messageDataFromJson(msgObj);
+            sanitized |= !msgObj.contains("messageId");
+            sanitized |= sanitizeMessageHistory(msg);
+            // A process restart cannot resume pending tool executions.
+            for (auto& value : msg.toolStates) {
+                auto state = value.toMap();
+                const auto status = state.value("state").toString();
+                if (status != "done" && status != "error" && status != "cancelled") {
+                    state["state"] = "cancelled";
+                    state["text"] = "调用已中断";
+                    value = state;
+                    sanitized = true;
+                }
+            }
+            session.messages.append(msg);
+        }
+    }
+
+    const auto oldSize = session.messages.size();
+    session.messages.erase(
+        std::remove_if(
+            session.messages.begin(),
+            session.messages.end(),
+            [](const MessageData& message) {
+                return message.role == "system"
+                    && (message.content.startsWith("用户引用了以下文件作为上下文：")
+                        || message.content.startsWith("用户引用了以下文件作为代码审查/分析的上下文："));
+            }
+        ),
+        session.messages.end()
+    );
+    sanitized |= session.messages.size() != oldSize;
+    // 归一化只保留被 assistant tool_calls 认领的 tool 消息，其余 tool 消息会被丢弃。
+    // 如果它把整条会话清空，这份历史结构已残缺，但内容仍是用户的：留一份原文，清空时退回
+    // （真正发请求前 buildApiMessages 会再归一化一次）。空会话既不进索引也不在列表显示，
+    // 等于从历史里消失。
+    const auto beforeNormalize = session.messages;
+    // 修复历史里损坏的工具调用组
+    int droppedOrphans  = 0;
+    sanitized           |= normalizeHistoryMessages(session.messages, &droppedOrphans);
+    if (session.messages.isEmpty() && !beforeNormalize.isEmpty()) {
+        warn("会话 {} 归一化后为空，已保留原始 {} 条消息", session.id.toStdString(), beforeNormalize.size());
+        session.messages = beforeNormalize;
+    }
+    QSet<QString> messageIds;
+    for (int i = 0; i < session.messages.size(); ++i) {
+        auto& message = session.messages[i];
+        if (message.messageId.isEmpty() || messageIds.contains(message.messageId)) {
+            message.messageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            sanitized = true;
+        }
+        messageIds.insert(message.messageId);
+        if (message.role != "assistant" || message.toolCallsJson.isEmpty() || !message.toolStates.isEmpty()) continue;
+        const auto calls = QJsonDocument::fromJson(message.toolCallsJson.toUtf8()).array();
+        for (int c = 0; c < calls.size(); ++c) {
+            const auto call = calls[c].toObject();
+            const auto id = call["id"].toString();
+            QString result;
+            for (int k = i + 1; k < session.messages.size() && session.messages[k].role == "tool"; ++k)
+                if (session.messages[k].toolCallId == id) result = session.messages[k].content;
+            const bool cancelled = result.contains("取消") || result.contains("中断") || result.contains("拒绝");
+            // Old sessions did not persist success. Keep the uncertainty visible.
+            message.toolStates.append(QVariantMap{
+                {"key", message.messageId + ":tool:" + QString::number(c)},
+                {"batchId", message.messageId}, {"sessionId", session.id}, {"callId", id},
+                {"name", call["function"].toObject()["name"].toString()},
+                {"arguments", call["function"].toObject()["arguments"].toString()},
+                {"state", cancelled ? "cancelled" : "error"},
+                {"text", cancelled ? "历史调用已取消" : "历史调用（状态未记录）"}, {"result", result}});
+            sanitized = true;
+        }
+    }
+    if (droppedOrphans > 0)
+        warn("会话 {} 丢弃了 {} 条找不到宿主的工具结果", session.id.toStdString(), droppedOrphans);
+    if (!hasCompletedUserIds) {
+        // Old stores lack protocol status. Seed visible historical final answers once,
+        // retaining the legacy last ID even when its messages have already been truncated.
+        sanitized = true;
+        QString pendingUser;
+        for (const auto& message : session.messages) {
+            if (message.role == "user") pendingUser = message.messageId;
+            else if (
+                message.role == "assistant" && !pendingUser.isEmpty()
+                && (message.toolCallsJson.isEmpty() || message.toolCallsJson == "[]")
+                && (!message.content.isEmpty() || !message.parts.isEmpty())
+            ) {
+                session.completedUserIds.insert(pendingUser);
+                if (!sessionObj.contains("completedRounds")) {
+                    ++session.completedRounds;
+                    session.lastCompletedUserId = pendingUser;
+                }
+                pendingUser.clear();
+            }
+        }
+        // Historical rounds must not trigger a delayed first-round title after reload.
+        if (!sessionObj.contains("completedRounds"))
+            session.titleAttemptRound = session.completedRounds;
+    }
+    // 空会话不写索引也不在列表显示，但它只是"这次没能重建出消息"，文件必须留在磁盘上：
+    // 记进保留集，GC 才不会把它当孤儿删掉。删除只能由用户显式操作触发。
+    if (session.id.isEmpty() || session.messages.isEmpty()) {
+        warn("会话 {} 没有可用内容，已跳过加载，原文件保留", fileName.isEmpty() ? "<legacy>" : fileName.toStdString());
+        if (!fileName.isEmpty()) m_retainedSessionFiles.insert(fileName);
+        return sanitized;
+    }
+    if (m_sessions.contains(session.id)) {
+        warn("会话 id 重复，保留先读到的一份: {}", session.id.toStdString());
+        if (!fileName.isEmpty()) m_retainedSessionFiles.insert(fileName);
+        return sanitized;
+    }
+    m_observedMessages[session.id] = session.messages;
+    m_sessions.insert(session.id, session);
+    // 回填索引里的文件名：之后保存据此复用未变更会话的文件名，不再整套重写/整套 GC。
+    if (!fileName.isEmpty()) m_sessionFiles.insert(session.id, fileName);
+    return sanitized;
+}
+
 void ChatBot::initSessions() {
     bool          historySanitized = false;
     auto          path             = sessionsFilePath();
     const QString directory        = path + ".d";
     const bool    splitStore       = QFile::exists(directory + "/index.json");
-    QFile         file(splitStore ? directory + "/index.json" : path);
+    // 没有索引却有会话文件：它们可能来自一次在提交索引前崩溃的保存，比旧版单体 sessions.json
+    // 更新。本次进程不清理它们，等新索引提交后由下一次启动回收。
+    if (!splitStore && !QDir(directory).entryList({"*.json"}, QDir::Files).isEmpty()) {
+        m_sessionGcBlocked = true;
+        warn("会话目录 {} 里有无法对应到索引的文件，本次不清理", directory.toStdString());
+    }
+    QFile file(splitStore ? directory + "/index.json" : path);
     if (file.exists() && file.open(QIODevice::ReadOnly)) {
         try {
             json root = json::parse(file.readAll().toStdString());
@@ -905,134 +1080,32 @@ void ChatBot::initSessions() {
 
             if (root.contains("sessions") && root["sessions"].is_array()) {
                 for (const auto& entry : root["sessions"]) {
-                    json sessionObj = entry;
-                    if (splitStore) {
-                        const QString name = QString::fromStdString(entry.at("file").get<std::string>());
-                        if (!QRegularExpression("^[0-9a-f]{64}\\.json$").match(name).hasMatch())
-                            throw std::runtime_error("invalid session file name");
-                        QFile sessionFile(directory + "/" + name);
-                        if (!sessionFile.open(QIODevice::ReadOnly))
-                            throw std::runtime_error("cannot read session file");
-                        sessionObj = json::parse(sessionFile.readAll().toStdString());
+                    // 索引条目本身损坏属存储级故障：抛给外层，暂停保存以保护原始记录。
+                    const QString name =
+                        splitStore ? QString::fromStdString(entry.at("file").get<std::string>()) : QString();
+                    if (splitStore && !QRegularExpression("^[0-9a-f]{64}\\.json$").match(name).hasMatch())
+                        throw std::runtime_error("invalid session file name");
+                    const QString displayName = name.isEmpty() ? QStringLiteral("<legacy>") : name;
+                    // 文件已经不在（被外部工具清理或在别处删掉）：索引条目没有内容可保护，
+                    // 直接丢弃，不要留成永久保留项。
+                    if (splitStore && !QFile::exists(directory + "/" + name)) {
+                        warn("会话文件 {} 不存在，已丢弃索引条目", displayName.toStdString());
+                        continue;
                     }
-                    SessionData session;
-                    session.id        = QString::fromStdString(sessionObj.value("id", ""));
-                    session.title     = QString::fromStdString(sessionObj.value("title", "未命名对话"));
-                    session.createdAt = QString::fromStdString(sessionObj.value("createdAt", ""));
-                    session.updatedAt = QString::fromStdString(sessionObj.value("updatedAt", ""));
-                    session.lastConversationAt =
-                        QString::fromStdString(sessionObj.value("lastConversationAt", session.updatedAt.toStdString()));
-                    session.manualTitle =
-                        sessionObj.value("manualTitle", session.title != "新对话" && session.title != "未命名对话");
-                    session.completedRounds     = std::max(0, sessionObj.value("completedRounds", 0));
-                    session.titleAttemptRound   = std::max(0, sessionObj.value("titleAttemptRound", 0));
-                    session.lastCompletedUserId = QString::fromStdString(sessionObj.value("lastCompletedUserId", ""));
-                    const bool hasCompletedUserIds =
-                        sessionObj.contains("completedUserIds") && sessionObj["completedUserIds"].is_array();
-                    if (hasCompletedUserIds) {
-                        for (const auto& id : sessionObj["completedUserIds"]) {
-                            if (!id.is_string()) continue;
-                            const auto userId = QString::fromStdString(id.get<std::string>());
-                            if (!userId.isEmpty()) session.completedUserIds.insert(userId);
+                    // 单条会话坏掉（坏 JSON、字段类型不符、超长）只跳过它自己：其它会话照常加载，
+                    // 它的文件进保留集，后续 GC 不会删除。
+                    try {
+                        json sessionObj = entry;
+                        if (splitStore) {
+                            QFile sessionFile(directory + "/" + name);
+                            if (!sessionFile.open(QIODevice::ReadOnly))
+                                throw std::runtime_error("cannot read session file");
+                            sessionObj = json::parse(sessionFile.readAll().toStdString());
                         }
-                    }
-                    if (!session.lastCompletedUserId.isEmpty())
-                        session.completedUserIds.insert(session.lastCompletedUserId);
-
-                    if (sessionObj.contains("messages") && sessionObj["messages"].is_array()) {
-                        for (const auto& msgObj : sessionObj["messages"]) {
-                            MessageData msg = messageDataFromJson(msgObj);
-                            historySanitized |= !msgObj.contains("messageId");
-                            historySanitized |= sanitizeMessageHistory(msg);
-                            // A process restart cannot resume pending tool executions.
-                            for (auto& value : msg.toolStates) {
-                                auto state = value.toMap();
-                                const auto status = state.value("state").toString();
-                                if (status != "done" && status != "error" && status != "cancelled") {
-                                    state["state"] = "cancelled";
-                                    state["text"] = "调用已中断";
-                                    value = state;
-                                    historySanitized = true;
-                                }
-                            }
-                            session.messages.append(msg);
-                        }
-                    }
-
-                    const auto oldSize = session.messages.size();
-                    session.messages.erase(
-                        std::remove_if(
-                            session.messages.begin(),
-                            session.messages.end(),
-                            [](const MessageData& message) {
-                                return message.role == "system"
-                                    && (message.content.startsWith("用户引用了以下文件作为上下文：")
-                                        || message.content.startsWith("用户引用了以下文件作为代码审查/分析的上下文："));
-                            }
-                        ),
-                        session.messages.end()
-                    );
-                    historySanitized |= session.messages.size() != oldSize;
-                    // 修复历史里损坏的工具调用组
-                    int droppedOrphans  = 0;
-                    historySanitized   |= normalizeHistoryMessages(session.messages, &droppedOrphans);
-                    QSet<QString> messageIds;
-                    for (int i = 0; i < session.messages.size(); ++i) {
-                        auto& message = session.messages[i];
-                        if (message.messageId.isEmpty() || messageIds.contains(message.messageId)) {
-                            message.messageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
-                            historySanitized = true;
-                        }
-                        messageIds.insert(message.messageId);
-                        if (message.role != "assistant" || message.toolCallsJson.isEmpty() || !message.toolStates.isEmpty()) continue;
-                        const auto calls = QJsonDocument::fromJson(message.toolCallsJson.toUtf8()).array();
-                        for (int c = 0; c < calls.size(); ++c) {
-                            const auto call = calls[c].toObject();
-                            const auto id = call["id"].toString();
-                            QString result;
-                            for (int k = i + 1; k < session.messages.size() && session.messages[k].role == "tool"; ++k)
-                                if (session.messages[k].toolCallId == id) result = session.messages[k].content;
-                            const bool cancelled = result.contains("取消") || result.contains("中断") || result.contains("拒绝");
-                            // Old sessions did not persist success. Keep the uncertainty visible.
-                            message.toolStates.append(QVariantMap{
-                                {"key", message.messageId + ":tool:" + QString::number(c)},
-                                {"batchId", message.messageId}, {"sessionId", session.id}, {"callId", id},
-                                {"name", call["function"].toObject()["name"].toString()},
-                                {"arguments", call["function"].toObject()["arguments"].toString()},
-                                {"state", cancelled ? "cancelled" : "error"},
-                                {"text", cancelled ? "历史调用已取消" : "历史调用（状态未记录）"}, {"result", result}});
-                            historySanitized = true;
-                        }
-                    }
-                    if (droppedOrphans > 0)
-                        warn("会话 {} 丢弃了 {} 条找不到宿主的工具结果", session.id.toStdString(), droppedOrphans);
-                    if (!hasCompletedUserIds) {
-                        // Old stores lack protocol status. Seed visible historical final answers once,
-                        // retaining the legacy last ID even when its messages have already been truncated.
-                        historySanitized = true;
-                        QString pendingUser;
-                        for (const auto& message : session.messages) {
-                            if (message.role == "user") pendingUser = message.messageId;
-                            else if (
-                                message.role == "assistant" && !pendingUser.isEmpty()
-                                && (message.toolCallsJson.isEmpty() || message.toolCallsJson == "[]")
-                                && (!message.content.isEmpty() || !message.parts.isEmpty())
-                            ) {
-                                session.completedUserIds.insert(pendingUser);
-                                if (!sessionObj.contains("completedRounds")) {
-                                    ++session.completedRounds;
-                                    session.lastCompletedUserId = pendingUser;
-                                }
-                                pendingUser.clear();
-                            }
-                        }
-                        // Historical rounds must not trigger a delayed first-round title after reload.
-                        if (!sessionObj.contains("completedRounds"))
-                            session.titleAttemptRound = session.completedRounds;
-                    }
-                    if (!session.id.isEmpty() && !session.messages.isEmpty()) {
-                        m_observedMessages[session.id] = session.messages;
-                        m_sessions.insert(session.id, session);
+                        historySanitized |= loadSession(sessionObj, name);
+                    } catch (const std::exception& e) {
+                        warn("会话文件 {} 加载失败，已跳过，原文件保留: {}", displayName.toStdString(), e.what());
+                        if (splitStore) m_retainedSessionFiles.insert(name);
                     }
                 }
             }
@@ -1043,6 +1116,8 @@ void ChatBot::initSessions() {
             }
 
             info("已加载 {} 个会话", m_sessions.size());
+            if (!m_retainedSessionFiles.isEmpty())
+                warn("有 {} 个会话文件没能完整加载，原文件已保留", m_retainedSessionFiles.size());
         } catch (const std::exception& e) {
             // Never replace a damaged split store with the subset loaded before the error.
             m_sessionStoreReadFailed = splitStore;
@@ -1360,6 +1435,10 @@ void ChatBot::pruneSessionAttachments(const QString& sessionId) {
 }
 
 void ChatBot::warmAttachmentCache(const SessionData& session) {
+    // 构造函数在 BeforeMain 里跑，此时还没有 QCoreApplication：QThreadPool::globalInstance()
+    // 依赖 application 实例，提前 start() 会直接空指针崩溃（实测 0x00000010 段错误，
+    // 且发生在启动期，会被启动器判为试用失败并回滚）。预热只是优化，跳过即可。
+    if (QCoreApplication::instance() == nullptr) return;
     QVector<MessagePart> imageParts;
     for (const auto& msg : session.messages) {
         for (const auto& part : msg.parts) {
@@ -4884,10 +4963,9 @@ bool ChatBot::switchSession(const QString& sessionId) {
     }
 
     cancelTitleRequest();
-    if (m_sessions.contains(m_currentSessionId) && currentMessages().isEmpty()) {
-        m_observedMessages.remove(m_currentSessionId);
-        m_sessions.remove(m_currentSessionId);
-    }
+    // 不在这里丢弃"空"的旧会话：空会话不写索引，一旦它离开 m_sessions，紧随其后的
+    // saveSessions() 就会把它的磁盘文件当成孤儿删掉——表现就是点一下历史记录、上一段对话
+    // 消失。空会话只能在用户显式删除时清理。
     m_currentSessionId = sessionId;
     saveSessions();
     emit messagesChanged();

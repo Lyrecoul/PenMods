@@ -431,12 +431,21 @@ private:
     QThreadPool                m_sessionSavePool;
     // Only the save worker accesses the last successfully committed snapshot.
     QMap<QString, SessionData> m_persistedSessions;
-    QMap<QString, QString>     m_sessionFiles;
+    // 会话 id → 磁盘文件名。initSessions 用上一次索引里的值回填，之后只有保存线程改写。
+    QMap<QString, QString> m_sessionFiles;
+    // 启动时明确没能载入内存的会话文件（坏 JSON、空内容、重复 id）。内容只在磁盘上，
+    // GC 必须永远跳过；initSessions 之后只读，所以保存线程读取无需加锁。
+    QSet<QString> m_retainedSessionFiles;
+    // 旧版单体 sessions.json 旁边还有非空的 sessions.json.d：那些文件可能来自一次未提交索引的
+    // 保存，比旧快照更新，本次进程不做 GC。
+    bool                       m_sessionGcBlocked    = false;
     bool                       m_sessionsDirty      = false;
     bool                       m_sessionSaveRunning = false;
     bool                       m_sessionStoreReadFailed = false;
 
     void    initSessions();
+    // 反序列化并归一化一条会话，返回是否改写过内容（需要重新落盘）。
+    bool    loadSession(const json& sessionObj, const QString& fileName);
     void    saveSessions();
     void    flushSessions();
     bool    writeSessions(const QMap<QString, SessionData>& sessions, const QString& activeId, const QString& path);

@@ -44,6 +44,7 @@
 #include <QSaveFile>
 #include <QTemporaryDir>
 #include <QTextDocument>
+#include <QTextCodec>
 #include <QTextStream>
 #include <QTimer>
 #include <QUrl>
@@ -406,13 +407,16 @@ QJsonObject ChatBot::messageToJson(const MessageData& msg) const {
     if (msg.isMultimodal() && msg.role == "user") {
         QJsonArray contentArr;
         for (const auto& part : msg.parts) {
-            if (part.type == "file") continue;
             // 活动模型不支持视觉时不发历史里的图（视觉代理下原图仅本地查看，发给文字模型会被拒）。
+            if (part.type == "file" && part.mimeType != "application/pdf") continue;
             if (part.type == "image_url" && !m_capVision) continue;
             QJsonObject p;
             p["type"] = part.type;
             if (part.type == "text") {
                 p["text"] = part.text;
+            } else if (part.type == "file") {
+                // Internal reference. Resolve it to the active provider's PDF format before POSTing.
+                p = {{"type", "penmods_pdf"}, {"path", part.localPath}, {"filename", part.name}};
             } else if (part.type == "image_url") {
                 const QString url = AttachmentManager::requestUrl(part);
                 // 附件被删/搬走后 requestUrl 返回空串，发空 url 会让本会话后续每条请求都 400，宁可少发。
@@ -1069,6 +1073,48 @@ bool ChatBot::isAvailable() { return !m_apiKey.isEmpty(); }
 namespace {
 
 constexpr qint64 MAX_FILE_CONTEXT_BYTES = 1024 * 1024;
+constexpr qint64 kMaxPdfBytes = 9LL * 1024 * 1024;
+constexpr int kMaxCachedPdfIds = 128;
+constexpr int kMaxDeepSeekPdfCount = 20;
+constexpr qint64 kMaxDeepSeekUploadBytes = 2 * kMaxPdfBytes;
+constexpr int kMaxDeepSeekUploads = 8;
+const auto kPdfUnsupported = QStringLiteral("当前模型不支持 PDF 附件，请切换到支持 PDF 的模型或移除附件");
+
+bool isPdfName(const QString& name) {
+    return QFileInfo(name).suffix().compare(QLatin1String("pdf"), Qt::CaseInsensitive) == 0;
+}
+
+bool isPdfPart(const MessagePart& part) { return part.type == "file" && part.mimeType == "application/pdf"; }
+
+bool isOfficialHttps(const QUrl& endpoint, const QString& host) {
+    return endpoint.scheme() == "https" && endpoint.host() == host && endpoint.port(443) == 443;
+}
+
+QString pdfFileError(const QFileInfo& info, QFile& file) {
+    if (!info.isAbsolute() || !info.isFile() || !info.isReadable() || !file.open(QIODevice::ReadOnly))
+        return QStringLiteral("PDF 附件不可读：%1").arg(info.fileName());
+    if (file.size() > kMaxPdfBytes)
+        return QStringLiteral("PDF 附件过大（上限 9 MiB）：%1").arg(info.fileName());
+    if (!file.peek(1024).contains("%PDF-"))
+        return QStringLiteral("无效的 PDF 附件：%1").arg(info.fileName());
+    return {};
+}
+
+QByteArray readPdf(const QString& path, QString& error) {
+    QFile file(path);
+    const QFileInfo info(path);
+    error = pdfFileError(info, file);
+    if (!error.isEmpty()) return {};
+    QByteArray bytes = file.read(kMaxPdfBytes + 1);
+    if (file.error() == QFile::NoError && bytes.size() == file.size() && bytes.size() <= kMaxPdfBytes)
+        return bytes;
+    error = QStringLiteral("PDF 附件读取失败或超过 9 MiB：%1").arg(info.fileName());
+    return {};
+}
+
+bool hasPdf(const QVector<MessagePart>& parts) {
+    return std::any_of(parts.cbegin(), parts.cend(), isPdfPart);
+}
 
 // 允许作为文本附件引用的扩展名（与 ChatAssistant.qml 的 isTextFile 保持一致）。
 // 其它二进制附件明确拒绝，避免把二进制塞进文本上下文。
@@ -1083,8 +1129,9 @@ bool isTextAttachmentName(const QString& name) {
 QString buildFileContext(const QVector<MessagePart>& parts, QStringList* failedFiles = nullptr) {
     QString context;
     qint64  totalBytes = 0;
+    QTextCodec* utf8 = QTextCodec::codecForName("UTF-8");
     for (const auto& part : parts) {
-        if (part.type != "file") continue;
+        if (part.type != "file" || isPdfPart(part)) continue;
 
         const QFileInfo info(part.localPath);
         if (!info.isAbsolute() || !info.isFile() || !info.isReadable() || info.size() > MAX_FILE_CONTEXT_BYTES
@@ -1099,13 +1146,20 @@ QString buildFileContext(const QVector<MessagePart>& parts, QStringList* failedF
             continue;
         }
         const QByteArray data = file.read(MAX_FILE_CONTEXT_BYTES + 1);
-        if (data.size() > MAX_FILE_CONTEXT_BYTES || totalBytes + data.size() > MAX_FILE_CONTEXT_BYTES) {
+        if (data.size() > MAX_FILE_CONTEXT_BYTES || totalBytes + data.size() > MAX_FILE_CONTEXT_BYTES
+            || data.left(1024).contains("%PDF-")) {
+            if (failedFiles) failedFiles->append(part.name.isEmpty() ? info.fileName() : part.name);
+            continue;
+        }
+        QTextCodec::ConverterState state;
+        const QString text = utf8->toUnicode(data.constData(), data.size(), &state);
+        if (data.contains('\0') || state.invalidChars || state.remainingChars) {
             if (failedFiles) failedFiles->append(part.name.isEmpty() ? info.fileName() : part.name);
             continue;
         }
         totalBytes += data.size();
         context    += QString("---\n## 文件: %1\n```%2\n%3\n```\n\n")
-                          .arg(info.absoluteFilePath(), part.language, QString::fromUtf8(data));
+                          .arg(info.absoluteFilePath(), part.language, text);
     }
     return context.isEmpty() ? QString() : "用户引用了以下文件作为上下文：\n\n" + context;
 }
@@ -1124,6 +1178,22 @@ void ChatBot::sendMessage(const QString& message, const QString& fileRefs) {
     if (!fileRefs.isEmpty()) {
         QJsonDocument doc = QJsonDocument::fromJson(fileRefs.toUtf8());
         if (doc.isArray() && !doc.array().isEmpty()) {
+            QJsonArray attachmentParts;
+            bool includesPdf = false;
+            for (const auto& fileVal : doc.array()) {
+                auto file = fileVal.toObject();
+                const QString path = file.take("path").toString();
+                if (isPdfName(path) || isPdfName(file["name"].toString()) || file["mimeType"].toString() == "application/pdf")
+                    includesPdf = true;
+                file["type"] = "file";
+                file["localPath"] = path;
+                attachmentParts.append(file);
+            }
+            if (includesPdf) {
+                const auto media = QJsonDocument(attachmentParts).toJson(QJsonDocument::Compact);
+                sendMessageWithMedia(message, QString::fromUtf8(media));
+                return;
+            }
             for (const auto& fileVal : doc.array()) {
                 QJsonObject file = fileVal.toObject();
                 QString     path = file["path"].toString();
@@ -1187,7 +1257,7 @@ int ChatBot::maxMediaJsonBytes() const { return static_cast<int>(AttachmentManag
 
 // 把 QML 传来的 mediaParts JSON 解析成有序 MessagePart 列表：
 //   - image_url: 支持 data URL / http(s) URL / 仅 localPath（不要求在 QML 里读文件转 base64）；
-//   - file: 文本附件，必须可读且扩展名在白名单内（二进制附件明确拒绝）；
+//   - file: 文本附件，或由当前模型解析的 PDF 附件；
 //   - input_audio: base64 data + format；
 // 校验单图 9 MiB、总媒体 12 MiB；按 canonical localPath 去重；保持原顺序。
 QVector<MessagePart>
@@ -1297,7 +1367,21 @@ ChatBot::parseAttachmentParts(const QString& mediaParts, QString* error, bool* h
                 return {};
             }
             if (part.name.isEmpty()) part.name = info.fileName();
-            if (!isTextAttachmentName(part.name)) {
+            const bool pdf = isPdfName(info.fileName()) || isPdfName(part.name) || part.mimeType == "application/pdf";
+            if (pdf) {
+                if (!getCapPdf()) {
+                    if (error) *error = kPdfUnsupported;
+                    return {};
+                }
+                part.mimeType = QStringLiteral("application/pdf");
+                part.language.clear();
+                QFile file(part.localPath);
+                const QString pdfError = pdfFileError(info, file);
+                if (!pdfError.isEmpty()) {
+                    if (error) *error = pdfError;
+                    return {};
+                }
+            } else if (!isTextAttachmentName(part.name)) {
                 unsupportedNames.append(part.name);
                 continue;
             }
@@ -1457,8 +1541,15 @@ void ChatBot::finishMediaMessage(
         emit errorOccurred("没有可发送的文字或媒体内容");
         return;
     }
+    const bool includesPdf = hasPdf(parts);
+    if (includesPdf && !getCapPdf()) {
+        emit errorOccurred(kPdfUnsupported);
+        return;
+    }
+    const QString requestText = (includesPdf && effectiveMessage.trimmed().isEmpty())
+        ? QStringLiteral("请阅读附件内容") : effectiveMessage;
 
-    QJsonArray apiMessages = buildApiMessages(m_sessions[sessionId].messages, effectiveMessage, parts);
+    QJsonArray apiMessages = buildApiMessages(m_sessions[sessionId].messages, requestText, parts);
 
     // 内嵌图片先落盘为附件，不写入历史
     QVector<MessagePart> historyParts   = parts;
@@ -1502,13 +1593,13 @@ void ChatBot::finishMediaMessage(
         userMsg.content = message;
     }
     userMsg.parts   = historyParts;
-    if (!effectiveMessage.isEmpty()) {
+    if (!requestText.isEmpty()) {
         if (historyParts.isEmpty()) {
-            userMsg.content = effectiveMessage;
+            userMsg.content = requestText;
         } else {
             MessagePart textPart;
             textPart.type = "text";
-            textPart.text = effectiveMessage;
+            textPart.text = requestText;
             userMsg.parts.prepend(textPart);
         }
     }
@@ -2033,6 +2124,10 @@ QJsonArray ChatBot::messagesToResponsesInput(const QJsonArray& messages) const {
                                 {"image_url", imageUrl     }
                         }
                         );
+                } else if (partType == "file") {
+                    QJsonObject file = part["file"].toObject();
+                    file["type"] = "input_file";
+                    responsesContent.append(file);
                 } else {
                     hasUnsupportedMedia = true;
                 }
@@ -2593,6 +2688,55 @@ void ChatBot::flushEmbeddedContent() {
     appendAnswerChunk(remaining);
 }
 
+struct ChatBot::PdfRequest {
+    QJsonArray messages;
+    QVector<QPair<int, int>> positions;
+    int latestUser = -1;
+    int seq = 0;
+    PdfTransport transport = PdfTransport::Unsupported;
+    QString endpoint;
+    QString model;
+    QString protocol;
+    QString apiKey;
+    int next = 0;
+    qint64 inlineBytes = 0;
+    int deepseekCount = 0;
+    qint64 uploadedBytes = 0;
+    int uploads = 0;
+    bool omittedOlder = false;
+    QString uploadedId;
+    QString uploadError;
+
+    void replaceCurrent(const QJsonObject& part) {
+        const auto [messageIndex, partIndex] = positions.at(next++);
+        auto message = messages.at(messageIndex).toObject();
+        auto parts = message["content"].toArray();
+        if (part.isEmpty()) parts.removeAt(partIndex);
+        else parts.replace(partIndex, part);
+        message["content"] = parts.isEmpty() ? QJsonValue(QStringLiteral("[PDF 附件未发送]")) : QJsonValue(parts);
+        messages.replace(messageIndex, message);
+    }
+};
+
+ChatBot::PdfTransport ChatBot::pdfTransport() const {
+    const QUrl endpoint(m_apiEndpoint);
+    if (endpoint.host() == "api.deepseek.com") {
+        const QString route = usesResponsesApi() ? QStringLiteral("/responses") : QStringLiteral("/chat/completions");
+        const QString path = endpoint.path();
+        const bool supportedPath = path == route || path == "/v1" + route;
+        return isOfficialHttps(endpoint, QStringLiteral("api.deepseek.com")) && supportedPath
+                && m_deepseekAdapter && m_capFileParsing && m_model == "deepseek-flash"
+            ? PdfTransport::DeepSeek : PdfTransport::Unsupported;
+    }
+    if (!endpoint.isValid() || endpoint.scheme() != "https" || endpoint.host().isEmpty())
+        return PdfTransport::Unsupported;
+    if (m_capPdf || (m_capVision && isOfficialHttps(endpoint, QStringLiteral("api.openai.com"))))
+        return PdfTransport::Inline;
+    return PdfTransport::Unsupported;
+}
+
+bool ChatBot::getCapPdf() const { return pdfTransport() != PdfTransport::Unsupported; }
+
 void ChatBot::makeApiRequest(const QJsonArray& messages) {
     // 递增序列号使旧请求的回调自动失效
     int seq = ++m_requestSeq;
@@ -2606,12 +2750,190 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
     m_responseSessionId = m_currentSessionId;
     m_responseToolStates.clear();
     m_toolFlushScheduled = false;
+    m_currentStreamBuffer.clear();
+    m_currentReasoningBuffer.clear();
+    m_embeddedContentBuffer.clear();
+    m_embeddedReasoningActive = false;
+    m_responseBuffer.clear();
+    m_toolCallsBuffer.clear();
+    m_responseToolItemIndexes.clear();
+    m_serverToolCallActive = false;
+    m_serverToolCallName.clear();
 
     if (m_apiKey.isEmpty()) {
         emit errorOccurred("API 密钥未设置\n请进入「设置」页面配置有效的 API 密钥后重试");
         return;
     }
 
+    // Prefer recent PDF references if the request reaches a provider or device limit.
+    // Reverse part order keeps the remaining positions stable when omitting an old reference.
+    QVector<QPair<int, int>> pdfPositions;
+    int latestUser = -1;
+    for (int i = messages.size() - 1; i >= 0; --i) {
+        const auto message = messages.at(i).toObject();
+        if (message["role"].toString() != "user") continue;
+        if (latestUser < 0) latestUser = i;
+        const auto parts = message["content"].toArray();
+        for (int j = parts.size() - 1; j >= 0; --j) {
+            if (parts.at(j).toObject()["type"].toString() == "penmods_pdf") pdfPositions.append(qMakePair(i, j));
+        }
+    }
+    if (pdfPositions.isEmpty()) {
+        postApiRequest(messages, seq, false);
+        return;
+    }
+    auto request = std::make_shared<PdfRequest>();
+    request->messages = messages;
+    request->positions = std::move(pdfPositions);
+    request->latestUser = latestUser;
+    request->seq = seq;
+    request->transport = pdfTransport();
+    request->endpoint = m_apiEndpoint;
+    request->model = m_model;
+    request->protocol = m_apiProtocol;
+    request->apiKey = m_apiKey;
+    resolvePdfAttachments(request);
+}
+
+void ChatBot::resolvePdfAttachments(const std::shared_ptr<PdfRequest>& request) {
+    if (request->seq != m_requestSeq || m_cancelled) return;
+    if (request->endpoint != m_apiEndpoint || request->model != m_model || request->protocol != m_apiProtocol
+        || request->apiKey != m_apiKey || request->transport != pdfTransport()) {
+        emit errorOccurred("处理 PDF 附件期间模型配置已更改，请重试");
+        return;
+    }
+
+    while (request->next < request->positions.size()) {
+        const auto [messageIndex, partIndex] = request->positions.at(request->next);
+        const auto message = request->messages.at(messageIndex).toObject();
+        const auto ref = message["content"].toArray().at(partIndex).toObject();
+        const QString path = ref["path"].toString();
+        QString error = std::exchange(request->uploadError, {});
+        QString fileId = std::exchange(request->uploadedId, {});
+        QJsonObject wirePart;
+
+        if (request->transport == PdfTransport::Unsupported) {
+            error = kPdfUnsupported;
+        } else if (request->transport == PdfTransport::Inline) {
+            const qint64 remaining = kMaxPdfBytes - request->inlineBytes;
+            const QByteArray bytes = QFileInfo(path).size() <= remaining ? readPdf(path, error) : QByteArray();
+            if (error.isEmpty() && (bytes.isEmpty() || bytes.size() > remaining))
+                error = QStringLiteral("PDF 附件总大小超出单次请求上限（9 MiB）");
+            if (error.isEmpty()) {
+                QString name = QFileInfo(ref["filename"].toString()).fileName();
+                if (!isPdfName(name)) name = QStringLiteral("document.pdf");
+                const auto data = QStringLiteral("data:application/pdf;base64,") + QString::fromLatin1(bytes.toBase64());
+                wirePart = {{"type", "file"}, {"file", QJsonObject{{"filename", name}, {"file_data", data}}}};
+                request->inlineBytes += bytes.size();
+            }
+        } else if (request->deepseekCount >= kMaxDeepSeekPdfCount) {
+            error = QStringLiteral("DeepSeek 单次请求最多引用 20 个 PDF");
+        } else if (error.isEmpty()) {
+            if (fileId.isEmpty()) {
+                const QByteArray bytes = readPdf(path, error);
+                if (error.isEmpty()) {
+                    QCryptographicHash hash(QCryptographicHash::Sha256);
+                    hash.addData(request->apiKey.toUtf8());
+                    hash.addData("\0", 1);
+                    hash.addData(bytes);
+                    const QByteArray cacheKey = hash.result();
+                    const auto cached = m_parsedPdfs.constFind(cacheKey);
+                    const qint64 now = QDateTime::currentSecsSinceEpoch();
+                    if (cached != m_parsedPdfs.cend() && !cached->id.isEmpty() && cached->expiresAt > now + 60) {
+                        fileId = cached->id;
+                    } else if (messageIndex != request->latestUser && cached != m_parsedPdfs.cend()
+                               && cached->id.isEmpty() && cached->expiresAt > now) {
+                        error = QStringLiteral("历史中的 DeepSeek PDF 解析失败");
+                    } else if (request->uploads >= kMaxDeepSeekUploads
+                               || request->uploadedBytes + bytes.size() > kMaxDeepSeekUploadBytes) {
+                        error = QStringLiteral("DeepSeek PDF 超出本次上传上限（8 个文件，合计 18 MiB）");
+                    } else {
+                        ++request->uploads;
+                        request->uploadedBytes += bytes.size();
+                        uploadDeepSeekPdf(request, path, bytes, cacheKey);
+                        return;
+                    }
+                }
+            }
+            if (!fileId.isEmpty()) {
+                const QJsonObject file{{"file_id", fileId}};
+                // DeepSeek Chat Completions uses a top-level file_id. Responses
+                // unwraps the intermediate OpenAI file object to an input_file.
+                wirePart = request->protocol == "responses"
+                    ? QJsonObject{{"type", "file"}, {"file", file}}
+                    : QJsonObject{{"type", "file"}, {"file_id", fileId}};
+                ++request->deepseekCount;
+            }
+        }
+
+        if (!error.isEmpty()) {
+            if (messageIndex == request->latestUser) {
+                emit errorOccurred(error);
+                return;
+            }
+            request->omittedOlder = true;
+        }
+        request->replaceCurrent(wirePart);
+    }
+
+    if (request->omittedOlder)
+        showToast("历史中的部分 PDF 附件未发送，请检查模型能力、附件路径或大小");
+    postApiRequest(request->messages, request->seq, request->inlineBytes > 0 || request->deepseekCount > 0);
+}
+
+void ChatBot::uploadDeepSeekPdf(const std::shared_ptr<PdfRequest>& request, const QString& path,
+                               const QByteArray& bytes, const QByteArray& cacheKey) {
+    auto* multipart = new QHttpMultiPart(QHttpMultiPart::FormDataType);
+    auto appendField = [multipart](const QByteArray& name, const QByteArray& value) {
+        QHttpPart field;
+        field.setRawHeader("Content-Disposition", "form-data; name=\"" + name + '"');
+        field.setBody(value);
+        multipart->append(field);
+    };
+    // DeepSeek requires the purpose field first. Limit remote retention to one day.
+    appendField("purpose", "text_recognition");
+    appendField("expires_after[anchor]", "created_at");
+    appendField("expires_after[seconds]", "86400");
+    QHttpPart document;
+    document.setRawHeader("Content-Disposition", "form-data; name=\"file\"; filename=\"document.pdf\"");
+    document.setRawHeader("Content-Type", "application/pdf");
+    document.setBody(bytes);
+    multipart->append(document);
+
+    QNetworkRequest upload(QUrl(QStringLiteral("https://api.deepseek.com/files")));
+    upload.setRawHeader("Authorization", "Bearer " + request->apiKey.toUtf8());
+    upload.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
+    upload.setTransferTimeout(250000);
+    auto* reply = m_networkManager->post(upload, multipart);
+    multipart->setParent(reply);
+    m_activeReplies.append(reply);
+    const QString filename = QFileInfo(path).fileName();
+    connect(reply, &QNetworkReply::finished, this, [this, reply, request, cacheKey, filename]() {
+        m_activeReplies.removeAll(reply);
+        reply->deleteLater();
+        if (request->seq != m_requestSeq || m_cancelled) return;
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const auto body = QJsonDocument::fromJson(reply->readAll()).object();
+        const QString id = body["id"].toString();
+        if (!m_parsedPdfs.contains(cacheKey) && m_parsedPdfs.size() >= kMaxCachedPdfIds)
+            m_parsedPdfs.erase(m_parsedPdfs.begin());
+        if (reply->error() == QNetworkReply::NoError && status >= 200 && status < 300 && id.startsWith("file-api-")) {
+            const qint64 expiresAt = body["expires_at"].toVariant().toLongLong();
+            const qint64 fallbackExpiry = QDateTime::currentSecsSinceEpoch() + 3600;
+            m_parsedPdfs.insert(cacheKey, {id, expiresAt > 0 ? expiresAt : fallbackExpiry});
+            request->uploadedId = id;
+        } else {
+            // A failed historical document must not cause a paid upload attempt on every turn.
+            m_parsedPdfs.insert(cacheKey, {QString(), QDateTime::currentSecsSinceEpoch() + 3600});
+            QString reason = body["error"].toObject()["message"].toString().left(240);
+            if (reason.isEmpty()) reason = reply->errorString();
+            request->uploadError = QStringLiteral("DeepSeek 无法解析 PDF %1：%2").arg(filename, reason);
+        }
+        resolvePdfAttachments(request);
+    });
+}
+
+void ChatBot::postApiRequest(const QJsonArray& messages, int seq, bool hasPdf) {
     // 发送前统一规整 tool_calls 序列
     QJsonArray safeMessages = messages;
     normalizeToolMessageSequence(safeMessages);
@@ -2644,7 +2966,10 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
         QJsonDocument epDoc = QJsonDocument::fromJson(QByteArray::fromStdString(m_extraParams.dump()));
         if (epDoc.isObject()) {
             const auto epObj = epDoc.object();
-            for (auto it = epObj.constBegin(); it != epObj.constEnd(); ++it) requestBody[it.key()] = it.value();
+            for (auto it = epObj.constBegin(); it != epObj.constEnd(); ++it) {
+                if (hasPdf && (it.key() == "model" || it.key() == "messages" || it.key() == "input")) continue;
+                requestBody[it.key()] = it.value();
+            }
         }
     }
 
@@ -2669,19 +2994,11 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
     request.setRawHeader("Authorization", QString("Bearer %1").arg(m_apiKey).toUtf8());
     request.setRawHeader("Content-Type", "application/json");
     request.setRawHeader("User-Agent", "PenMods ChatBot/1.0");
+    if (hasPdf)
+        request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::SameOriginRedirectPolicy);
 
     QNetworkReply* reply = m_networkManager->post(request, requestData);
     m_activeReplies.append(reply);
-
-    m_currentStreamBuffer.clear();
-    m_currentReasoningBuffer.clear();
-    m_embeddedContentBuffer.clear();
-    m_embeddedReasoningActive = false;
-    m_responseBuffer.clear();
-    m_toolCallsBuffer.clear();
-    m_responseToolItemIndexes.clear();
-    m_serverToolCallActive = false;
-    m_serverToolCallName.clear();
 
     // 流式与非流式都要发 streamStart：QML 用它复位 streamThrottle（endProcessed 等），
     // 否则一次流式回复之后再发非流式请求时 messageReceived 会被 endProcessed 挡住，
@@ -3357,6 +3674,11 @@ void ChatBot::applyEditedMessage(
         }
     }
 
+    if (hasPdf(parts) && !getCapPdf()) {
+        emit errorOccurred(kPdfUnsupported);
+        return;
+    }
+
     // 图片落盘：data URL → 本会话附件目录；只带 localPath 的原样保留。
     const QString attachmentRoot = QFileInfo(sessionsFilePath()).absolutePath();
     for (auto& part : parts) {
@@ -3463,6 +3785,11 @@ void ChatBot::regenerateMessage(int index) {
     }
     if (userMessageIndex == -1) {
         error("找不到对应于 AI 消息的用户消息，索引: {}", index);
+        return;
+    }
+
+    if (hasPdf(msgs[userMessageIndex].parts) && !getCapPdf()) {
+        emit errorOccurred(kPdfUnsupported);
         return;
     }
 
@@ -3695,6 +4022,7 @@ void ChatBot::setApiEndpoint(const QString& endpoint) {
     if (m_apiEndpoint == endpoint) return;
     m_apiEndpoint = endpoint;
     emit apiEndpointChanged();
+    emit activeModelCapabilitiesChanged();
 }
 
 QString ChatBot::getModel() const { return m_model; }
@@ -3705,6 +4033,7 @@ void ChatBot::setModel(const QString& model) {
     if (m_model == model) return;
     m_model = model;
     emit modelChanged();
+    emit activeModelCapabilitiesChanged();
 }
 
 qreal ChatBot::getTemperature() const { return m_temperature; }
@@ -3849,13 +4178,16 @@ json emptyModelTemplate() {
     model["reasoningEffort"]         = "";
     model["nativeWebSearchEnabled"]  = false;
     model["nativeWebSearchProvider"] = "auto";
+    model["deepseekAdapter"]          = false;
     model["capabilities"]            = json{
         {"text",            true },
         {"vision",          false},
         {"audio",           false},
         {"toolCall",        false},
         {"reasoning",       false},
-        {"imageGeneration", false}
+        {"imageGeneration", false},
+        {"pdf",             false},
+        {"fileParsing",     false}
     };
     model["extraParams"]        = json::object();
     model["proxyVisionModelId"] = "";
@@ -4015,6 +4347,7 @@ json ChatBot::normalizeModel(const json& raw, const std::string& fallbackId, std
         webSearchProvider        = webSearchProviders.count(legacy) ? legacy : "auto";
     }
     out["nativeWebSearchProvider"] = webSearchProvider;
+    out["deepseekAdapter"] = readBool(raw, "deepseekAdapter", false);
 
     // capabilities：object（当前格式）/ 字符串数组（旧格式“支持的能力名列表”）/ 缺失
     json caps = json::object();
@@ -4031,6 +4364,8 @@ json ChatBot::normalizeModel(const json& raw, const std::string& fallbackId, std
     capOut["toolCall"]        = readBool(caps, "toolCall", false);
     capOut["reasoning"]       = readBool(caps, "reasoning", false);
     capOut["imageGeneration"] = readBool(caps, "imageGeneration", false);
+    capOut["pdf"]             = readBool(caps, "pdf", false);
+    capOut["fileParsing"]     = readBool(caps, "fileParsing", false);
     // 未知能力字段原样保留（前向兼容）
     for (auto it = caps.begin(); it != caps.end(); ++it)
         if (!capOut.contains(it.key())) capOut[it.key()] = it.value();
@@ -4134,6 +4469,9 @@ void ChatBot::applyModelConfig(const json& modelObj) {
     m_capToolCall        = false;
     m_capReasoning       = false;
     m_capImageGeneration = false;
+    m_capPdf             = false;
+    m_deepseekAdapter    = readBool(modelObj, "deepseekAdapter", false);
+    m_capFileParsing     = false;
     if (containsKey(modelObj, "capabilities") && modelObj["capabilities"].is_object()) {
         const auto& cap      = modelObj["capabilities"];
         m_capText            = readBool(cap, "text", true);
@@ -4142,6 +4480,8 @@ void ChatBot::applyModelConfig(const json& modelObj) {
         m_capToolCall        = readBool(cap, "toolCall", false);
         m_capReasoning       = readBool(cap, "reasoning", false);
         m_capImageGeneration = readBool(cap, "imageGeneration", false);
+        m_capPdf             = readBool(cap, "pdf", false);
+        m_capFileParsing     = readBool(cap, "fileParsing", false);
     }
     emit activeModelCapabilitiesChanged();
     if (oldProxyVisionModelId != m_proxyVisionModelId || oldProxyVisionPrompt != m_proxyVisionPrompt)
@@ -4180,6 +4520,8 @@ QString ChatBot::getModelSummaries() {
         capabilities["toolCall"]        = readBool(cap, "toolCall", false);
         capabilities["reasoning"]       = readBool(cap, "reasoning", false);
         capabilities["imageGeneration"] = readBool(cap, "imageGeneration", false);
+        capabilities["pdf"]             = readBool(cap, "pdf", false);
+        capabilities["fileParsing"]     = readBool(cap, "fileParsing", false);
         list.push_back(
             json{
                 {"id", id},
@@ -4302,7 +4644,18 @@ bool ChatBot::addModel(const QString& modelJson) {
     if (containsKey(raw, "proxyVisionModelId"))
         merged["proxyVisionModelId"] = readString(raw, "proxyVisionModelId", "");
     if (containsKey(raw, "proxyVisionPrompt")) merged["proxyVisionPrompt"] = readString(raw, "proxyVisionPrompt", "");
-    if (containsKey(raw, "capabilities")) merged["capabilities"] = raw["capabilities"];
+    if (containsKey(raw, "deepseekAdapter"))
+        merged["deepseekAdapter"] = readBool(raw, "deepseekAdapter", false);
+    if (containsKey(raw, "capabilities")) {
+        json caps = raw["capabilities"];
+        if (updating && caps.is_object()) {
+            // Model editors predating PDF support don't submit these keys.
+            for (const char* key : {"pdf", "fileParsing"}) {
+                if (!caps.contains(key)) caps[key] = readBool((*existing)["capabilities"], key, false);
+            }
+        }
+        merged["capabilities"] = std::move(caps);
+    }
     if (containsKey(raw, "apiKey")) {
         const std::string key = readString(raw, "apiKey", "");
         // 空字符串视为“不修改已存密钥”：旧资源库只能拿到脱敏数据；需要显式清空时传 clearApiKey=true

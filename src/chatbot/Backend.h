@@ -24,6 +24,8 @@
 #include <QUuid>
 #include <QVector>
 
+#include <memory>
+
 #include <nlohmann/json.hpp>
 using json = nlohmann::json;
 
@@ -105,6 +107,7 @@ class ChatBot : public QObject, public Singleton<ChatBot>, private Logger {
     // 当前活动模型的能力标志（只读，随模型切换更新）
     Q_PROPERTY(bool capText READ getCapText NOTIFY activeModelCapabilitiesChanged)
     Q_PROPERTY(bool capVision READ getCapVision NOTIFY activeModelCapabilitiesChanged)
+    Q_PROPERTY(bool capPdf READ getCapPdf NOTIFY activeModelCapabilitiesChanged)
     Q_PROPERTY(bool capAudio READ getCapAudio NOTIFY activeModelCapabilitiesChanged)
     Q_PROPERTY(bool capToolCall READ getCapToolCall NOTIFY activeModelCapabilitiesChanged)
     Q_PROPERTY(bool capReasoning READ getCapReasoning NOTIFY activeModelCapabilitiesChanged)
@@ -260,6 +263,7 @@ public:
 
     bool getCapText() const { return m_capText; }
     bool getCapVision() const { return m_capVision; }
+    bool getCapPdf() const;
     bool getCapAudio() const { return m_capAudio; }
     bool getCapToolCall() const { return m_capToolCall; }
     bool getCapReasoning() const { return m_capReasoning; }
@@ -407,6 +411,9 @@ private:
     // 当前活动模型的能力标志
     bool    m_capText                 = true;
     bool    m_capVision               = false;
+    bool    m_capPdf                  = false;
+    bool    m_deepseekAdapter         = false;
+    bool    m_capFileParsing          = false;
     bool    m_capAudio                = false;
     bool    m_capToolCall             = false;
     bool    m_capReasoning            = false;
@@ -460,6 +467,18 @@ private:
     );
 
     void       makeApiRequest(const QJsonArray& messages);
+    enum class PdfTransport { Unsupported, Inline, DeepSeek };
+    struct ParsedPdf {
+        QString id;
+        qint64 expiresAt;
+    };
+    QHash<QByteArray, ParsedPdf> m_parsedPdfs;
+    PdfTransport pdfTransport() const;
+    struct PdfRequest;
+    void resolvePdfAttachments(const std::shared_ptr<PdfRequest>& request);
+    void uploadDeepSeekPdf(const std::shared_ptr<PdfRequest>& request, const QString& path,
+                           const QByteArray& bytes, const QByteArray& cacheKey);
+    void postApiRequest(const QJsonArray& messages, int seq, bool hasPdf);
     void       handleNetworkReply(QNetworkReply* reply, bool isStream);
     void       finishStream(bool success);
     void       emitContentChunk(const QString& content);

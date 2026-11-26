@@ -334,7 +334,7 @@ mpp_rt: NOT found ion allocator / found drm allocator
 ## 9. 仓库集成（已落地）
 
 ```
-external/ffmpeg-player/          上游 v1.0.5（b98a8ea）的 vendor 副本，GPL-3.0
+external/ffmpeg-player/          上游 v1.0.6（9ffe988）的 vendor 副本，GPL-3.0
 ├── xmake.lua                    已适配为 PenMods 根工程的子工程（见 UPSTREAM.md 的差异表）
 ├── UPSTREAM.md                  来源、改动、同步方式、硬解门控说明
 ├── src/ patches/ examples/      上游原样

@@ -20,6 +20,8 @@
 
 #include "DrmPrime.hpp"
 #include "Logger.hpp"
+#include "PlaybackLifecycle.hpp"
+#include "ShutdownTrace.hpp"
 
 #include <QImage>
 #include <QMatrix4x4>
@@ -71,6 +73,19 @@ namespace render {
 inline bool EnvDisabled(const char *name) {
   const char *v = std::getenv(name);
   return v && std::strcmp(v, "0") == 0;
+}
+
+// The last frame unref can run MPP buffer-release callbacks. Scene-graph
+// synchronization blocks the GUI, so retired frames must be freed elsewhere.
+inline void RetireFrame(AVFrame *&frame) {
+  if (!frame) return;
+  auto *retired = frame;
+  frame = nullptr;
+  PlaybackCleanup::Instance().Enqueue([retired] {
+    ShutdownTrace trace("frame-free", retired);
+    auto *owned = retired;
+    av_frame_free(&owned);
+  });
 }
 
 inline bool IsFullRange(const AVFrame *f) {
@@ -145,6 +160,7 @@ inline Placement ComputePlacement(const QRectF &rect, int rotation) {
 class SwsConverter {
 public:
   ~SwsConverter() {
+    ShutdownTrace trace("sws-free", this, sws_ != nullptr);
     if (sws_)
       sws_freeContext(sws_);
   }
@@ -612,7 +628,7 @@ public:
   }
 
   ~GlVideoNode() override {
-    ReleaseHeld(0);
+    ShutdownTrace trace("gl-node-destroy", this);
     if (QOpenGLContext *ctx = QOpenGLContext::currentContext()) {
       QOpenGLFunctions *f = ctx->functions();
       for (Plane &p : planes_) {
@@ -622,8 +638,10 @@ public:
       if (oes_texture_)
         f->glDeleteTextures(1, &oes_texture_);
     }
-    if (scratch_)
-      av_frame_free(&scratch_);
+    trace.Step("gl-textures-deleted");
+    ReleaseHeld(0, true);
+    trace.Step("egl-images-retired");
+    RetireFrame(scratch_);
   }
 
   // 接管 frame 所有权；返回是否成功更新了画面
@@ -901,12 +919,16 @@ private:
     return true;
   }
 
-  void ReleaseHeld(size_t keep) {
+  void ReleaseHeld(size_t keep, bool retiring = false) {
     while (held_.size() > keep) {
       HeldFrame h = held_.front();
       held_.pop_front();
-      importer_.Destroy(h.image);
-      av_frame_free(&h.frame);
+      {
+        ShutdownTrace trace("egl-image-destroy", h.image, retiring);
+        importer_.Destroy(h.image);
+      }
+      if (retiring) RetireFrame(h.frame);
+      else av_frame_free(&h.frame);
     }
   }
 
@@ -952,7 +974,7 @@ public:
   }
 
   ~VideoRootNode() override {
-    av_frame_free(&cpu_frame_);
+    RetireFrame(cpu_frame_);
   }
 
   void SetSampling(bool downsampling, bool smooth) {

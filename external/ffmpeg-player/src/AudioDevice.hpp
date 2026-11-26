@@ -2,6 +2,7 @@
 #define AUDIO_DEVICE_HPP
 
 #include "Logger.hpp"
+#include "ShutdownTrace.hpp"
 #include <algorithm>
 #include <alsa/asoundlib.h>
 #include <atomic>
@@ -229,6 +230,7 @@ public:
   }
 
   ~AudioDevice() {
+    ShutdownTrace trace("audio-device-destroy", this);
     // 1. 设置标志位
     running_ = false;
 
@@ -240,6 +242,7 @@ public:
     if (audio_thread_.joinable()) {
       audio_thread_.join();
     }
+    trace.Step("audio-output-joined");
 
     if (pcm_handle) {
       snd_pcm_drop(pcm_handle);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "PlaybackLifecycle.hpp"
+
 #include <QByteArray>
 #include <QFile>
 #include <QFileInfo>
@@ -155,45 +157,108 @@ inline LoadResult decode(const QByteArray& bytes, const QString& format) {
 
 // 只处理本地/qrc 字幕。网络资源由宿主下载后通过 setSubtitleText() 提交。
 class Loader {
-public:
-    ~Loader() { stop(); }
-    void request(QObject* receiver, QUrl source, std::function<void(LoadResult)> callback) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (stopping_) return;
-        pending_ = Request{++generation_, receiver, std::move(source), std::move(callback), {}, {}};
-        if (!worker_.joinable()) worker_ = std::thread([this] { run(); });
-        changed_.notify_one();
-    }
-    void requestText(QObject* receiver, QString text, QString format, std::function<void(LoadResult)> callback) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (stopping_) return;
-        pending_ = Request{++generation_, receiver, {}, std::move(callback), std::move(text), std::move(format)};
-        if (!worker_.joinable()) worker_ = std::thread([this] { run(); });
-        changed_.notify_one();
-    }
-    void cancel() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        ++generation_;
-        pending_.reset();
-    }
-    void stop() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stopping_ = true;
-            ++generation_;
-            pending_.reset();
-        }
-        changed_.notify_one();
-        if (worker_.joinable()) worker_.join();
-    }
-private:
     struct Request {
         quint64 id;
-        QObject* receiver;
         QUrl source;
         std::function<void(LoadResult)> callback;
         QString text, format;
     };
+
+    struct State : std::enable_shared_from_this<State> {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool stopping = false;
+        quint64 generation = 0;
+        std::optional<Request> pending;
+        std::thread worker;
+        PlaybackUiDispatcher ui;
+
+        void run() {
+            for (;;) {
+                Request job;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    changed.wait(lock, [this] { return stopping || pending.has_value(); });
+                    if (stopping) return;
+                    job = std::move(*pending);
+                    pending.reset();
+                }
+                auto result = job.format.isEmpty() ? Loader::read(job.source) : parse(job.text, job.format);
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (stopping || job.id != generation) continue;
+                }
+                const std::weak_ptr<State> weak = shared_from_this();
+                ui.Post([weak, id = job.id, callback = std::move(job.callback),
+                         result = std::move(result)]() mutable {
+                    const auto state = weak.lock();
+                    if (!state) return;
+                    {
+                        std::lock_guard<std::mutex> lock(state->mutex);
+                        if (state->stopping || id != state->generation) return;
+                    }
+                    callback(std::move(result));
+                });
+            }
+        }
+    };
+
+public:
+    Loader() : state_(std::make_shared<State>()) {}
+    ~Loader() { stop(); }
+    Loader(const Loader &) = delete;
+    Loader &operator=(const Loader &) = delete;
+
+    void request(QObject *receiver, QUrl source, std::function<void(LoadResult)> callback) {
+        const auto state = state_;
+        if (!state) return;
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->stopping) return;
+        state->ui.Attach(receiver);
+        state->pending = Request{++state->generation, std::move(source), std::move(callback), {}, {}};
+        if (!state->worker.joinable())
+            state->worker = std::thread([state] { state->run(); });
+        state->changed.notify_one();
+    }
+
+    void requestText(QObject *receiver, QString text, QString format,
+                     std::function<void(LoadResult)> callback) {
+        const auto state = state_;
+        if (!state) return;
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->stopping) return;
+        state->ui.Attach(receiver);
+        state->pending = Request{++state->generation, {},
+                                std::move(callback), std::move(text), std::move(format)};
+        if (!state->worker.joinable())
+            state->worker = std::thread([state] { state->run(); });
+        state->changed.notify_one();
+    }
+
+    void cancel() {
+        const auto state = state_;
+        if (!state) return;
+        std::lock_guard<std::mutex> lock(state->mutex);
+        ++state->generation;
+        state->pending.reset();
+    }
+
+    void stop() {
+        const auto state = std::move(state_);
+        if (!state) return;
+        state->ui.Disconnect();
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->stopping = true;
+            ++state->generation;
+        }
+        state->changed.notify_all();
+        PlaybackCleanup::Instance().Enqueue([state] {
+            if (state->worker.joinable()) state->worker.join();
+        });
+    }
+
+private:
     static LoadResult read(const QUrl& source) {
         QString path;
         if (source.isLocalFile()) path = source.toLocalFile();
@@ -221,31 +286,6 @@ private:
         if (file.error() != QFileDevice::NoError) return {{}, "Subtitle read failed"};
         return decode(bytes, QFileInfo(path).suffix());
     }
-    void run() {
-        for (;;) {
-            Request job;
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                changed_.wait(lock, [this] { return stopping_ || pending_.has_value(); });
-                if (stopping_) return;
-                job = std::move(*pending_);
-                pending_.reset();
-            }
-            auto result = job.format.isEmpty() ? read(job.source) : parse(job.text, job.format);
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (stopping_ || job.id != generation_) continue;
-            }
-            QMetaObject::invokeMethod(job.receiver, [callback = job.callback, result = std::move(result)]() mutable {
-                callback(std::move(result));
-            }, Qt::QueuedConnection);
-        }
-    }
-    std::mutex mutex_;
-    std::condition_variable changed_;
-    bool stopping_ = false;
-    quint64 generation_ = 0;
-    std::optional<Request> pending_;
-    std::thread worker_;
+    std::shared_ptr<State> state_;
 };
 }

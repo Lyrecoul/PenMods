@@ -1,5 +1,6 @@
 #pragma once
 #include "SubtitleDocument.hpp"
+#include "ShutdownTrace.hpp"
 #include <QImage>
 #include <QRect>
 #include <ass/ass.h>
@@ -21,8 +22,11 @@ public:
     Renderer(const Renderer&) = delete;
     Renderer& operator=(const Renderer&) = delete;
     ~Renderer() {
+        ShutdownTrace trace("subtitle-renderer-destroy", this, library_ != nullptr);
         if (track_) ass_free_track(track_);
+        trace.Step("subtitle-track-freed");
         if (renderer_) ass_renderer_done(renderer_);
+        trace.Step("subtitle-renderer-freed");
         if (library_) ass_library_done(library_);
     }
     Bitmap render(const DocumentPtr& document, const QString& font, double scale,

@@ -324,10 +324,8 @@ void ScreenManager::onAudioDaemonStateChanged() {
     }
     if (shouldLock && !mAudioLockActive) {
         mAudioLockActive = true;
-        // setSystemSuspendOverride() rewrites the daemon config and may restart
-        // input-event-daemon. The host pause is delivered with SIGUSR1 to the
-        // running process (plus a /tmp marker), and a freshly started daemon
-        // starts unpaused, so re-apply the screen pause after the restart.
+        // InputDaemon coalesces the configuration and pause intent, then applies
+        // both on its serial worker. A restarted daemon receives the latest pause.
         rtSetAutoScreenOff(false);
     } else if (mAudioLockActive && !shouldLock) {
         mAudioLockActive = false;

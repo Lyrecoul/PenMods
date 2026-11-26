@@ -18,6 +18,12 @@
 #include <QSaveFile>
 #include <QTimer>
 #include <cstring>
+#include <condition_variable>
+#include <limits>
+#include <mutex>
+#include <sstream>
+#include <thread>
+#include <signal.h>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -27,7 +33,7 @@ namespace mod {
 
 namespace {
 
-// daemon 的启动/停止都只在“状态不对”时等待，正常路径不 sleep，绝不在 UI 线程无界阻塞。
+// Bounded process polling runs exclusively on the serial backend worker.
 constexpr int         kDaemonStopTimeoutMs   = 200;
 constexpr int         kDaemonStartTimeoutMs  = 150;
 constexpr int         kDaemonStartAttempts   = 3;
@@ -85,6 +91,164 @@ bool isMountPoint(const std::string& path) {
  *  并且 ScreenManager 在灭屏期间不再调用 resume()（SIGUSR2 会让积压输入触发 [Idle] reset）。
  */
 
+// Owns all blocking operations. No QObject or GUI-owned singleton is accessed
+// here; requests are value snapshots and at most one operation is in flight.
+class InputDaemon::Backend : private Logger {
+public:
+    struct State {
+        uint32 mBackLightDown = 30, mScreenOff = 60, mSystemSuspend = 600;
+        bool mSystemSuspendOverride = false, mPaused = false, mScreenOn = true;
+        bool configure = false, controlPause = false, charging = false, externalPower = false;
+        uint64_t configRevision = 0;
+        std::string reason;
+    };
+
+    Backend() : Logger("InputDaemon"), mThread([this] { run(); }) {}
+    ~Backend() {
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mClosing = true;
+        }
+        mChanged.notify_one();
+        mThread.join();
+    }
+
+    void submit(State state, bool dispatch) {
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mDesired = std::move(state);
+            ++mRevision;
+            if (dispatch) mPending = true;
+        }
+        mChanged.notify_one();
+    }
+
+    bool busy() const {
+        std::lock_guard<std::mutex> lock(mMutex);
+        return mBusy || mPending;
+    }
+
+    std::string pids() const {
+        std::lock_guard<std::mutex> lock(mMutex);
+        return mKnownPids;
+    }
+
+private:
+    struct Config {
+        std::string mName, mPath, mEffectivePath, mContent;
+        bool mLoaded = false;
+    };
+    void run() {
+        std::unique_lock<std::mutex> lock(mMutex);
+        while (!mClosing) {
+            mChanged.wait(lock, [this] { return mClosing || mPending; });
+            if (mClosing) break;
+            mPending = false;
+            mBusy = true;
+            mCurrent = mDesired;
+            const auto revision = mRevision;
+            lock.unlock();
+            bool ok = false;
+            try {
+                ok = !mCurrent.configure || mCurrent.configRevision == mInstalledRevision
+                    || _apply(mCurrent.reason.c_str());
+                if (ok && mCurrent.configure) mInstalledRevision = mCurrent.configRevision;
+                ok = syncPause() && ok;
+            } catch (const std::exception& e) {
+                error("input daemon worker failed: {}", e.what());
+            } catch (...) {
+                error("input daemon worker failed with an unknown exception");
+            }
+            lock.lock();
+            mBusy = false;
+            // Retry once per request; a new request interrupts the delay.
+            if (!ok && !mPending && !mClosing && revision == mRevision && mRetriedRevision != revision) {
+                mRetriedRevision = revision;
+                mBusy = true;
+                mChanged.wait_for(lock, std::chrono::milliseconds(kDaemonDeferredRetryMs),
+                                  [this, revision] { return mClosing || mRevision != revision; });
+                mBusy = false;
+                if (!mClosing) mPending = true;
+            }
+        }
+    }
+
+    bool syncPause() {
+        // Discovery may be slow. Take the latest intent only after it returns.
+        const auto pids = _daemonPids();
+        std::unique_lock<std::mutex> lock(mMutex);
+        if (mClosing || !mDesired.controlPause) return true;
+        if (pids.empty()) return false;
+        const bool paused = mDesired.mPaused;
+        if (!paused && !mDesired.mScreenOn) {
+            // A queued resume must not deliver SIGUSR2 after screen-off.
+            mPauseKnown = false;
+            return true;
+        }
+        const bool marker = QFile::exists("/tmp/stop_input_event_daemon");
+        if (mPauseKnown && mAppliedPaused == paused && marker == paused && mSignalledPids == pids) return true;
+
+        // Equivalent to the vendor shell wrappers, without launching a shell.
+        // Keep the intent lock only for these short tmpfs/signal operations.
+        if (paused) {
+            const int fd = ::open("/tmp/stop_input_event_daemon", O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+            if (fd < 0) { mPauseKnown = false; return false; }
+            ::futimens(fd, nullptr); // Match touch: refresh the vendor stale-marker age.
+            ::close(fd);
+        } else if (::unlink("/tmp/stop_input_event_daemon") != 0 && errno != ENOENT) {
+            mPauseKnown = false;
+            return false;
+        }
+        bool ok = true, signalled = false;
+        std::istringstream input(pids);
+        long pid;
+        while (input >> pid) {
+            if (pid <= 1 || pid > std::numeric_limits<pid_t>::max()) { ok = false; continue; }
+            signalled = true;
+            if (::kill(static_cast<pid_t>(pid), paused ? SIGUSR1 : SIGUSR2) != 0) ok = false;
+        }
+        ok = ok && signalled && input.eof();
+        mPauseKnown = ok;
+        mAppliedPaused = paused;
+        mSignalledPids = pids;
+        const auto reason = mDesired.reason;
+        lock.unlock();
+        info("[{}] async auto screen off {}: pid={} success={}", reason, paused ? "pause" : "resume", pids, ok);
+        return ok;
+    }
+
+    const Config& _config();
+    std::string _renderConfig(const Config& cfg) const;
+    std::string _currentConfigContent(const Config& cfg) const;
+    bool _apply(const char* reason);
+    bool _applyImpl(const char* reason);
+    bool _installConfig(const Config& cfg, const std::string& rendered, const char* reason);
+    bool _stopDaemon(const char* reason);
+    bool _startDaemon(const char* reason);
+    bool _writeFileAtomic(const std::string& path, const std::string& content);
+    bool _overwriteFileInPlace(const std::string& path, const std::string& content);
+    bool _waitForDaemonState(bool running, int timeoutMs);
+    std::string _daemonPids();
+    void _logState(const char* phase, const char* reason);
+    Config _getConfig();
+    std::string _getRawConfigure(const char* model);
+
+    mutable std::mutex mMutex;
+    std::condition_variable mChanged;
+    State mDesired, mCurrent;
+    uint64_t mRevision = 0, mRetriedRevision = 0;
+    uint64_t mInstalledRevision = 0;
+    bool mClosing = false, mPending = false, mBusy = false;
+    std::string mKnownPids;
+    // Only the worker accesses configuration and applied state.
+    Config mConfig;
+    int mSkipCount = 0;
+    std::string mSkipContent;
+    bool mPauseKnown = false, mAppliedPaused = false;
+    std::string mSignalledPids;
+    std::thread mThread;
+};
+
 InputDaemon::InputDaemon() : Logger("InputDaemon") {
     // USB/蓝牙耳机媒体键监听，等 UI 就绪后才启动。
     HeadsetControls::getInstance();
@@ -114,7 +278,10 @@ void InputDaemon::onUiCompleted() {
 bool InputDaemon::setScreenOff(uint32 sec) {
     mScreenOff     = sec;
     mBackLightDown = sec > 10 ? sec - 10 : 0;
-    return _apply("setScreenOff");
+    mConfigure = true;
+    ++mConfigRevision;
+    _scheduleUpdate("setScreenOff");
+    return true;
 }
 
 bool InputDaemon::setSystemSuspend(uint32 sec) {
@@ -131,7 +298,10 @@ bool InputDaemon::setSystemSuspend(uint32 sec) {
         return false;
     }
     mSystemSuspend = sec;
-    return _apply("setSystemSuspend");
+    mConfigure = true;
+    ++mConfigRevision;
+    _scheduleUpdate("setSystemSuspend");
+    return true;
 }
 
 void InputDaemon::setSystemSuspendOverride(bool enabled) {
@@ -139,7 +309,9 @@ void InputDaemon::setSystemSuspendOverride(bool enabled) {
         return;
     }
     mSystemSuspendOverride = enabled;
-    _apply(enabled ? "suspend-override-on" : "suspend-override-off");
+    mConfigure = true;
+    ++mConfigRevision;
+    _scheduleUpdate(enabled ? "suspend-override-on" : "suspend-override-off");
 }
 
 void InputDaemon::reset() {
@@ -162,85 +334,56 @@ void InputDaemon::reset() {
         mBackLightDown,
         mSystemSuspend
     );
-    _apply("reset");
+    mConfigure = true;
+    ++mConfigRevision;
+    _scheduleUpdate("reset");
+}
+
+InputDaemon::~InputDaemon() = default;
+
+void InputDaemon::_scheduleUpdate(const char* reason) {
+    mReason = reason;
+    if (!mBackend) mBackend = std::make_unique<Backend>();
+    const auto snapshot = [this] {
+        return Backend::State{mBackLightDown, mScreenOff, mSystemSuspend, mSystemSuspendOverride,
+            mPaused, mScreenOn, mConfigure, mControlPause,
+            BatteryInfo::getInstance().isCharging(), BatteryInfo::getInstance().isOnExternalPower(),
+            mConfigRevision, mReason};
+    };
+    // Publish controls immediately, so an in-flight restart cannot replay stale
+    // pause/resume. Coalesce requests from this GUI turn before starting work.
+    mBackend->submit(snapshot(), false);
+    if (mUpdateQueued) return;
+    mUpdateQueued = true;
+    QTimer::singleShot(0, this, [this, snapshot] {
+        mUpdateQueued = false;
+        mBackend->submit(snapshot(), true);
+    });
 }
 
 void InputDaemon::pause(const char* reason) {
     mPaused = true;
-    try {
-        const std::string pids = _daemonPids();
-        info(
-            "[{}] pause auto screen off：screen_on={} charging={} external_power={} daemon_pid={}",
-            reason,
-            mScreenOn,
-            BatteryInfo::getInstance().isCharging(),
-            BatteryInfo::getInstance().isOnExternalPower(),
-            pidsOrNone(pids)
-        );
-        // 厂商实现 = `touch /tmp/stop_input_event_daemon` + `killall -USR1 input-event-daemon`
-        // （daemon 进 freeze）。它只让 daemon 不再处理输入/idle，不会点亮屏幕。
-        PEN_CALL(void*, "stop_auto_screen_off")();
-    } catch (const std::exception& e) {
-        error("[{}] pause auto screen off 异常（已忽略）：{}", reason, e.what());
-    } catch (...) {
-        error("[{}] pause auto screen off 未知异常（已忽略）", reason);
-    }
+    mControlPause = true;
+    _scheduleUpdate(reason);
 }
 
 void InputDaemon::resume(const char* reason) {
     mPaused = false;
-    try {
-        if (!mScreenOn) {
-            // ScreenManager 已经用 mResumePending 拦了这类调用；这里再兜一层并留证据：
-            // 灭屏时 SIGUSR2 会让 daemon 处理积压输入并执行 [Idle] reset（screen_onoff on），
-            // 实测表现是“刚熄的屏幕又亮起来”。
-            warn("[{}] resume auto screen off 被要求在灭屏状态下调用（延迟到屏幕亮起后再做）", reason);
-        }
-        const std::string pids = _daemonPids();
-        info(
-            "[{}] resume auto screen off：screen_on={} charging={} external_power={} daemon_pid={}",
-            reason,
-            mScreenOn,
-            BatteryInfo::getInstance().isCharging(),
-            BatteryInfo::getInstance().isOnExternalPower(),
-            pidsOrNone(pids)
-        );
-        // 厂商实现 = `rm /tmp/stop_input_event_daemon` + `killall -USR2 input-event-daemon`。
-        PEN_CALL(void*, "start_auto_screen_off")();
-    } catch (const std::exception& e) {
-        error("[{}] resume auto screen off 异常（已忽略）：{}", reason, e.what());
-    } catch (...) {
-        error("[{}] resume auto screen off 未知异常（已忽略）", reason);
-    }
+    mControlPause = true;
+    _scheduleUpdate(reason);
 }
 
 void InputDaemon::onScreenStateChanged(bool screenOn) {
-    if (mScreenOn == screenOn) {
-        return;
-    }
+    if (mScreenOn == screenOn) return;
     mScreenOn = screenOn;
-    try {
-        const std::string pids = _daemonPids();
-        info(
-            "屏幕{}：charging={} external_power={} paused={} daemon_pid={}",
-            screenOn ? "亮起" : "熄灭",
-            BatteryInfo::getInstance().isCharging(),
-            BatteryInfo::getInstance().isOnExternalPower(),
-            mPaused,
-            pidsOrNone(pids)
-        );
-    } catch (const std::exception& e) {
-        error("屏幕状态日志异常（已忽略）：{}", e.what());
-    } catch (...) {
-        error("屏幕状态日志未知异常（已忽略）");
-    }
+    if (mBackend) _scheduleUpdate(screenOn ? "screen-on" : "screen-off");
 }
 
-bool InputDaemon::isDaemonRunning() { return !_daemonPids().empty(); }
+bool InputDaemon::isUpdating() const { return mUpdateQueued || (mBackend && mBackend->busy()); }
+bool InputDaemon::isDaemonRunning() { return !daemonPids().empty(); }
+std::string InputDaemon::daemonPids() { return mBackend ? mBackend->pids() : std::string{}; }
 
-std::string InputDaemon::daemonPids() { return _daemonPids(); }
-
-const InputDaemon::Config& InputDaemon::_config() {
+const InputDaemon::Backend::Config& InputDaemon::Backend::_config() {
     if (!mConfig.mLoaded) {
         mConfig         = _getConfig();
         mConfig.mLoaded = true;
@@ -249,18 +392,18 @@ const InputDaemon::Config& InputDaemon::_config() {
     return mConfig;
 }
 
-std::string InputDaemon::_renderConfig(const Config& cfg) const {
+std::string InputDaemon::Backend::_renderConfig(const Config& cfg) const {
     // The audio lock suppresses suspend at runtime without discarding the
     // user's configured duration.
-    const uint32 suspend = mSystemSuspendOverride ? 0 : mSystemSuspend;
+    const uint32 suspend = mCurrent.mSystemSuspendOverride ? 0 : mCurrent.mSystemSuspend;
     return QString::fromStdString(cfg.mContent)
-        .replace("{backlight_down}", mBackLightDown ? QString::number(mBackLightDown) : "#")
-        .replace("{screen_off}", mScreenOff ? QString::number(mScreenOff) : "#")
+        .replace("{backlight_down}", mCurrent.mBackLightDown ? QString::number(mCurrent.mBackLightDown) : "#")
+        .replace("{screen_off}", mCurrent.mScreenOff ? QString::number(mCurrent.mScreenOff) : "#")
         .replace("{system_suspend}", suspend ? QString::number(suspend) : "#")
         .toStdString();
 }
 
-std::string InputDaemon::_currentConfigContent(const Config& cfg) const {
+std::string InputDaemon::Backend::_currentConfigContent(const Config& cfg) const {
     const std::string effective = readFile(cfg.mEffectivePath.c_str());
     if (!effective.empty()) {
         return effective;
@@ -268,7 +411,7 @@ std::string InputDaemon::_currentConfigContent(const Config& cfg) const {
     return readFile(cfg.mPath.c_str());
 }
 
-bool InputDaemon::_apply(const char* reason) {
+bool InputDaemon::Backend::_apply(const char* reason) {
     try {
         return _applyImpl(reason);
     } catch (const std::exception& e) {
@@ -279,7 +422,7 @@ bool InputDaemon::_apply(const char* reason) {
     return false;
 }
 
-bool InputDaemon::_applyImpl(const char* reason) {
+bool InputDaemon::Backend::_applyImpl(const char* reason) {
     const Config&     cfg        = _config();
     const std::string rendered   = _renderConfig(cfg);
     const std::string pids       = _daemonPids();
@@ -295,25 +438,16 @@ bool InputDaemon::_applyImpl(const char* reason) {
                 "charging={} screen_on={} paused={}",
                 reason,
                 pids,
-                mScreenOff,
-                mSystemSuspend,
-                mSystemSuspendOverride,
-                BatteryInfo::getInstance().isCharging(),
-                mScreenOn,
-                mPaused
+                mCurrent.mScreenOff,
+                mCurrent.mSystemSuspend,
+                mCurrent.mSystemSuspendOverride,
+                mCurrent.charging,
+                mCurrent.mScreenOn,
+                mCurrent.mPaused
             );
             mSkipContent = rendered;
         } else {
             debug("[{}] 配置仍无变化，跳过重启（第 {} 次）", reason, mSkipCount);
-        }
-        // 配置不用改，但 daemon 的 freeze 状态可能被外部（cron/init 重新拉起）清掉。
-        // 只做“往暂停方向”的补偿：pause 不会点亮屏幕；反向的 resume 在灭屏过渡期是禁区，
-        // 残留标记交给厂商 cron（20 分钟）或下次进程启动清理，这里只留证据。
-        if (mPaused && !QFile::exists("/tmp/stop_input_event_daemon")) {
-            warn("[{}] daemon 在跑但 pause 标记缺失，重放 pause 以恢复 freeze", reason);
-            pause("resync-pause");
-        } else if (!mPaused && QFile::exists("/tmp/stop_input_event_daemon")) {
-            warn("[{}] 发现残留 /tmp/stop_input_event_daemon 但本进程未暂停；不在过渡期发 SIGUSR2", reason);
         }
         return true;
     }
@@ -329,7 +463,8 @@ bool InputDaemon::_applyImpl(const char* reason) {
 
     // 先停 daemon：避免 bind mount 的 in-place 镜像有并发读者，也保证新 daemon 不会
     // 读到任何半写内容。（rename 是原子的；镜像旧 inode 那一步不是，原因见下。）
-    _stopDaemon(reason);
+    if (!_stopDaemon(reason)) return false;
+    mPauseKnown = false;
 
     const std::string previous  = _currentConfigContent(cfg);
     const bool        installed = _installConfig(cfg, rendered, reason);
@@ -341,28 +476,11 @@ bool InputDaemon::_applyImpl(const char* reason) {
     }
 
     const bool started = _startDaemon(reason);
-    if (started && mPaused) {
-        // 新 daemon 从“未暂停”开始；厂商的 freeze 是运行期信号 + /tmp 标记，重启后就丢了。
-        info("[{}] daemon 已重启，重放 pause（新进程默认未 freeze）", reason);
-        pause("reapply-after-restart");
-    }
     _logState(started ? "apply-end" : "apply-end(daemon-missing)", reason);
-    if (!started) {
-        // 有限重试都失败时不在 UI 线程死循环，交给事件循环稍后再试一次。
-        QTimer::singleShot(kDaemonDeferredRetryMs, this, [this]() {
-            if (!_daemonPids().empty()) {
-                return;
-            }
-            warn("延迟重试拉起 input-event-daemon");
-            if (_startDaemon("deferred-retry") && mPaused) {
-                pause("reapply-after-deferred-retry");
-            }
-        });
-    }
-    return started;
+    return installed && started;
 }
 
-bool InputDaemon::_installConfig(const Config& cfg, const std::string& rendered, const char* reason) {
+bool InputDaemon::Backend::_installConfig(const Config& cfg, const std::string& rendered, const char* reason) {
     const QString effective    = QString::fromStdString(cfg.mEffectivePath);
     const bool    hasEffective = cfg.mEffectivePath != cfg.mPath && QFile::exists(effective);
 
@@ -486,7 +604,7 @@ bool InputDaemon::_installConfig(const Config& cfg, const std::string& rendered,
     return true;
 }
 
-bool InputDaemon::_stopDaemon(const char* reason) {
+bool InputDaemon::Backend::_stopDaemon(const char* reason) {
     const std::string before = _daemonPids();
     if (before.empty()) {
         debug("[{}] 没有运行中的 input-event-daemon", reason);
@@ -499,7 +617,7 @@ bool InputDaemon::_stopDaemon(const char* reason) {
     const bool gone = _waitForDaemonState(false, kDaemonStopTimeoutMs);
     if (!gone) {
         warn(
-            "[{}] killall 后约 {}ms 仍能看到 input-event-daemon（pid={}），继续后续步骤",
+            "[{}] killall 后约 {}ms 仍能看到 input-event-daemon（pid={}），取消本次配置写入",
             reason,
             kDaemonStopTimeoutMs,
             _daemonPids()
@@ -510,7 +628,7 @@ bool InputDaemon::_stopDaemon(const char* reason) {
     return gone;
 }
 
-bool InputDaemon::_startDaemon(const char* reason) {
+bool InputDaemon::Backend::_startDaemon(const char* reason) {
     // 绝不能给 exec() 加 -v/--verbose：daemon(1,1) 会保留 stdout（也就是 popen 的管道
     // 写端），exec() 里的 pclose() 就会一直等 EOF，把 UI 线程永久卡住。
     for (int attempt = 1; attempt <= kDaemonStartAttempts; ++attempt) {
@@ -538,7 +656,7 @@ bool InputDaemon::_startDaemon(const char* reason) {
     return false;
 }
 
-bool InputDaemon::_writeFileAtomic(const std::string& path, const std::string& content) {
+bool InputDaemon::Backend::_writeFileAtomic(const std::string& path, const std::string& content) {
     QSaveFile file(QString::fromStdString(path));
     // 不允许 QSaveFile 退化成“直接写目标文件”：那样截断瞬间就会暴露半写配置。
     file.setDirectWriteFallback(false);
@@ -559,7 +677,7 @@ bool InputDaemon::_writeFileAtomic(const std::string& path, const std::string& c
     return true;
 }
 
-bool InputDaemon::_overwriteFileInPlace(const std::string& path, const std::string& content) {
+bool InputDaemon::Backend::_overwriteFileInPlace(const std::string& path, const std::string& content) {
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         // EROFS 通常表示路径是 ro bind mount（本机型 /etc/input-event-daemon.conf），
@@ -588,7 +706,7 @@ bool InputDaemon::_overwriteFileInPlace(const std::string& path, const std::stri
     return ok;
 }
 
-bool InputDaemon::_waitForDaemonState(bool running, int timeoutMs) {
+bool InputDaemon::Backend::_waitForDaemonState(bool running, int timeoutMs) {
     for (int waited = 0; waited <= timeoutMs; waited += kDaemonPollStepMs) {
         const bool isRunning = !_daemonPids().empty();
         if (isRunning == running) {
@@ -599,17 +717,20 @@ bool InputDaemon::_waitForDaemonState(bool running, int timeoutMs) {
     return !_daemonPids().empty() == running;
 }
 
-std::string InputDaemon::_daemonPids() {
+std::string InputDaemon::Backend::_daemonPids() {
     // exec() 在 popen 失败时会抛 std::runtime_error；这个值被日志/Qt 槽路径调用，不能外抛。
     try {
-        return exec("pidof input-event-daemon");
+        auto pids = exec("pidof input-event-daemon");
+        std::lock_guard<std::mutex> lock(mMutex);
+        mKnownPids = pids;
+        return pids;
     } catch (const std::exception& e) {
         warn("pidof input-event-daemon 执行失败：{}", e.what());
         return {};
     }
 }
 
-void InputDaemon::_logState(const char* phase, const char* reason) {
+void InputDaemon::Backend::_logState(const char* phase, const char* reason) {
     const Config&     cfg      = _config();
     const std::string pids     = _daemonPids();
     const std::string rendered = _renderConfig(cfg);
@@ -619,14 +740,14 @@ void InputDaemon::_logState(const char* phase, const char* reason) {
         "config={} (model={}) content_matches={}",
         reason,
         phase,
-        mScreenOff,
-        mBackLightDown,
-        mSystemSuspend,
-        mSystemSuspendOverride,
-        BatteryInfo::getInstance().isCharging(),
-        BatteryInfo::getInstance().isOnExternalPower(),
-        mScreenOn,
-        mPaused,
+        mCurrent.mScreenOff,
+        mCurrent.mBackLightDown,
+        mCurrent.mSystemSuspend,
+        mCurrent.mSystemSuspendOverride,
+        mCurrent.charging,
+        mCurrent.externalPower,
+        mCurrent.mScreenOn,
+        mCurrent.mPaused,
         !pids.empty(),
         pidsOrNone(pids),
         cfg.mPath,
@@ -635,7 +756,7 @@ void InputDaemon::_logState(const char* phase, const char* reason) {
     );
 }
 
-InputDaemon::Config InputDaemon::_getConfig() {
+InputDaemon::Backend::Config InputDaemon::Backend::_getConfig() {
     auto pcba = exec("get_pcba_version");
     if (pcba == "Dictpen2.0_V4") {
         return {"V4", "/etc/input-event-daemon_V4.conf", kEffectiveConfigPath, _getRawConfigure("V4")};
@@ -661,7 +782,7 @@ InputDaemon::Config InputDaemon::_getConfig() {
     return {"V0(fallback)", "/etc/input-event-daemon_V0.conf", kEffectiveConfigPath, _getRawConfigure("V0")};
 }
 
-std::string InputDaemon::_getRawConfigure(const char* model) {
+std::string InputDaemon::Backend::_getRawConfigure(const char* model) {
     switch (H(model)) {
     case H("Cherry"):
         return R"(

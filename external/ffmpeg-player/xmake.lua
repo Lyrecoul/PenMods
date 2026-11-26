@@ -1,6 +1,6 @@
 -- ============================================================================
 -- Haikure/ffmpeg-player —— Qt5 QML 视频播放器插件（已 vendor 进 PenMods）
---   上游   : https://github.com/Haikure/ffmpeg-player  (v1.0.5 / b98a8ea, GPL-3.0)
+--   上游   : https://github.com/Haikure/ffmpeg-player  (v1.0.6 / 9ffe988, GPL-3.0)
 --   改动   : external/ffmpeg-player/UPSTREAM.md
 --   分析与实测: doc/FFMPEG_PLAYER_ANALYSIS.md
 --   构建   : xmake build ffmpegplayerplugin

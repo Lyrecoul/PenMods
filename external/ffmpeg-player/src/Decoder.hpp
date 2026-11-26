@@ -21,6 +21,7 @@
 
 #include "DrmPrime.hpp"
 #include "FFmpegCore.hpp"
+#include "ShutdownTrace.hpp"
 
 #include <chrono>
 #include <deque>
@@ -80,7 +81,8 @@ public:
 
   // 送入一个包并取出所有可用帧；pkt 为 nullptr 表示 drain（EOF 冲刷）。
   // 返回 AVERROR_EOF 表示解码器已完全排空，其余情况返回 0 或错误码。
-  int Decode(const AVPacket *pkt, const FrameCallback &on_frame) {
+  int Decode(const AVPacket *pkt, const FrameCallback &on_frame,
+             const std::function<bool()> &cancelled = {}) {
     const auto start = std::chrono::steady_clock::now();
     double callback = 0;
     unsigned frames = 0;
@@ -90,7 +92,7 @@ public:
       const bool result = on_frame(frame);
       callback += std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
       return result;
-    });
+    }, cancelled);
     callback_seconds_ += callback;
     const auto now = std::chrono::steady_clock::now();
     const double elapsed = std::chrono::duration<double>(now - start).count() - callback;
@@ -109,7 +111,9 @@ public:
   }
   void ResetPerformance() { recent_.clear(); recent_seconds_ = 0; recent_frames_ = 0; }
 
-  int DecodeInternal(const AVPacket *pkt, const FrameCallback &on_frame) {
+  int DecodeInternal(const AVPacket *pkt, const FrameCallback &on_frame,
+                     const std::function<bool()> &cancelled = {}) {
+    if (cancelled && cancelled()) return AVERROR_EXIT;
     if (!ctx_)
       return AVERROR(EINVAL);
     if (!frame_ && !(frame_ = av_frame_alloc()))
@@ -117,6 +121,7 @@ public:
 
     const auto start = std::chrono::steady_clock::now();
     for (;;) {
+      if (cancelled && cancelled()) return AVERROR_EXIT;
       int ret = avcodec_send_packet(ctx_, pkt);
       if (ret == 0 || ret == AVERROR_EOF)
         break;
@@ -125,7 +130,8 @@ public:
 
       // 输入队列已满（rkmpp 常见）：先取帧腾出空间再重发，不能丢包
       int got = 0;
-      ret = ReceiveAll(on_frame, got);
+      ret = ReceiveAll(on_frame, got, cancelled);
+      if (ret == AVERROR_EXIT) return ret;
       if (ret == kStopped)
         return 0;
       if (ret == AVERROR_EOF)
@@ -148,7 +154,8 @@ public:
 
     for (;;) {
       int got = 0;
-      int ret = ReceiveAll(on_frame, got);
+      int ret = ReceiveAll(on_frame, got, cancelled);
+      if (ret == AVERROR_EXIT) return ret;
       if (ret == kStopped)
         return 0;
       if (ret == AVERROR_EOF)
@@ -218,7 +225,9 @@ private:
   static constexpr int64_t kMaxHwPixels = 1920LL * 1088;
 
   void Cleanup() {
+    ShutdownTrace trace("decoder-cleanup", this, ctx_ || frame_);
     FreeContext();
+    trace.Step("codec-context-freed");
     if (params_)
       avcodec_parameters_free(&params_);
     if (frame_)
@@ -271,11 +280,17 @@ private:
     return true;
   }
 
-  int ReceiveAll(const FrameCallback &on_frame, int &got) {
+  int ReceiveAll(const FrameCallback &on_frame, int &got,
+                 const std::function<bool()> &cancelled) {
     for (;;) {
+      if (cancelled && cancelled()) return AVERROR_EXIT;
       int ret = avcodec_receive_frame(ctx_, frame_);
       if (ret < 0)
         return ret;
+      if (cancelled && cancelled()) {
+        av_frame_unref(frame_);
+        return AVERROR_EXIT;
+      }
 
       ++got;
 #ifdef FFPLAYER_VALIDATION

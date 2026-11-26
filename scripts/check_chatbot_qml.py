@@ -38,6 +38,15 @@ functions = [
 # absence through duplicate row identities, rather than asserting source spelling.
 if "function _nextResponseRowId(" in source:
     functions.append("_nextResponseRowId")
+if "function _consumeAiFollowup(" in source:
+    functions.append("_consumeAiFollowup")
+else:
+    for helper in ("_consumeAiFollowupContext", "_dropAiFollowupContext", "_applyAiFollowupContext"):
+        if "function " + helper + "(" in source:
+            functions.append(helper)
+for helper in ("_scanBehavior", "_scanInterceptGate", "_scanCaptureTarget", "_syncScanCaptureArm"):
+    if "function " + helper + "(" in source:
+        functions.append(helper)
 logic = "\n".join(block("function " + name + "(") for name in functions)
 logic += "\n    function visibilityChanged() " + block("onVisibleChanged:").split(":", 1)[1]
 logic += "\n" + block("function onToolStateChanged(")
@@ -62,10 +71,12 @@ Item {
                             searchConfigured: false, searchEnabled: false})
     property var keyBoard: ({autoSendScan: true, autoSendScanConfig: true})
     property var cameraCapture: ({captureEnabled: true})
-    property var id_pop_container: ({closeAllPages: function() {}})
+    property var id_pop_container: ({count: 0, closeAllPages: function() {}})
+    property var mod: ({pendingAiFollowupContext: ""})
     property var scrollController: ({beforeLayout: function() {}, schedule: function() {}})
     property var throttlingTimer: ({running: false, stop: function() {}, start: function() {}})
     property var generationDoneTimer: ({stop: function() {}})
+    Timer { id: scanCaptureWait }
     property var streamThrottle: ({content: "", lastIndex: -1, targetKind: "", reasoning: "", reasoningIndex: -1})
     ListModel { id: chatModel; dynamicRoles: true }
     ListModel { id: attachedFilesModel; dynamicRoles: true }
@@ -123,7 +134,7 @@ Item {
             compare(id_more_menu.searchEnabled, true);
             compare(id_more_menu.searchConfigured, true);
             verify(findText(id_more_menu, "厂商搜索"));
-            mouseClick(id_chat_assistant_page, 100, 50);
+            id_more_menu.webSearchToggled();
             compare(chatbot.nativeSearchEnabled, false);
             compare(chatbot.searchEnabled, false);
         }
@@ -133,7 +144,7 @@ Item {
             id_more_menu.show();
             tryCompare(id_more_menu, "opacity", 1);
             verify(findText(id_more_menu, "网络搜索"));
-            mouseClick(id_chat_assistant_page, 100, 50);
+            id_more_menu.webSearchToggled();
             compare(chatbot.searchEnabled, true);
             compare(chatbot.nativeSearchEnabled, true);
         }

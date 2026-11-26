@@ -9,6 +9,7 @@
 #include "common/Event.h"
 #include "mod/Config.h"
 #include "system/input/ScreenManager.h"
+#include "tweaker/AsrService.h"
 
 #include "base/YPointer.h"
 
@@ -201,9 +202,21 @@ QString envSummary(const ScanEnv& env) {
 namespace mod {
 
 KeyBoard::KeyBoard() {
-    auto& config         = mod::Config::getInstance();
-    json  aiCfg          = config.read("ai");
-    m_autoSendScanConfig = aiCfg.contains("auto_send_scan") ? aiCfg["auto_send_scan"].get<bool>() : true;
+    auto& config = mod::Config::getInstance();
+    json  aiCfg  = config.read("ai");
+    // 新键优先；老配置只有 auto_send_scan 时在 Config 加载阶段已经迁移过，
+    // 这里再兜一层，避免手工改过的配置把行为读成非法值。
+    const auto validBehavior = [](const std::string& value) {
+        return value == "send" || value == "input" || value == "capture" || value == "off";
+    };
+    std::string behavior = "send";
+    if (aiCfg.contains("scan_behavior") && aiCfg["scan_behavior"].is_string()) {
+        behavior = aiCfg["scan_behavior"].get<std::string>();
+    } else if (aiCfg.contains("auto_send_scan") && aiCfg["auto_send_scan"].is_boolean()) {
+        behavior = aiCfg["auto_send_scan"].get<bool>() ? "send" : "off";
+    }
+    if (!validBehavior(behavior)) behavior = "send";
+    m_scanBehavior = QString::fromStdString(behavior);
 
     mCfg             = config.read(mClassName);
     m_keyboardLayout = QString::fromStdString(mCfg.value("layout", std::string("native")));
@@ -239,18 +252,35 @@ void KeyBoard::setInputPageShowing(bool value) {
 }
 
 void KeyBoard::setAutoSendScanConfig(bool value) {
-    if (m_autoSendScanConfig != value) {
-        m_autoSendScanConfig = value;
-        auto& config         = mod::Config::getInstance();
-        json  aiCfg          = config.read("ai");
-        if (aiCfg.is_null()) aiCfg = json::object();
-        aiCfg["auto_send_scan"] = value;
-        config.write("ai", aiCfg, true);
-        emit autoSendScanConfigChanged();
-    }
+    // 旧设置项（开关）等价于在 send / off 之间切换，保留以免旧资源库或插件调用失效。
+    setScanBehavior(value ? "send" : "off");
+}
+
+void KeyBoard::setScanBehavior(const QString& value) {
+    const QString normalized = (value == "send" || value == "input" || value == "capture" || value == "off")
+                                   ? value
+                                   : QStringLiteral("send");
+    if (m_scanBehavior == normalized) return;
+
+    m_scanBehavior = normalized;
+    auto& config   = Config::getInstance();
+    json  aiCfg    = config.read("ai");
+    if (aiCfg.is_null() || !aiCfg.is_object()) aiCfg = json::object();
+    aiCfg["scan_behavior"] = normalized.toStdString();
+    // 同时回写旧字段：降级回旧版（或旧资源库）时行为不会突变。
+    aiCfg["auto_send_scan"] = (normalized == "send");
+    config.write("ai", aiCfg, true);
+    emit scanBehaviorChanged();
+    emit autoSendScanConfigChanged();
 }
 
 bool KeyBoard::startVoiceInput(QObject* speechManager) {
+    // 需求 10：DeepSeek 语音识别接管（默认关闭，只接管这个键盘语音键）。
+    // 关闭时 beginVoiceCapture() 立刻返回 false，这里不会碰麦克风，下面的原厂流程与以前
+    // 一模一样；开启且条件满足时由 AsrService 自己录音并返回 true，这时不调用厂商的
+    // startAsrRecord —— 两路麦克风采集不能同时开。
+    if (mod::AsrService::getInstance().beginVoiceCapture(speechManager)) return true;
+
     auto* startAsrRecord = PEN_SYM("_ZN14YSpeechManager14startAsrRecordEv");
     auto* setAsrResult   = PEN_SYM("_ZN14YSpeechManager12setAsrResultERK7QString");
     if (speechManager == nullptr || startAsrRecord == nullptr || setAsrResult == nullptr) return false;
@@ -265,6 +295,10 @@ bool KeyBoard::startVoiceInput(QObject* speechManager) {
 }
 
 bool KeyBoard::stopVoiceInput(QObject* speechManager) {
+    // 同上：接管中的停止由 AsrService 负责（停止采集 → 上传 → 注入文本 / 失败回退）。
+    // 长按语音那条路不经过这里，仍然完全由厂商处理。
+    if (mod::AsrService::getInstance().endVoiceCapture(speechManager)) return true;
+
     auto* stopAsrRecord = PEN_SYM("_ZN14YSpeechManager13stopAsrRecordEv");
     if (speechManager == nullptr || stopAsrRecord == nullptr) return false;
 

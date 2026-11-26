@@ -34,6 +34,9 @@ AntiEmbs::AntiEmbs() {
     mFastHide       = mCfg["fast_hide_music"];
     mLowVoiceMode   = mCfg["low_voice"];
     mFastMute       = mCfg["fast_mute"];
+    // 旧配置里没有这个键时不能直接取值：mCfg 是本类的配置节，_fill_missing_defaults
+    // 会在加载时补齐，但为兼容被外部手改过的配置，这里仍然走一次存在性判断。
+    mBootMute = mCfg.contains("boot_mute") ? mCfg["boot_mute"].get<bool>() : false;
 
     connect(this, &AntiEmbs::lowVoiceModeChanged, [&]() {
         mLowVoiceMode ? ASound::getInstance().setDb({-80.0, -20.0}) : ASound::getInstance().setDb({-50.0, 0.0});
@@ -60,6 +63,32 @@ AntiEmbs::AntiEmbs() {
 void AntiEmbs::onUiCompleted() {
     emit lowVoiceModeChanged();
     emit autoPronLockChanged();
+
+    // 开机默认静音：只在 UI 就绪后做一次。厂商在自身初始化阶段会把上次保存的音量
+    // 恢复回来，uiCompleted 是那之后第一个我们确定已经跑完的点。
+    // 两个入口都要写：YSettingManager::setSpkVolume 的缓存值已经等于目标值时会提前
+    // 返回，真正下发到混音器的是 YDeviceManager::setSpkVolume（与
+    // VolumeGuard::enforce() 的处理方式一致）。写 0 不需要延迟重试。
+    // 三个厂商符号都先判空再调：PEN_CALL 是裸函数指针强转，符号缺失时等于跳转到 0。
+    // 这里在 uiCompleted（Qt 槽）里执行，一次空指针调用就是一次 SIGSEGV -> 守护器重启 ->
+    // 连续快速失败会把设备推进 recovery，代价远大于"静音功能不生效"。
+    if (mBootMute) {
+        auto* setting = YPointer<YSettingManager>::getInstance();
+        auto* setVolumeSym = PEN_SYM("_ZN15YSettingManager12setSpkVolumeEi");
+        if (setting == nullptr || setVolumeSym == nullptr) {
+            spdlog::warn("AntiEmbs: 开机默认静音跳过（YSettingManager 或 setSpkVolume 不可用）");
+            return;
+        }
+        reinterpret_cast<void (*)(void*, int)>(setVolumeSym)(setting, 0);
+
+        auto* instanceSym = PEN_SYM("_ZN10YSingletonI14YDeviceManagerE8instanceEv");
+        auto* deviceSym   = PEN_SYM("_ZN14YDeviceManager12setSpkVolumeEi");
+        if (instanceSym != nullptr && deviceSym != nullptr) {
+            auto* device = reinterpret_cast<void* (*)()>(instanceSym)();
+            if (device != nullptr) reinterpret_cast<void (*)(void*, int)>(deviceSym)(device, 0);
+        }
+        spdlog::info("AntiEmbs: 开机默认静音已应用（音量=0）");
+    }
 }
 
 void AntiEmbs::onHomeButtonPress() {
@@ -104,6 +133,8 @@ bool AntiEmbs::deactivate(const QString& password) {
 }
 
 bool AntiEmbs::getAutoMute() const { return mAutoMute; }
+
+bool AntiEmbs::getBootMute() const { return mBootMute; }
 
 bool AntiEmbs::getLowVoiceMode() const { return mLowVoiceMode; }
 
@@ -154,6 +185,14 @@ void AntiEmbs::setFastHide(bool val) {
         mFastHide = val;
         UPDATE_CFG("fast_hide_music", val);
         emit fastHideChanged();
+    }
+}
+
+void AntiEmbs::setBootMute(bool val) {
+    if (mBootMute != val) {
+        mBootMute = val;
+        UPDATE_CFG("boot_mute", val);
+        emit bootMuteChanged();
     }
 }
 

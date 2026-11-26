@@ -410,6 +410,7 @@ QJsonObject ChatBot::messageToJson(const MessageData& msg) const {
             // 活动模型不支持视觉时不发历史里的图（视觉代理下原图仅本地查看，发给文字模型会被拒）。
             if (part.type == "file" && part.mimeType != "application/pdf") continue;
             if (part.type == "image_url" && !m_capVision) continue;
+            if (part.type == "input_audio" && !getCapAudio()) continue;
             QJsonObject p;
             p["type"] = part.type;
             if (part.type == "text") {
@@ -839,6 +840,7 @@ bool ChatBot::writeSessions(const QMap<QString, SessionData>& sessions, const QS
                                 && old->createdAt == session.createdAt && old->updatedAt == session.updatedAt
                                 && old->lastConversationAt == session.lastConversationAt
                                 && old->manualTitle == session.manualTitle
+                                && old->previewTitle == session.previewTitle
                                 && old->completedRounds == session.completedRounds
                                 && old->titleAttemptRound == session.titleAttemptRound
                                 && old->lastCompletedUserId == session.lastCompletedUserId
@@ -853,6 +855,7 @@ bool ChatBot::writeSessions(const QMap<QString, SessionData>& sessions, const QS
                     {"updatedAt",           session.updatedAt.toStdString()          },
                     {"lastConversationAt",  session.lastConversationAt.toStdString() },
                     {"manualTitle",         session.manualTitle                      },
+                    {"previewTitle",        session.previewTitle                     },
                     {"completedRounds",     session.completedRounds                  },
                     {"titleAttemptRound",   session.titleAttemptRound                },
                     {"lastCompletedUserId", session.lastCompletedUserId.toStdString()},
@@ -877,11 +880,33 @@ bool ChatBot::writeSessions(const QMap<QString, SessionData>& sessions, const QS
                 {"file", name.toStdString()}
             });
         }
+        // 本次没能载入的会话文件仍写进索引：索引条目一消失，下一次启动就会把它的文件当孤儿
+        // 删掉，而那些内容只在磁盘上。下一次启动会照常再试一次加载。
+        auto retained = m_retainedSessionFiles.values();
+        std::sort(retained.begin(), retained.end());
+        for (const auto& name : retained) root["sessions"].push_back({{"file", name.toStdString()}});
         if (!writeJson(directory + "/index.json", root.dump())) return false;
-        const auto names = files.values();
-        const QSet<QString> liveFiles(names.constBegin(), names.constEnd());
-        for (const auto& name : QDir(directory).entryList({"*.json"}, QDir::Files)) {
-            if (name != "index.json" && !liveFiles.contains(name)) QFile::remove(directory + "/" + name);
+        // 保守 GC：只删"既不在新索引、也不在已知集合"的文件。本次没能加载的会话（坏 JSON /
+        // 归一化后为空 / id 缺失）的内容只存在于磁盘，删掉它的文件就是永久丢历史，所以它的
+        // 索引条目照旧保留（下一次启动会再试一次），上一次索引里的文件名只要其会话不在本次
+        // 快照里也一律保留。能立刻删的只有两种：被本次新文件取代的旧版本，以及用户显式删掉
+        // 的会话（在上一份已提交快照里、却不在本次快照里）。
+        QSet<QString> keep;
+        for (const auto& name : files.values()) keep.insert(name);
+        keep.unite(m_retainedSessionFiles);
+        for (auto it = m_sessionFiles.constBegin(); it != m_sessionFiles.constEnd(); ++it)
+            if (!sessions.contains(it.key())) keep.insert(it.value());
+        for (auto it = m_persistedSessions.constBegin(); it != m_persistedSessions.constEnd(); ++it)
+            if (!sessions.contains(it.key())) keep.remove(m_sessionFiles.value(it.key()));
+        if (m_sessionGcBlocked) {
+            warn("会话目录里有无法归属的旧文件，跳过本次 GC");
+        } else {
+            int removed = 0;
+            for (const auto& name : QDir(directory).entryList({"*.json"}, QDir::Files)) {
+                if (name == "index.json" || keep.contains(name)) continue;
+                if (QFile::remove(directory + "/" + name)) ++removed;
+            }
+            if (removed > 0) info("会话存储已清理 {} 个不再被引用的文件", removed);
         }
         m_persistedSessions = sessions;
         m_sessionFiles      = files;
@@ -896,12 +921,168 @@ bool ChatBot::writeSessions(const QMap<QString, SessionData>& sessions, const QS
 // 加载 sessions.json
 // -----------------------------------------------------------------------
 
+// 反序列化并归一化一条会话，返回是否改写过内容（需要重新落盘）。
+// 只处理一条会话：坏 JSON、字段类型不符、超长都由调用方捕获，不能影响其它会话。
+bool ChatBot::loadSession(const json& sessionObj, const QString& fileName) {
+    bool        sanitized = false;
+    SessionData session;
+    session.id        = QString::fromStdString(sessionObj.value("id", ""));
+    session.title     = QString::fromStdString(sessionObj.value("title", "未命名对话"));
+    session.createdAt = QString::fromStdString(sessionObj.value("createdAt", ""));
+    session.updatedAt = QString::fromStdString(sessionObj.value("updatedAt", ""));
+    session.lastConversationAt =
+        QString::fromStdString(sessionObj.value("lastConversationAt", session.updatedAt.toStdString()));
+    session.manualTitle =
+        sessionObj.value("manualTitle", session.title != "新对话" && session.title != "未命名对话");
+    // 旧数据没有这个字段：一律 false（旧会话的标题可能正是当时兜出来的预览串，
+    // 那一轮的原生标题早已错过，不需要再回头改写）。
+    session.previewTitle = sessionObj.value("previewTitle", false);
+    session.completedRounds     = std::max(0, sessionObj.value("completedRounds", 0));
+    session.titleAttemptRound   = std::max(0, sessionObj.value("titleAttemptRound", 0));
+    session.lastCompletedUserId = QString::fromStdString(sessionObj.value("lastCompletedUserId", ""));
+    const bool hasCompletedUserIds =
+        sessionObj.contains("completedUserIds") && sessionObj["completedUserIds"].is_array();
+    if (hasCompletedUserIds) {
+        for (const auto& id : sessionObj["completedUserIds"]) {
+            if (!id.is_string()) continue;
+            const auto userId = QString::fromStdString(id.get<std::string>());
+            if (!userId.isEmpty()) session.completedUserIds.insert(userId);
+        }
+    }
+    if (!session.lastCompletedUserId.isEmpty())
+        session.completedUserIds.insert(session.lastCompletedUserId);
+
+    if (sessionObj.contains("messages") && sessionObj["messages"].is_array()) {
+        for (const auto& msgObj : sessionObj["messages"]) {
+            MessageData msg = messageDataFromJson(msgObj);
+            sanitized |= !msgObj.contains("messageId");
+            sanitized |= sanitizeMessageHistory(msg);
+            // A process restart cannot resume pending tool executions.
+            for (auto& value : msg.toolStates) {
+                auto state = value.toMap();
+                const auto status = state.value("state").toString();
+                if (status != "done" && status != "error" && status != "cancelled") {
+                    state["state"] = "cancelled";
+                    state["text"] = "调用已中断";
+                    value = state;
+                    sanitized = true;
+                }
+            }
+            session.messages.append(msg);
+        }
+    }
+
+    const auto oldSize = session.messages.size();
+    session.messages.erase(
+        std::remove_if(
+            session.messages.begin(),
+            session.messages.end(),
+            [](const MessageData& message) {
+                return message.role == "system"
+                    && (message.content.startsWith("用户引用了以下文件作为上下文：")
+                        || message.content.startsWith("用户引用了以下文件作为代码审查/分析的上下文："));
+            }
+        ),
+        session.messages.end()
+    );
+    sanitized |= session.messages.size() != oldSize;
+    // 归一化只保留被 assistant tool_calls 认领的 tool 消息，其余 tool 消息会被丢弃。
+    // 如果它把整条会话清空，这份历史结构已残缺，但内容仍是用户的：留一份原文，清空时退回
+    // （真正发请求前 buildApiMessages 会再归一化一次）。空会话既不进索引也不在列表显示，
+    // 等于从历史里消失。
+    const auto beforeNormalize = session.messages;
+    // 修复历史里损坏的工具调用组
+    int droppedOrphans  = 0;
+    sanitized           |= normalizeHistoryMessages(session.messages, &droppedOrphans);
+    if (session.messages.isEmpty() && !beforeNormalize.isEmpty()) {
+        warn("会话 {} 归一化后为空，已保留原始 {} 条消息", session.id.toStdString(), beforeNormalize.size());
+        session.messages = beforeNormalize;
+    }
+    QSet<QString> messageIds;
+    for (int i = 0; i < session.messages.size(); ++i) {
+        auto& message = session.messages[i];
+        if (message.messageId.isEmpty() || messageIds.contains(message.messageId)) {
+            message.messageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            sanitized = true;
+        }
+        messageIds.insert(message.messageId);
+        if (message.role != "assistant" || message.toolCallsJson.isEmpty() || !message.toolStates.isEmpty()) continue;
+        const auto calls = QJsonDocument::fromJson(message.toolCallsJson.toUtf8()).array();
+        for (int c = 0; c < calls.size(); ++c) {
+            const auto call = calls[c].toObject();
+            const auto id = call["id"].toString();
+            QString result;
+            for (int k = i + 1; k < session.messages.size() && session.messages[k].role == "tool"; ++k)
+                if (session.messages[k].toolCallId == id) result = session.messages[k].content;
+            const bool cancelled = result.contains("取消") || result.contains("中断") || result.contains("拒绝");
+            // Old sessions did not persist success. Keep the uncertainty visible.
+            message.toolStates.append(QVariantMap{
+                {"key", message.messageId + ":tool:" + QString::number(c)},
+                {"batchId", message.messageId}, {"sessionId", session.id}, {"callId", id},
+                {"name", call["function"].toObject()["name"].toString()},
+                {"arguments", call["function"].toObject()["arguments"].toString()},
+                {"state", cancelled ? "cancelled" : "error"},
+                {"text", cancelled ? "历史调用已取消" : "历史调用（状态未记录）"}, {"result", result}});
+            sanitized = true;
+        }
+    }
+    if (droppedOrphans > 0)
+        warn("会话 {} 丢弃了 {} 条找不到宿主的工具结果", session.id.toStdString(), droppedOrphans);
+    if (!hasCompletedUserIds) {
+        // Old stores lack protocol status. Seed visible historical final answers once,
+        // retaining the legacy last ID even when its messages have already been truncated.
+        sanitized = true;
+        QString pendingUser;
+        for (const auto& message : session.messages) {
+            if (message.role == "user") pendingUser = message.messageId;
+            else if (
+                message.role == "assistant" && !pendingUser.isEmpty()
+                && (message.toolCallsJson.isEmpty() || message.toolCallsJson == "[]")
+                && (!message.content.isEmpty() || !message.parts.isEmpty())
+            ) {
+                session.completedUserIds.insert(pendingUser);
+                if (!sessionObj.contains("completedRounds")) {
+                    ++session.completedRounds;
+                    session.lastCompletedUserId = pendingUser;
+                }
+                pendingUser.clear();
+            }
+        }
+        // Historical rounds must not trigger a delayed first-round title after reload.
+        if (!sessionObj.contains("completedRounds"))
+            session.titleAttemptRound = session.completedRounds;
+    }
+    // 空会话不写索引也不在列表显示，但它只是"这次没能重建出消息"，文件必须留在磁盘上：
+    // 记进保留集，GC 才不会把它当孤儿删掉。删除只能由用户显式操作触发。
+    if (session.id.isEmpty() || session.messages.isEmpty()) {
+        warn("会话 {} 没有可用内容，已跳过加载，原文件保留", fileName.isEmpty() ? "<legacy>" : fileName.toStdString());
+        if (!fileName.isEmpty()) m_retainedSessionFiles.insert(fileName);
+        return sanitized;
+    }
+    if (m_sessions.contains(session.id)) {
+        warn("会话 id 重复，保留先读到的一份: {}", session.id.toStdString());
+        if (!fileName.isEmpty()) m_retainedSessionFiles.insert(fileName);
+        return sanitized;
+    }
+    m_observedMessages[session.id] = session.messages;
+    m_sessions.insert(session.id, session);
+    // 回填索引里的文件名：之后保存据此复用未变更会话的文件名，不再整套重写/整套 GC。
+    if (!fileName.isEmpty()) m_sessionFiles.insert(session.id, fileName);
+    return sanitized;
+}
+
 void ChatBot::initSessions() {
     bool          historySanitized = false;
     auto          path             = sessionsFilePath();
     const QString directory        = path + ".d";
     const bool    splitStore       = QFile::exists(directory + "/index.json");
-    QFile         file(splitStore ? directory + "/index.json" : path);
+    // 没有索引却有会话文件：它们可能来自一次在提交索引前崩溃的保存，比旧版单体 sessions.json
+    // 更新。本次进程不清理它们，等新索引提交后由下一次启动回收。
+    if (!splitStore && !QDir(directory).entryList({"*.json"}, QDir::Files).isEmpty()) {
+        m_sessionGcBlocked = true;
+        warn("会话目录 {} 里有无法对应到索引的文件，本次不清理", directory.toStdString());
+    }
+    QFile file(splitStore ? directory + "/index.json" : path);
     if (file.exists() && file.open(QIODevice::ReadOnly)) {
         try {
             json root = json::parse(file.readAll().toStdString());
@@ -909,134 +1090,32 @@ void ChatBot::initSessions() {
 
             if (root.contains("sessions") && root["sessions"].is_array()) {
                 for (const auto& entry : root["sessions"]) {
-                    json sessionObj = entry;
-                    if (splitStore) {
-                        const QString name = QString::fromStdString(entry.at("file").get<std::string>());
-                        if (!QRegularExpression("^[0-9a-f]{64}\\.json$").match(name).hasMatch())
-                            throw std::runtime_error("invalid session file name");
-                        QFile sessionFile(directory + "/" + name);
-                        if (!sessionFile.open(QIODevice::ReadOnly))
-                            throw std::runtime_error("cannot read session file");
-                        sessionObj = json::parse(sessionFile.readAll().toStdString());
+                    // 索引条目本身损坏属存储级故障：抛给外层，暂停保存以保护原始记录。
+                    const QString name =
+                        splitStore ? QString::fromStdString(entry.at("file").get<std::string>()) : QString();
+                    if (splitStore && !QRegularExpression("^[0-9a-f]{64}\\.json$").match(name).hasMatch())
+                        throw std::runtime_error("invalid session file name");
+                    const QString displayName = name.isEmpty() ? QStringLiteral("<legacy>") : name;
+                    // 文件已经不在（被外部工具清理或在别处删掉）：索引条目没有内容可保护，
+                    // 直接丢弃，不要留成永久保留项。
+                    if (splitStore && !QFile::exists(directory + "/" + name)) {
+                        warn("会话文件 {} 不存在，已丢弃索引条目", displayName.toStdString());
+                        continue;
                     }
-                    SessionData session;
-                    session.id        = QString::fromStdString(sessionObj.value("id", ""));
-                    session.title     = QString::fromStdString(sessionObj.value("title", "未命名对话"));
-                    session.createdAt = QString::fromStdString(sessionObj.value("createdAt", ""));
-                    session.updatedAt = QString::fromStdString(sessionObj.value("updatedAt", ""));
-                    session.lastConversationAt =
-                        QString::fromStdString(sessionObj.value("lastConversationAt", session.updatedAt.toStdString()));
-                    session.manualTitle =
-                        sessionObj.value("manualTitle", session.title != "新对话" && session.title != "未命名对话");
-                    session.completedRounds     = std::max(0, sessionObj.value("completedRounds", 0));
-                    session.titleAttemptRound   = std::max(0, sessionObj.value("titleAttemptRound", 0));
-                    session.lastCompletedUserId = QString::fromStdString(sessionObj.value("lastCompletedUserId", ""));
-                    const bool hasCompletedUserIds =
-                        sessionObj.contains("completedUserIds") && sessionObj["completedUserIds"].is_array();
-                    if (hasCompletedUserIds) {
-                        for (const auto& id : sessionObj["completedUserIds"]) {
-                            if (!id.is_string()) continue;
-                            const auto userId = QString::fromStdString(id.get<std::string>());
-                            if (!userId.isEmpty()) session.completedUserIds.insert(userId);
+                    // 单条会话坏掉（坏 JSON、字段类型不符、超长）只跳过它自己：其它会话照常加载，
+                    // 它的文件进保留集，后续 GC 不会删除。
+                    try {
+                        json sessionObj = entry;
+                        if (splitStore) {
+                            QFile sessionFile(directory + "/" + name);
+                            if (!sessionFile.open(QIODevice::ReadOnly))
+                                throw std::runtime_error("cannot read session file");
+                            sessionObj = json::parse(sessionFile.readAll().toStdString());
                         }
-                    }
-                    if (!session.lastCompletedUserId.isEmpty())
-                        session.completedUserIds.insert(session.lastCompletedUserId);
-
-                    if (sessionObj.contains("messages") && sessionObj["messages"].is_array()) {
-                        for (const auto& msgObj : sessionObj["messages"]) {
-                            MessageData msg = messageDataFromJson(msgObj);
-                            historySanitized |= !msgObj.contains("messageId");
-                            historySanitized |= sanitizeMessageHistory(msg);
-                            // A process restart cannot resume pending tool executions.
-                            for (auto& value : msg.toolStates) {
-                                auto state = value.toMap();
-                                const auto status = state.value("state").toString();
-                                if (status != "done" && status != "error" && status != "cancelled") {
-                                    state["state"] = "cancelled";
-                                    state["text"] = "调用已中断";
-                                    value = state;
-                                    historySanitized = true;
-                                }
-                            }
-                            session.messages.append(msg);
-                        }
-                    }
-
-                    const auto oldSize = session.messages.size();
-                    session.messages.erase(
-                        std::remove_if(
-                            session.messages.begin(),
-                            session.messages.end(),
-                            [](const MessageData& message) {
-                                return message.role == "system"
-                                    && (message.content.startsWith("用户引用了以下文件作为上下文：")
-                                        || message.content.startsWith("用户引用了以下文件作为代码审查/分析的上下文："));
-                            }
-                        ),
-                        session.messages.end()
-                    );
-                    historySanitized |= session.messages.size() != oldSize;
-                    // 修复历史里损坏的工具调用组
-                    int droppedOrphans  = 0;
-                    historySanitized   |= normalizeHistoryMessages(session.messages, &droppedOrphans);
-                    QSet<QString> messageIds;
-                    for (int i = 0; i < session.messages.size(); ++i) {
-                        auto& message = session.messages[i];
-                        if (message.messageId.isEmpty() || messageIds.contains(message.messageId)) {
-                            message.messageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
-                            historySanitized = true;
-                        }
-                        messageIds.insert(message.messageId);
-                        if (message.role != "assistant" || message.toolCallsJson.isEmpty() || !message.toolStates.isEmpty()) continue;
-                        const auto calls = QJsonDocument::fromJson(message.toolCallsJson.toUtf8()).array();
-                        for (int c = 0; c < calls.size(); ++c) {
-                            const auto call = calls[c].toObject();
-                            const auto id = call["id"].toString();
-                            QString result;
-                            for (int k = i + 1; k < session.messages.size() && session.messages[k].role == "tool"; ++k)
-                                if (session.messages[k].toolCallId == id) result = session.messages[k].content;
-                            const bool cancelled = result.contains("取消") || result.contains("中断") || result.contains("拒绝");
-                            // Old sessions did not persist success. Keep the uncertainty visible.
-                            message.toolStates.append(QVariantMap{
-                                {"key", message.messageId + ":tool:" + QString::number(c)},
-                                {"batchId", message.messageId}, {"sessionId", session.id}, {"callId", id},
-                                {"name", call["function"].toObject()["name"].toString()},
-                                {"arguments", call["function"].toObject()["arguments"].toString()},
-                                {"state", cancelled ? "cancelled" : "error"},
-                                {"text", cancelled ? "历史调用已取消" : "历史调用（状态未记录）"}, {"result", result}});
-                            historySanitized = true;
-                        }
-                    }
-                    if (droppedOrphans > 0)
-                        warn("会话 {} 丢弃了 {} 条找不到宿主的工具结果", session.id.toStdString(), droppedOrphans);
-                    if (!hasCompletedUserIds) {
-                        // Old stores lack protocol status. Seed visible historical final answers once,
-                        // retaining the legacy last ID even when its messages have already been truncated.
-                        historySanitized = true;
-                        QString pendingUser;
-                        for (const auto& message : session.messages) {
-                            if (message.role == "user") pendingUser = message.messageId;
-                            else if (
-                                message.role == "assistant" && !pendingUser.isEmpty()
-                                && (message.toolCallsJson.isEmpty() || message.toolCallsJson == "[]")
-                                && (!message.content.isEmpty() || !message.parts.isEmpty())
-                            ) {
-                                session.completedUserIds.insert(pendingUser);
-                                if (!sessionObj.contains("completedRounds")) {
-                                    ++session.completedRounds;
-                                    session.lastCompletedUserId = pendingUser;
-                                }
-                                pendingUser.clear();
-                            }
-                        }
-                        // Historical rounds must not trigger a delayed first-round title after reload.
-                        if (!sessionObj.contains("completedRounds"))
-                            session.titleAttemptRound = session.completedRounds;
-                    }
-                    if (!session.id.isEmpty() && !session.messages.isEmpty()) {
-                        m_observedMessages[session.id] = session.messages;
-                        m_sessions.insert(session.id, session);
+                        historySanitized |= loadSession(sessionObj, name);
+                    } catch (const std::exception& e) {
+                        warn("会话文件 {} 加载失败，已跳过，原文件保留: {}", displayName.toStdString(), e.what());
+                        if (splitStore) m_retainedSessionFiles.insert(name);
                     }
                 }
             }
@@ -1047,6 +1126,8 @@ void ChatBot::initSessions() {
             }
 
             info("已加载 {} 个会话", m_sessions.size());
+            if (!m_retainedSessionFiles.isEmpty())
+                warn("有 {} 个会话文件没能完整加载，原文件已保留", m_retainedSessionFiles.size());
         } catch (const std::exception& e) {
             // Never replace a damaged split store with the subset loaded before the error.
             m_sessionStoreReadFailed = splitStore;
@@ -1087,7 +1168,7 @@ bool isPdfName(const QString& name) {
 bool isPdfPart(const MessagePart& part) { return part.type == "file" && part.mimeType == "application/pdf"; }
 
 bool isOfficialHttps(const QUrl& endpoint, const QString& host) {
-    return endpoint.scheme() == "https" && endpoint.host() == host && endpoint.port(443) == 443;
+    return endpoint.isValid() && endpoint.scheme() == "https" && endpoint.host() == host && endpoint.port(443) == 443;
 }
 
 QString pdfFileError(const QFileInfo& info, QFile& file) {
@@ -1116,17 +1197,24 @@ bool hasPdf(const QVector<MessagePart>& parts) {
     return std::any_of(parts.cbegin(), parts.cend(), isPdfPart);
 }
 
-// 允许作为文本附件引用的扩展名（与 ChatAssistant.qml 的 isTextFile 保持一致）。
-// 其它二进制附件明确拒绝，避免把二进制塞进文本上下文。
-bool isTextAttachmentName(const QString& name) {
+// 文本附件扩展名白名单。QML 通过 C++ 接口取用；文件内容仍须在发送前验证。
+const QStringList& textAttachmentExtensionsList() {
     static const QStringList kExtensions = {"txt", "md",  "markdown", "json", "py",   "js",   "ts",
                                             "qml", "cpp", "h",        "c",    "java", "html", "htm",
                                             "css", "xml", "yaml",     "yml",  "ini",  "log",  "csv"};
-    const QString            suffix      = QFileInfo(name).suffix().toLower();
-    return !suffix.isEmpty() && kExtensions.contains(suffix);
+    return kExtensions;
 }
 
-QString buildFileContext(const QVector<MessagePart>& parts, QStringList* failedFiles = nullptr) {
+bool isTextAttachmentName(const QString& name) {
+    const QString suffix = QFileInfo(name).suffix().toLower();
+    return !suffix.isEmpty() && textAttachmentExtensionsList().contains(suffix);
+}
+
+QString buildFileContext(
+    const QVector<MessagePart>& parts,
+    QStringList&                failedFiles,
+    QStringList&                binaryFiles
+) {
     QString context;
     qint64  totalBytes = 0;
     QTextCodec* utf8 = QTextCodec::codecForName("UTF-8");
@@ -1136,25 +1224,25 @@ QString buildFileContext(const QVector<MessagePart>& parts, QStringList* failedF
         const QFileInfo info(part.localPath);
         if (!info.isAbsolute() || !info.isFile() || !info.isReadable() || info.size() > MAX_FILE_CONTEXT_BYTES
             || totalBytes + info.size() > MAX_FILE_CONTEXT_BYTES) {
-            if (failedFiles) failedFiles->append(part.name.isEmpty() ? info.fileName() : part.name);
+            failedFiles.append(part.name.isEmpty() ? info.fileName() : part.name);
             continue;
         }
 
         QFile file(info.absoluteFilePath());
         if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            if (failedFiles) failedFiles->append(part.name.isEmpty() ? info.fileName() : part.name);
+            failedFiles.append(part.name.isEmpty() ? info.fileName() : part.name);
             continue;
         }
         const QByteArray data = file.read(MAX_FILE_CONTEXT_BYTES + 1);
-        if (data.size() > MAX_FILE_CONTEXT_BYTES || totalBytes + data.size() > MAX_FILE_CONTEXT_BYTES
-            || data.left(1024).contains("%PDF-")) {
-            if (failedFiles) failedFiles->append(part.name.isEmpty() ? info.fileName() : part.name);
+        if (file.error() != QFile::NoError || data.size() > MAX_FILE_CONTEXT_BYTES
+            || totalBytes + data.size() > MAX_FILE_CONTEXT_BYTES) {
+            failedFiles.append(part.name.isEmpty() ? info.fileName() : part.name);
             continue;
         }
         QTextCodec::ConverterState state;
         const QString text = utf8->toUnicode(data.constData(), data.size(), &state);
-        if (data.contains('\0') || state.invalidChars || state.remainingChars) {
-            if (failedFiles) failedFiles->append(part.name.isEmpty() ? info.fileName() : part.name);
+        if (data.contains('\0') || data.left(1024).contains("%PDF-") || state.invalidChars || state.remainingChars) {
+            binaryFiles.append(part.name.isEmpty() ? info.fileName() : part.name);
             continue;
         }
         totalBytes += data.size();
@@ -1171,73 +1259,30 @@ QString buildFileContext(const QVector<MessagePart>& parts, QStringList* failedF
 // -----------------------------------------------------------------------
 
 void ChatBot::sendMessage(const QString& message, const QString& fileRefs) {
-    QVector<MessagePart> extraParts;
-    QString              requestFileContext;
-
-    // 文件引用转文本 part（保持原有行为）
+    // 旧文件引用格式也走同一套附件校验和发送流程。
     if (!fileRefs.isEmpty()) {
         QJsonDocument doc = QJsonDocument::fromJson(fileRefs.toUtf8());
         if (doc.isArray() && !doc.array().isEmpty()) {
             QJsonArray attachmentParts;
-            bool includesPdf = false;
             for (const auto& fileVal : doc.array()) {
                 auto file = fileVal.toObject();
-                const QString path = file.take("path").toString();
-                if (isPdfName(path) || isPdfName(file["name"].toString()) || file["mimeType"].toString() == "application/pdf")
-                    includesPdf = true;
+                const auto path = file.take("path");
                 file["type"] = "file";
                 file["localPath"] = path;
                 attachmentParts.append(file);
             }
-            if (includesPdf) {
-                const auto media = QJsonDocument(attachmentParts).toJson(QJsonDocument::Compact);
-                sendMessageWithMedia(message, QString::fromUtf8(media));
-                return;
-            }
-            for (const auto& fileVal : doc.array()) {
-                QJsonObject file = fileVal.toObject();
-                QString     path = file["path"].toString();
-                QString     lang = file["language"].toString();
-
-                MessagePart part;
-                part.type      = "file";
-                part.localPath = path;
-                part.name      = file["name"].toString(QFileInfo(path).fileName());
-                part.mimeType  = "text/plain";
-                part.language  = lang;
-                part.size      = QFileInfo(path).size();
-                extraParts.append(part);
-            }
-            QStringList failedFiles;
-            requestFileContext = buildFileContext(extraParts, &failedFiles);
-            if (!failedFiles.isEmpty()) {
-                warn("附件未发送给模型: {}", failedFiles.join("、").toStdString());
-                showToast(QString("%1 个附件未发送，请检查权限或大小").arg(failedFiles.size()).toStdString());
-            }
-            debug("已附加 {} 个文件，{} 个读取失败", doc.array().size(), failedFiles.size());
+            const auto media = QJsonDocument(attachmentParts).toJson(QJsonDocument::Compact);
+            sendMessageWithMedia(message, QString::fromUtf8(media));
+            return;
         }
     }
 
-    QVector<MessageData> requestHistory = currentMessages();
-    if (!requestFileContext.isEmpty()) {
-        MessageData contextMessage;
-        contextMessage.role    = "system";
-        contextMessage.content = requestFileContext;
-        requestHistory.append(contextMessage);
-    }
-    QJsonArray apiMessages = buildApiMessages(requestHistory, message);
+    const QJsonArray apiMessages = buildApiMessages(currentMessages(), message);
 
     // 记录用户消息
     MessageData userMsg;
     userMsg.role    = "user";
     userMsg.content = message;
-    userMsg.parts   = extraParts;
-    if (!message.isEmpty() && !extraParts.isEmpty()) {
-        MessagePart textPart;
-        textPart.type = "text";
-        textPart.text = message;
-        userMsg.parts.prepend(textPart);
-    }
     currentMessages().append(userMsg);
     if (currentMessages().size() > MAX_HISTORY_SIZE) currentMessages().removeFirst();
 
@@ -1255,9 +1300,17 @@ void ChatBot::sendMessage(const QString& message, const QString& fileRefs) {
 int ChatBot::maxImageBytes() const { return static_cast<int>(AttachmentManager::kMaxImageBytes); }
 int ChatBot::maxMediaJsonBytes() const { return static_cast<int>(AttachmentManager::kMaxMediaJsonBytes); }
 
+// 引用文件的扩展名策略：白名单唯一来源在 C++（见 textAttachmentExtensionsList）。
+QStringList ChatBot::textAttachmentExtensions() const { return textAttachmentExtensionsList(); }
+
+bool ChatBot::attachmentExtensionAllowed(const QString& fileName) const {
+    if (isPdfName(fileName)) return getCapPdf();
+    return getFileParsingActive() || isTextAttachmentName(fileName);
+}
+
 // 把 QML 传来的 mediaParts JSON 解析成有序 MessagePart 列表：
 //   - image_url: 支持 data URL / http(s) URL / 仅 localPath（不要求在 QML 里读文件转 base64）；
-//   - file: 文本附件，或由当前模型解析的 PDF 附件；
+//   - file: PDF 按模型能力和文件头检查，其它文件按扩展名预检并在构建文本上下文时检查内容；
 //   - input_audio: base64 data + format；
 // 校验单图 9 MiB、总媒体 12 MiB；按 canonical localPath 去重；保持原顺序。
 QVector<MessagePart>
@@ -1381,9 +1434,12 @@ ChatBot::parseAttachmentParts(const QString& mediaParts, QString* error, bool* h
                     if (error) *error = pdfError;
                     return {};
                 }
-            } else if (!isTextAttachmentName(part.name)) {
-                unsupportedNames.append(part.name);
-                continue;
+            } else {
+                if (!attachmentExtensionAllowed(info.fileName())) {
+                    unsupportedNames.append(part.name);
+                    continue;
+                }
+                part.mimeType = QStringLiteral("text/plain");
             }
             const QString canonical =
                 info.canonicalFilePath().isEmpty() ? info.absoluteFilePath() : info.canonicalFilePath();
@@ -1444,6 +1500,10 @@ void ChatBot::pruneSessionAttachments(const QString& sessionId) {
 }
 
 void ChatBot::warmAttachmentCache(const SessionData& session) {
+    // 构造函数在 BeforeMain 里跑，此时还没有 QCoreApplication：QThreadPool::globalInstance()
+    // 依赖 application 实例，提前 start() 会直接空指针崩溃（实测 0x00000010 段错误，
+    // 且发生在启动期，会被启动器判为试用失败并回滚）。预热只是优化，跳过即可。
+    if (QCoreApplication::instance() == nullptr) return;
     QVector<MessagePart> imageParts;
     for (const auto& msg : session.messages) {
         for (const auto& part : msg.parts) {
@@ -1472,7 +1532,7 @@ void ChatBot::sendMessageWithMedia(const QString& message, const QString& mediaP
 
     // 音频能力/协议兜底：不支持音频的模型、或 Responses API（该协议不支持 input_audio）丢弃音频并提示。
     int droppedAudio = 0;
-    if (!m_capAudio || usesResponsesApi()) {
+    if (!getCapAudio() || usesResponsesApi()) {
         for (int i = parts.size() - 1; i >= 0; --i) {
             if (parts[i].type == "input_audio") {
                 parts.remove(i);
@@ -1484,7 +1544,10 @@ void ChatBot::sendMessageWithMedia(const QString& message, const QString& mediaP
     }
 
     QStringList   failedFiles;
-    const QString fileContext = buildFileContext(parts, &failedFiles);
+    QStringList   binaryFiles;
+    const QString fileContext = buildFileContext(parts, failedFiles, binaryFiles);
+    if (!binaryFiles.isEmpty())
+        showToast(QString("%1 个附件不是有效的 UTF-8 文本，未发送").arg(binaryFiles.size()).toStdString());
     if (!fileContext.isEmpty()) {
         MessagePart contextPart;
         contextPart.type = "text";
@@ -1537,7 +1600,11 @@ void ChatBot::finishMediaMessage(
         warn("多模态消息已失效，会话已切换或请求已取消");
         return;
     }
-    if (effectiveMessage.trimmed().isEmpty() && parts.isEmpty()) {
+    const bool hasSendablePart = std::any_of(parts.cbegin(), parts.cend(), [](const MessagePart& part) {
+        // Non-PDF file parts are local references. Their sendable text is a separate part.
+        return part.type != "file" || isPdfPart(part);
+    });
+    if (effectiveMessage.trimmed().isEmpty() && !hasSendablePart) {
         emit errorOccurred("没有可发送的文字或媒体内容");
         return;
     }
@@ -1850,7 +1917,7 @@ void ChatBot::persistPartialResponse() {
     if (m_currentStreamBuffer.isEmpty() && m_currentReasoningBuffer.isEmpty() && m_responseToolStates.isEmpty()) return;
     MessageData message;
     message.role = "assistant";
-    message.content = m_currentStreamBuffer;
+    message.content = sanitizeAnswerText(m_currentStreamBuffer);
     message.reasoning = m_currentReasoningBuffer;
     attachResponseMetadata(message);
     currentMessages().append(message);
@@ -2227,6 +2294,229 @@ QString responseOutputToolCalls(const QJsonArray& output) {
         );
     }
     return QString::fromUtf8(QJsonDocument(toolCalls).toJson(QJsonDocument::Compact));
+}
+
+// -----------------------------------------------------------------------
+// DeepSeek 官方 API 适配的纯函数
+// -----------------------------------------------------------------------
+
+struct TextSpan {
+    int start = 0;
+    int end   = 0;
+};
+
+// 收集不应改动的位置区间：围栏代码块（``` / ~~~）、行内代码（`…`）、LaTeX（$$…$$、$…$、\(…\)、\[…\]）。
+QVector<TextSpan> protectedMarkupSpans(const QString& text) {
+    QVector<TextSpan> spans;
+    const int         size      = text.size();
+    int               i         = 0;
+    bool              lineStart = true; // 只允许空白出现在行首之前，围栏行才认
+
+    while (i < size) {
+        const QChar c = text.at(i);
+
+        if (lineStart && (c == '`' || c == '~')) {
+            int j = i;
+            while (j < size && text.at(j) == c) ++j;
+            if (j - i >= 3) {
+                const QChar fence  = c;
+                const int   length = j - i;
+                int         cursor = j;
+                int         close  = size;
+                bool        closed = false;
+                while (cursor < size) {
+                    int lineEnd = text.indexOf('\n', cursor);
+                    if (lineEnd < 0) lineEnd = size;
+                    int k = cursor;
+                    while (k < lineEnd && (text.at(k) == ' ' || text.at(k) == '\t')) ++k;
+                    int e = k;
+                    while (e < lineEnd && text.at(e) == fence) ++e;
+                    if (e - k >= length) {
+                        close  = lineEnd;
+                        closed = true;
+                        break;
+                    }
+                    cursor = lineEnd + 1;
+                }
+                // 未闭合的围栏按“保护到结尾”处理：宁可少剥，也不能删掉代码里的方括号
+                spans.append(TextSpan{i, close});
+                i         = close;
+                lineStart = false;
+                continue;
+            }
+        }
+
+        if (c == '`') {
+            const int pos = text.indexOf('`', i + 1);
+            const int end = pos < 0 ? size : pos + 1;
+            spans.append(TextSpan{i, end});
+            i         = end;
+            lineStart = false;
+            continue;
+        }
+
+        if (c == '$') {
+            if (i + 1 < size && text.at(i + 1) == '$') {
+                const int pos = text.indexOf(QStringLiteral("$$"), i + 2);
+                const int end = pos < 0 ? size : pos + 2;
+                spans.append(TextSpan{i, end});
+                i         = end;
+                lineStart = false;
+                continue;
+            }
+            const int pos = text.indexOf('$', i + 1);
+            // 单个 $ 只在内容含反斜杠时才当公式，避免把“$5 到 $10”这种金额整段保护起来
+            if (pos > i + 1 && text.mid(i + 1, pos - i - 1).contains('\\')) {
+                spans.append(TextSpan{i, pos + 1});
+                i         = pos + 1;
+                lineStart = false;
+                continue;
+            }
+        }
+
+        if (c == '\\' && i + 1 < size) {
+            const QChar next = text.at(i + 1);
+            if (next == '[' || next == '(') {
+                const QString terminator = next == '[' ? QStringLiteral("\\]") : QStringLiteral("\\)");
+                const int     pos        = text.indexOf(terminator, i + 2);
+                const int     end        = pos < 0 ? size : pos + 2;
+                spans.append(TextSpan{i, end});
+                i         = end;
+                lineStart = false;
+                continue;
+            }
+        }
+
+        if (c == '\n')
+            lineStart = true;
+        else if (lineStart && c != ' ' && c != '\t')
+            lineStart = false;
+        ++i;
+    }
+    return spans;
+}
+
+// 内联引用角标：官方 API 的引用是结构化字段（ChatCompletions message.annotations[].url_citation、
+// Responses output_text.annotations），正文里没有角标；[citation:N] 只是官方 demo 客户端的渲染约定。
+// 但中转/第三方兼容端点会把 [citation:1]、[1]、【1】 直接写进正文，气泡里就成了无意义编号，
+// 所以落库/渲染前统一剥掉（保留正文，不动结构化 annotations —— 那部分本来就被丢弃）。
+//
+// 保守规则（宁可漏剥，也不能误删内容）：只剥“紧跟标点/空白/行首”的纯数字编号，
+// 因此 foo[1]（下标）、[1,2]（数组或公式）、[1]: url（引用式链接定义）都不会被删；
+// 代码块/行内代码/公式内部完全不处理（见 protectedMarkupSpans）。
+QString stripInlineCitationMarkers(const QString& text) {
+    if (text.isEmpty()) return text;
+
+    static const QRegularExpression marker(QStringLiteral(
+        R"((^|[\s,.;:!?，。、；：！？)】"'])[ \t]*(?:\[\s*(?:citation\s*[:：]\s*)?\d{1,3}\s*\]|【\s*\d{1,3}\s*】)(?![ \t]*[:：]))"
+    ));
+    if (!marker.isValid()) return text;
+
+    const QVector<TextSpan> spans = protectedMarkupSpans(text);
+    const auto isProtected = [&spans](int position) {
+        for (const auto& span : spans)
+            if (position >= span.start && position < span.end) return true;
+        return false;
+    };
+
+    QString out;
+    out.reserve(text.size());
+    int             copied = 0;
+    QRegularExpressionMatchIterator it = marker.globalMatch(text);
+    while (it.hasNext()) {
+        const QRegularExpressionMatch match       = it.next();
+        const int                     matchStart  = match.capturedStart(0);
+        const int                     markerStart = match.capturedEnd(1); // 组 1 = 前置标点或行首
+        if (matchStart < copied) continue;
+        // 角标本体或它前面的标点落在受保护区里就不动
+        if (isProtected(markerStart) || isProtected(match.capturedEnd(0) - 1)) continue;
+        out += text.mid(copied, matchStart - copied);
+        // 前置分隔符是同一行内的空白时跟角标一起删掉，否则会留下 “fact .” 或双空格；
+        // 含换行的空白保留，避免把两行粘在一起。
+        const QString lead = match.captured(1);
+        const bool    dropLeadWhitespace =
+            !lead.isEmpty() && lead.trimmed().isEmpty() && !lead.contains('\n') && !lead.contains('\r');
+        if (!dropLeadWhitespace) out += lead;
+        copied = match.capturedEnd(0);
+    }
+    if (copied == 0) return text;
+    out += text.mid(copied);
+    return out;
+}
+
+// HTTP 错误体里可展示的信息：DeepSeek 与 OpenAI 兼容格式都是 {"error":{"message":...}}，
+// 也兼容 {"error":"..."}、{"message":"..."}、{"detail":"..."}；都取不到才退回原文。
+// 单行化并截断到 200 字：绝不把整段响应体直接弹给用户。
+QString extractHttpErrorMessage(const QByteArray& body) {
+    if (body.isEmpty()) return QString();
+    QString message;
+    const QJsonDocument doc = QJsonDocument::fromJson(body);
+    if (doc.isObject()) {
+        const QJsonObject object = doc.object();
+        const QJsonValue  error  = object.value("error");
+        if (error.isObject()) message = error.toObject().value("message").toString();
+        else if (error.isString()) message = error.toString();
+        if (message.isEmpty()) message = object.value("message").toString();
+        if (message.isEmpty()) message = object.value("detail").toString();
+    }
+    if (message.isEmpty()) message = QString::fromUtf8(body);
+    message = message.simplified();
+    if (message.isEmpty()) return QString();
+    if (message.size() > 200) message = message.left(200) + QStringLiteral("…");
+    return message;
+}
+
+// 会话标题在响应里的位置（官方指南的表格）：
+//   ChatCompletions 非流式 choices[0].message.title；流式最后一个 chunk 的 choices[0].delta.title
+//   Responses       非流式顶层 title；流式结束事件（response.completed）里的 response.title
+//   Messages        非流式顶层 title；流式 message_delta 的 delta.title
+QString extractSessionTitle(const QJsonObject& object) {
+    const auto nonEmpty = [](const QJsonValue& value) {
+        return value.isString() ? value.toString().trimmed() : QString();
+    };
+    const QJsonArray choices = object.value("choices").toArray();
+    if (!choices.isEmpty()) {
+        const QJsonObject choice     = choices.first().toObject();
+        const QString     fromDelta  = nonEmpty(choice.value("delta").toObject().value("title"));
+        if (!fromDelta.isEmpty()) return fromDelta;
+        const QString fromMessage = nonEmpty(choice.value("message").toObject().value("title"));
+        if (!fromMessage.isEmpty()) return fromMessage;
+    }
+    const QString direct = nonEmpty(object.value("title"));
+    if (!direct.isEmpty()) return direct;
+    const QString fromEventDelta = nonEmpty(object.value("delta").toObject().value("title"));
+    if (!fromEventDelta.isEmpty()) return fromEventDelta;
+    return nonEmpty(object.value("response").toObject().value("title"));
+}
+
+// 用户元信息标记（latest_reminder）：`<date>,<weekday>,<location>,<platform>,<language>`。
+//
+// 官方文档（https://api-docs.deepseek.com/guides/latest_reminder）逐字规定：
+//   • `date`     = `YYYY-MM-DD`
+//   • `weekday`  = 该日期对应的星期，**用 language 指定的语言书写**（`Monday` / `星期一`）
+//   • `location` = 可选、可为空、可含逗号；设备没有定位能力，所以这里永远是空字段（仍然占位）
+//   • `platform` = **只能是 `App` 或 `Web`**
+//   • `language` = 官方枚举里的一项，且要写成该语言自己的写法（中文是 `中文`，不是 `zh`/`Chinese`）
+// 格式里任何一处不符都返回 `400` 并点名出错字段，所以这里不发可变内容：固定中文 + App，
+// 形如 `2026-11-22,星期六,,App,中文`。
+//
+// 日期取**本地日期**（设备时区）。设备通常没有把时区配成 Asia/Shanghai，甚至停在 UTC，
+// 所以日志里额外带上 UTC 偏移，真机核对时一眼就能看出日期偏没偏。
+QString buildLatestReminderContent() {
+    static const char* const zhWeekdays[] = {"星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"};
+
+    const QDateTime now   = QDateTime::currentDateTime();
+    int             index = now.date().dayOfWeek() - 1;
+    if (index < 0 || index > 6) index = 0;
+
+    return now.date().toString(QStringLiteral("yyyy-MM-dd")) + QStringLiteral(",")
+         + QString::fromUtf8(zhWeekdays[index]) + QStringLiteral(",,App,中文");
+}
+
+// 新建会话的占位标题不算“已有标题”：原生标题/本地自动标题都可以覆盖它。
+// 与旧版会话加载时 manualTitle 的判定（"新对话"/"未命名对话"）保持一致。
+bool isPlaceholderSessionTitle(const QString& title) {
+    return title.isEmpty() || title.startsWith(QStringLiteral("新对话")) || title == QStringLiteral("未命名对话");
 }
 
 } // namespace
@@ -2724,8 +3014,7 @@ ChatBot::PdfTransport ChatBot::pdfTransport() const {
         const QString route = usesResponsesApi() ? QStringLiteral("/responses") : QStringLiteral("/chat/completions");
         const QString path = endpoint.path();
         const bool supportedPath = path == route || path == "/v1" + route;
-        return isOfficialHttps(endpoint, QStringLiteral("api.deepseek.com")) && supportedPath
-                && m_deepseekAdapter && m_capFileParsing && m_model == "deepseek-flash"
+        return getFileParsingActive() && supportedPath && m_model == "deepseek-flash"
             ? PdfTransport::DeepSeek : PdfTransport::Unsupported;
     }
     if (!endpoint.isValid() || endpoint.scheme() != "https" || endpoint.host().isEmpty())
@@ -2938,6 +3227,58 @@ void ChatBot::postApiRequest(const QJsonArray& messages, int seq, bool hasPdf) {
     QJsonArray safeMessages = messages;
     normalizeToolMessageSequence(safeMessages);
 
+    // 适配判据只算一次：所有 DeepSeek 专有字段都受它保护（开关 + 官方域名双门槛）
+    const bool deepseekAdapter = deepseekAdapterActive();
+
+    // 元信息标记（设置页「元信息标记」开关，caps.metaMarker）。
+    //
+    // 官方只认 `{"role":"latest_reminder","content":"<date>,<weekday>,<loc>,<platform>,<lang>"}`，
+    // 且**只在 Messages API / Chat Completions API 生效**；Responses API 明确不支持。做法：
+    //   • 官方 Chat Completions：在**最后一条 user 消息之前**插入这条消息。官方要求它必须
+    //     "directly followed by a user message"，也不能夹在 tool_use 与 tool_result 之间，
+    //     所以插入点是"最后一条 user 消息的下标"，其后紧邻的就是那条 user 消息本身。
+    //   • Responses（以及非官方端点）：**不注入**。既不发官方 role（会被 400），也不用一条
+    //     system 消息假装有效 —— 设置页在该开关下方直接写明"当前接口类型不支持元信息标记"，
+    //     宁可明确告知不支持，也不要静默无效。
+    // 开关关着时这条分支整个不执行（每一轮请求都会经过这里，不关就不打日志，避免噪音）。
+    const bool metaMarkerRouteOk = deepseekAdapter && !usesResponsesApi();
+    if (m_capMetaMarker && !metaMarkerRouteOk) {
+        info(
+            "[MetaMarker] 未注入：protocol={} deepseekAdapter={}（官方 latest_reminder 仅支持 "
+            "Messages / Chat Completions，且需要 DeepSeek 官方端点）",
+            usesResponsesApi() ? "responses" : "chat_completions",
+            deepseekAdapter
+        );
+    } else if (m_capMetaMarker) {
+        int insertAt = -1;
+        for (int i = safeMessages.size() - 1; i >= 0; --i) {
+            if (safeMessages.at(i).toObject().value("role").toString() == QStringLiteral("user")) {
+                insertAt = i;
+                break;
+            }
+        }
+        if (insertAt < 0) {
+            warn("[MetaMarker] 未注入：本轮没有 user 消息，无处插入 latest_reminder");
+        } else {
+            const QString reminder    = buildLatestReminderContent();
+            const int     totalBefore = safeMessages.size();
+            safeMessages.insert(
+                insertAt,
+                QJsonObject{{"role", QStringLiteral("latest_reminder")}, {"content", reminder}}
+            );
+            // 用 info 而不是 debug：release 构建默认只打 info，这样设备日志里 grep "[MetaMarker]"
+            // 就能直接核对 content、插入位置，以及"紧随其后的是不是 user"（官方硬要求）。
+            info(
+                "[MetaMarker] 已注入 content=\"{}\" 位置=index {}/{}，紧随其后 role={}（UTC 偏移 {} 秒）",
+                reminder.toStdString(),
+                insertAt,
+                totalBefore,
+                safeMessages.at(insertAt + 1).toObject().value("role").toString().toStdString(),
+                QDateTime::currentDateTime().offsetFromUtc()
+            );
+        }
+    }
+
     QJsonObject requestBody;
     requestBody["model"] = m_model;
     requestBody[usesResponsesApi() ? "input" : "messages"] =
@@ -2961,6 +3302,13 @@ void ChatBot::postApiRequest(const QJsonArray& messages, int seq, bool hasPdf) {
         }
     }
 
+    // 会话标题由 DeepSeek 随对话响应返回，模型的 sessionTitle 能力独立控制。
+    const bool requestNativeTitle = nativeTitleRequestWanted();
+    if (requestNativeTitle) {
+        requestBody["title"] = QJsonObject{{"enabled", true}};
+        m_nativeTitleRequested.insert(m_currentSessionId);
+    }
+
     // 合并 extraParams（模型自定义参数，可覆盖默认字段）
     if (!m_extraParams.empty()) {
         QJsonDocument epDoc = QJsonDocument::fromJson(QByteArray::fromStdString(m_extraParams.dump()));
@@ -2968,14 +3316,19 @@ void ChatBot::postApiRequest(const QJsonArray& messages, int seq, bool hasPdf) {
             const auto epObj = epDoc.object();
             for (auto it = epObj.constBegin(); it != epObj.constEnd(); ++it) {
                 if (hasPdf && (it.key() == "model" || it.key() == "messages" || it.key() == "input")) continue;
+                if (requestNativeTitle && it.key() == "title") continue;
                 requestBody[it.key()] = it.value();
             }
         }
     }
 
-    // 注入本地函数工具和 Responses API 图片生成工具。
+    // 注入本地函数工具和服务端工具。
+    // DeepSeek 适配下服务端联网由 deepseek_web_search/deepseek_read_url 承担，
+    // 官方明确不允许它们与 web_search / image_generation 同时声明，所以这几种组合互斥。
     if (searchToolAvailable() || (m_capToolCall && m_shellToolEnabled)
-        || (getNativeSearchActive() && m_nativeSearchEnabled) || (usesResponsesApi() && m_capImageGeneration)) {
+        || (!deepseekAdapter && getNativeSearchActive() && m_nativeSearchEnabled)
+        || (!deepseekAdapter && usesResponsesApi() && m_capImageGeneration)
+        || (deepseekAdapter && (m_capNativeWebTools || m_capReadUrl))) {
         injectToolDefinitions(requestBody);
     }
 
@@ -2994,10 +3347,11 @@ void ChatBot::postApiRequest(const QJsonArray& messages, int seq, bool hasPdf) {
     request.setRawHeader("Authorization", QString("Bearer %1").arg(m_apiKey).toUtf8());
     request.setRawHeader("Content-Type", "application/json");
     request.setRawHeader("User-Agent", "PenMods ChatBot/1.0");
-    if (hasPdf)
+    if (hasPdf || deepseekAdapter)
         request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::SameOriginRedirectPolicy);
 
     QNetworkReply* reply = m_networkManager->post(request, requestData);
+    reply->setProperty("penmodsNativeTitleRequested", requestNativeTitle);
     m_activeReplies.append(reply);
 
     // 流式与非流式都要发 streamStart：QML 用它复位 streamThrottle（endProcessed 等），
@@ -3068,7 +3422,7 @@ void ChatBot::postApiRequest(const QJsonArray& messages, int seq, bool hasPdf) {
                             QString     toolCallsJson = QString::fromStdString(tcArr.dump());
                             MessageData assistantMsg;
                             assistantMsg.role          = "assistant";
-                            assistantMsg.content       = m_currentStreamBuffer;
+                            assistantMsg.content       = sanitizeAnswerText(m_currentStreamBuffer);
                             assistantMsg.reasoning     = m_currentReasoningBuffer;
                             assistantMsg.toolCallsJson = toolCallsJson;
                             attachResponseMetadata(assistantMsg);
@@ -3082,7 +3436,7 @@ void ChatBot::postApiRequest(const QJsonArray& messages, int seq, bool hasPdf) {
                         } else if (!m_currentStreamBuffer.isEmpty() || !m_currentReasoningBuffer.isEmpty() || !m_responseToolStates.isEmpty()) {
                             MessageData assistantMsg;
                             assistantMsg.role      = "assistant";
-                            assistantMsg.content   = m_currentStreamBuffer;
+                            assistantMsg.content   = sanitizeAnswerText(m_currentStreamBuffer);
                             assistantMsg.reasoning = m_currentReasoningBuffer;
                             attachResponseMetadata(assistantMsg);
                             currentMessages().append(assistantMsg);
@@ -3105,6 +3459,12 @@ void ChatBot::postApiRequest(const QJsonArray& messages, int seq, bool hasPdf) {
 
                 QJsonObject obj = doc.object();
                 if (obj["usage"].isObject()) recordApiUsage(obj["usage"].toObject());
+                // 原生会话标题只在请求了 title 的响应中解析（Chat Completions 的最后一个
+                // chunk 中的 choices[0].delta.title，或 Responses 的 response.completed 中的 response.title）。
+                if (reply->property("penmodsNativeTitleRequested").toBool()) {
+                    const QString nativeTitle = extractSessionTitle(obj);
+                    if (!nativeTitle.isEmpty()) applyNativeSessionTitle(nativeTitle);
+                }
                 if (usesResponsesApi()) {
                     const QString eventType = obj["type"].toString();
                     if (eventType == "response.output_text.delta") {
@@ -3267,7 +3627,7 @@ void ChatBot::postApiRequest(const QJsonArray& messages, int seq, bool hasPdf) {
                         if (!m_cancelled && !toolCallsJson.isEmpty() && toolCallsJson != "[]") {
                             MessageData assistantMsg;
                             assistantMsg.role          = "assistant";
-                            assistantMsg.content       = m_currentStreamBuffer;
+                            assistantMsg.content       = sanitizeAnswerText(m_currentStreamBuffer);
                             assistantMsg.reasoning     = m_currentReasoningBuffer;
                             assistantMsg.toolCallsJson = toolCallsJson;
                             assistantMsg.parts         = generatedImages;
@@ -3284,7 +3644,7 @@ void ChatBot::postApiRequest(const QJsonArray& messages, int seq, bool hasPdf) {
                         ) {
                             MessageData assistantMsg;
                             assistantMsg.role      = "assistant";
-                            assistantMsg.content   = m_currentStreamBuffer;
+                            assistantMsg.content   = sanitizeAnswerText(m_currentStreamBuffer);
                             assistantMsg.reasoning = m_currentReasoningBuffer;
                             assistantMsg.parts     = generatedImages;
                             attachResponseMetadata(assistantMsg);
@@ -3305,6 +3665,25 @@ void ChatBot::postApiRequest(const QJsonArray& messages, int seq, bool hasPdf) {
                     }
                     continue;
                 }
+                // DeepSeek/OpenAI 兼容端点在中途失败时会推一个 HTTP 200 + {"error":{...}} 的 chunk，
+                // 之后没有 [DONE]、choices 为空；不在这里处理就会静默变成“响应格式错误”。
+                if (obj.contains("error") && !obj["error"].isNull()) {
+                    QString reason = extractHttpErrorMessage(
+                        QJsonDocument(obj).toJson(QJsonDocument::Compact)
+                    );
+                    if (reason.isEmpty()) reason = QStringLiteral("响应未完成");
+                    if (m_serverToolCallActive) {
+                        emit toolCallProgress(QString("已完成：%1").arg(m_serverToolCallName), true);
+                        m_serverToolCallActive = false;
+                        m_serverToolCallName.clear();
+                    }
+                    flushEmbeddedContent();
+                    m_toolCallsBuffer.clear();
+                    emit errorOccurred("API 请求失败\n" + reason);
+                    finishStream(false);
+                    continue;
+                }
+
                 if (!obj.contains("choices") || !obj["choices"].isArray()) continue;
 
                 QJsonArray choices = obj["choices"].toArray();
@@ -3423,6 +3802,11 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
 
             QJsonObject obj = doc.object();
             if (obj["usage"].isObject()) recordApiUsage(obj["usage"].toObject());
+            // 原生会话标题：非流式在顶层 title / choices[0].message.title / response.title
+            if (reply->property("penmodsNativeTitleRequested").toBool()) {
+                const QString nativeTitle = extractSessionTitle(obj);
+                if (!nativeTitle.isEmpty()) applyNativeSessionTitle(nativeTitle);
+            }
             if (usesResponsesApi()) {
                 if (obj["status"].toString() != "completed") {
                     const QString detail = obj["error"].toObject()["message"].toString(
@@ -3444,7 +3828,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                 QString                    content         = responseOutputText(output);
                 QString                    reasoning       = responseOutputReasoning(output);
                 const EmbeddedContent      embedded        = splitEmbeddedContent(content);
-                content                                    = embedded.answer;
+                content                                    = sanitizeAnswerText(embedded.answer);
                 if (!embedded.reasoning.isEmpty()) {
                     if (!reasoning.isEmpty()) reasoning += "\n";
                     reasoning += embedded.reasoning;
@@ -3488,7 +3872,14 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                 return;
             }
             if (!obj.contains("choices") || !obj["choices"].isArray()) {
-                emit errorOccurred("API 响应格式错误：缺少 choices");
+                // 官方文档：生成中途失败时状态码仍是 200，响应体是 {"error":{...}}，没有 choices。
+                // 只有确实是错误体时才展示 API 的 message；否则仍给格式错误提示（不弹原始响应体）。
+                const bool hasErrorBody = obj.contains("error") || obj.contains("message") || obj.contains("detail");
+                const QString reason    = hasErrorBody ? extractHttpErrorMessage(response) : QString();
+                emit errorOccurred(
+                    reason.isEmpty() ? QStringLiteral("API 响应格式错误：缺少 choices")
+                                     : QStringLiteral("API 请求失败\n") + reason
+                );
                 reply->deleteLater();
                 return;
             }
@@ -3516,7 +3907,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                 MessageData   assistantMsg;
                 assistantMsg.role = "assistant";
                 if (!m_cancelled) {
-                    assistantMsg.content   = embedded.answer;
+                    assistantMsg.content   = sanitizeAnswerText(embedded.answer);
                     assistantMsg.reasoning = reasoning;
                 }
                 assistantMsg.toolCallsJson = toolCallsJson;
@@ -3530,7 +3921,7 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
                 }
                 dispatchToolCalls(toolCallsJson);
             } else if (message.contains("content") && message["content"].isString()) {
-                const QString content = embedded.answer;
+                const QString content = sanitizeAnswerText(embedded.answer);
                 if (!m_cancelled) {
                     MessageData assistantMsg;
                     assistantMsg.role      = "assistant";
@@ -3558,16 +3949,9 @@ void ChatBot::handleNetworkReply(QNetworkReply* reply, bool isStream) {
 
         int        httpStatus   = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         QByteArray responseBody = reply->readAll();
-        QString    detailMsg;
-        if (!responseBody.isEmpty()) {
-            QJsonDocument errDoc = QJsonDocument::fromJson(responseBody);
-            if (errDoc.isObject()) {
-                QJsonObject errObj = errDoc.object();
-                if (errObj.contains("error") && errObj["error"].isObject())
-                    detailMsg = errObj["error"].toObject()["message"].toString();
-            }
-            if (detailMsg.isEmpty()) detailMsg = QString::fromUtf8(responseBody).left(200);
-        }
+        // 错误体统一解析（error.message / error / message / detail），单行化并截断到 200 字；
+        // 解析不出来才退回截断后的原文，绝不把整段响应体弹给用户。
+        const QString detailMsg = extractHttpErrorMessage(responseBody);
 
         QString suggestion;
         if (httpStatus == 401 || httpStatus == 403) suggestion = "API 密钥无效或已过期";
@@ -3647,7 +4031,10 @@ void ChatBot::applyEditedMessage(
             if (part.type != "text") parts.append(part);
         }
         QStringList   failedFiles;
-        const QString fileContext = buildFileContext(parts, &failedFiles);
+        QStringList   binaryFiles;
+        const QString fileContext = buildFileContext(parts, failedFiles, binaryFiles);
+        if (!binaryFiles.isEmpty())
+            showToast(QString("%1 个附件不是有效的 UTF-8 文本，未发送").arg(binaryFiles.size()).toStdString());
         if (!failedFiles.isEmpty()) {
             warn("编辑附件未发送给模型: {}", failedFiles.join("、").toStdString());
             showToast(QString("%1 个附件未发送，请检查权限或大小").arg(failedFiles.size()).toStdString());
@@ -3703,8 +4090,9 @@ void ChatBot::applyEditedMessage(
 
     const bool hadImage =
         std::any_of(parts.cbegin(), parts.cend(), [](const MessagePart& part) { return part.type == "image_url"; });
-    const bool hasAnyAttachment = std::any_of(parts.cbegin(), parts.cend(), [](const MessagePart& part) {
-        return part.type == "image_url" || part.type == "file" || part.type == "input_audio";
+    const bool hasAnyAttachment = std::any_of(parts.cbegin(), parts.cend(), [this](const MessagePart& part) {
+        return (part.type == "text" && !part.text.isEmpty()) || part.type == "image_url" || isPdfPart(part)
+            || (part.type == "input_audio" && getCapAudio() && !usesResponsesApi());
     });
     // 文字与附件都空：拒绝（编辑里“全删”等于删除消息，不走该接口）。
     if (newContent.trimmed().isEmpty() && !hasAnyAttachment) {
@@ -4178,7 +4566,7 @@ json emptyModelTemplate() {
     model["reasoningEffort"]         = "";
     model["nativeWebSearchEnabled"]  = false;
     model["nativeWebSearchProvider"] = "auto";
-    model["deepseekAdapter"]          = false;
+    model["deepseekAdapter"]         = false;
     model["capabilities"]            = json{
         {"text",            true },
         {"vision",          false},
@@ -4187,7 +4575,11 @@ json emptyModelTemplate() {
         {"reasoning",       false},
         {"imageGeneration", false},
         {"pdf",             false},
-        {"fileParsing",     false}
+        {"nativeWebTools",  false},
+        {"fileParsing",     false},
+        {"readUrl",         false},
+        {"sessionTitle",    false},
+        {"metaMarker",      false}
     };
     model["extraParams"]        = json::object();
     model["proxyVisionModelId"] = "";
@@ -4265,13 +4657,20 @@ void ChatBot::initModels() {
         defaultModel["reasoningEffort"]         = "";
         defaultModel["nativeWebSearchEnabled"]  = false;
         defaultModel["nativeWebSearchProvider"] = "auto";
+        defaultModel["deepseekAdapter"]         = false;
         defaultModel["capabilities"]            = json{
             {"text",            true },
             {"vision",          false},
             {"audio",           false},
             {"toolCall",        false},
             {"reasoning",       false},
-            {"imageGeneration", false}
+            {"imageGeneration", false},
+            {"pdf",             false},
+            {"nativeWebTools",  false},
+            {"fileParsing",     false},
+            {"readUrl",         false},
+            {"sessionTitle",    false},
+            {"metaMarker",      false}
         };
         defaultModel["extraParams"]        = json::object();
         defaultModel["proxyVisionModelId"] = "";
@@ -4347,6 +4746,8 @@ json ChatBot::normalizeModel(const json& raw, const std::string& fallbackId, std
         webSearchProvider        = webSearchProviders.count(legacy) ? legacy : "auto";
     }
     out["nativeWebSearchProvider"] = webSearchProvider;
+    // DeepSeek 官方 API 适配开关。只做布尔归一化（缺字段/false），
+    // “是否真的生效”统一由 deepseekAdapterActive()（开关 + 官方域名）判定。
     out["deepseekAdapter"] = readBool(raw, "deepseekAdapter", false);
 
     // capabilities：object（当前格式）/ 字符串数组（旧格式“支持的能力名列表”）/ 缺失
@@ -4365,7 +4766,12 @@ json ChatBot::normalizeModel(const json& raw, const std::string& fallbackId, std
     capOut["reasoning"]       = readBool(caps, "reasoning", false);
     capOut["imageGeneration"] = readBool(caps, "imageGeneration", false);
     capOut["pdf"]             = readBool(caps, "pdf", false);
-    capOut["fileParsing"]     = readBool(caps, "fileParsing", false);
+    // DeepSeek 适配专用能力：旧配置缺字段时一律 false（不会因此判成非法模型）
+    capOut["nativeWebTools"] = readBool(caps, "nativeWebTools", false);
+    capOut["fileParsing"]    = readBool(caps, "fileParsing", false);
+    capOut["readUrl"]        = readBool(caps, "readUrl", false);
+    capOut["sessionTitle"]   = readBool(caps, "sessionTitle", false);
+    capOut["metaMarker"]     = readBool(caps, "metaMarker", false);
     // 未知能力字段原样保留（前向兼容）
     for (auto it = caps.begin(); it != caps.end(); ++it)
         if (!capOut.contains(it.key())) capOut[it.key()] = it.value();
@@ -4458,6 +4864,9 @@ void ChatBot::applyModelConfig(const json& modelObj) {
     m_nativeWebSearchProvider = QString::fromStdString(readString(modelObj, "nativeWebSearchProvider", "auto"));
     if (!webSearchProviders.contains(m_nativeWebSearchProvider)) m_nativeWebSearchProvider = "auto";
 
+    // DeepSeek 官方 API 适配：旧配置没有这些键时必须落到 false，不能把旧模型判成非法或被当成已适配
+    m_deepseekAdapter = readBool(modelObj, "deepseekAdapter", false);
+
     const QString oldProxyVisionModelId = m_proxyVisionModelId;
     const QString oldProxyVisionPrompt  = m_proxyVisionPrompt;
     m_proxyVisionModelId                = QString::fromStdString(readString(modelObj, "proxyVisionModelId", ""));
@@ -4470,8 +4879,11 @@ void ChatBot::applyModelConfig(const json& modelObj) {
     m_capReasoning       = false;
     m_capImageGeneration = false;
     m_capPdf             = false;
-    m_deepseekAdapter    = readBool(modelObj, "deepseekAdapter", false);
+    m_capNativeWebTools  = false;
     m_capFileParsing     = false;
+    m_capReadUrl         = false;
+    m_capSessionTitle    = false;
+    m_capMetaMarker      = false;
     if (containsKey(modelObj, "capabilities") && modelObj["capabilities"].is_object()) {
         const auto& cap      = modelObj["capabilities"];
         m_capText            = readBool(cap, "text", true);
@@ -4481,7 +4893,12 @@ void ChatBot::applyModelConfig(const json& modelObj) {
         m_capReasoning       = readBool(cap, "reasoning", false);
         m_capImageGeneration = readBool(cap, "imageGeneration", false);
         m_capPdf             = readBool(cap, "pdf", false);
-        m_capFileParsing     = readBool(cap, "fileParsing", false);
+        // DeepSeek 适配的五个能力：缺字段一律 false
+        m_capNativeWebTools = readBool(cap, "nativeWebTools", false);
+        m_capFileParsing    = readBool(cap, "fileParsing", false);
+        m_capReadUrl        = readBool(cap, "readUrl", false);
+        m_capSessionTitle   = readBool(cap, "sessionTitle", false);
+        m_capMetaMarker     = readBool(cap, "metaMarker", false);
     }
     emit activeModelCapabilitiesChanged();
     if (oldProxyVisionModelId != m_proxyVisionModelId || oldProxyVisionPrompt != m_proxyVisionPrompt)
@@ -4522,6 +4939,10 @@ QString ChatBot::getModelSummaries() {
         capabilities["imageGeneration"] = readBool(cap, "imageGeneration", false);
         capabilities["pdf"]             = readBool(cap, "pdf", false);
         capabilities["fileParsing"]     = readBool(cap, "fileParsing", false);
+        capabilities["nativeWebTools"]  = readBool(cap, "nativeWebTools", false);
+        capabilities["readUrl"]         = readBool(cap, "readUrl", false);
+        capabilities["sessionTitle"]    = readBool(cap, "sessionTitle", false);
+        capabilities["metaMarker"]      = readBool(cap, "metaMarker", false);
         list.push_back(
             json{
                 {"id", id},
@@ -4530,6 +4951,7 @@ QString ChatBot::getModelSummaries() {
                 {"modelId", readString(model, "modelId", "")},
                 {"endpoint", readString(model, "endpoint", "")},
                 {"apiProtocol", readString(model, "apiProtocol", "chat_completions")},
+                {"deepseekAdapter", readBool(model, "deepseekAdapter", false)},
                 {"apiKeySet", !readString(model, "apiKey", "").empty()},
                 {"isActive", id == activeId},
                 {"hasWarning", m_modelWarnings.contains(QString::fromStdString(id))},
@@ -4649,8 +5071,8 @@ bool ChatBot::addModel(const QString& modelJson) {
     if (containsKey(raw, "capabilities")) {
         json caps = raw["capabilities"];
         if (updating && caps.is_object()) {
-            // Model editors predating PDF support don't submit these keys.
-            for (const char* key : {"pdf", "fileParsing"}) {
+            // Unsubmitted capabilities retain their prior values for older model editors.
+            for (const char* key : {"pdf", "fileParsing", "nativeWebTools", "readUrl", "sessionTitle", "metaMarker"}) {
                 if (!caps.contains(key)) caps[key] = readBool((*existing)["capabilities"], key, false);
             }
         }
@@ -4975,7 +5397,15 @@ void ChatBot::setAutoTitleConfig(const char* key, const json& value) {
 }
 
 void ChatBot::setAutoTitleEnabled(bool enabled) { setAutoTitleConfig("enabled", enabled); }
-void ChatBot::setAutoTitleModelId(const QString& id) { setAutoTitleConfig("modelId", id.toStdString()); }
+void ChatBot::setAutoTitleModelId(const QString& id) {
+    // 原生标题生效期间“标题模型”被冻结为 DeepSeek 原生：这里直接忽略写入，
+    // 保证解冻后 ai.auto_title.modelId 仍是用户原来的选择（不是被冻结期覆盖的值）。
+    if (getDeepseekSessionTitleActive()) {
+        info("忽略标题模型修改：当前由 DeepSeek 原生标题接管（保留原选择）");
+        return;
+    }
+    setAutoTitleConfig("modelId", id.toStdString());
+}
 void ChatBot::setAutoTitleFrequency(int frequency) { setAutoTitleConfig("frequency", frequency == 3 ? 3 : 0); }
 
 void ChatBot::cancelTitleRequest() {
@@ -5008,6 +5438,27 @@ void ChatBot::completedRound() {
     session.completedUserIds.insert(userId);
     session.lastCompletedUserId = userId;
     ++session.completedRounds;
+
+    // 原生标题兜底：官方指南建议“响应不带标题时自行兜底，例如取用户消息的前若干字符”。
+    // 只在确实请求过原生标题、且服务端没给标题的会话上做一次（有标题 / 手动改名都不覆盖）。
+    const auto sessionId = m_currentSessionId;
+    if (getDeepseekSessionTitleActive() && m_nativeTitleRequested.contains(sessionId)
+        && (isPlaceholderSessionTitle(session.title) || session.previewTitle) && !session.manualTitle) {
+        // 只用用户正文：附件上下文（parts 里的 text 段）是“用户引用了以下文件…”这类机器文本，
+        // 拿来当标题没有意义。
+        for (const auto& message : session.messages) {
+            if (message.role != "user") continue;
+            const QString text = message.content.simplified();
+            if (text.isEmpty()) continue;
+            session.title        = text.left(16);
+            // 兜底标题也是预览性质（官方指南："响应不一定带标题，请自行兜底"）。
+            session.previewTitle = true;
+            session.updatedAt    = QDateTime::currentDateTime().toString(Qt::ISODate);
+            emit sessionsChanged();
+            break;
+        }
+    }
+
     saveSessions();
     const auto id  = m_currentSessionId;
     const int  seq = m_requestSeq;
@@ -5020,6 +5471,12 @@ void ChatBot::requestAutoTitle(const QString& sessionId, int requestSeq) {
     if (requestSeq != m_requestSeq || sessionId != m_currentSessionId || !m_sessions.contains(sessionId)
         || !getAutoTitleEnabled() || m_cancelled)
         return;
+    // 标题模型“冻结为 DeepSeek 原生标题”：没有独立标题接口，原生标题由对话请求里的
+    // title 开关顺带生成（见 makeApiRequest / applyNativeSessionTitle），所以这里不再单独发请求。
+    if (getDeepseekSessionTitleActive()) {
+        info("Auto-title skipped: DeepSeek native title handles this session (session={})", sessionId.toStdString());
+        return;
+    }
     auto&     session   = m_sessions[sessionId];
     const int round     = session.completedRounds;
     const int frequency = getAutoTitleFrequency();
@@ -5237,10 +5694,9 @@ bool ChatBot::switchSession(const QString& sessionId) {
     }
 
     cancelTitleRequest();
-    if (m_sessions.contains(m_currentSessionId) && currentMessages().isEmpty()) {
-        m_observedMessages.remove(m_currentSessionId);
-        m_sessions.remove(m_currentSessionId);
-    }
+    // 不在这里丢弃"空"的旧会话：空会话不写索引，一旦它离开 m_sessions，紧随其后的
+    // saveSessions() 就会把它的磁盘文件当成孤儿删掉——表现就是点一下历史记录、上一段对话
+    // 消失。空会话只能在用户显式删除时清理。
     m_currentSessionId = sessionId;
     saveSessions();
     emit messagesChanged();
@@ -5310,9 +5766,14 @@ bool ChatBot::deleteSession(const QString& sessionId) {
 bool ChatBot::setSessionPreviewTitle(const QString& sessionId, const QString& newTitle) {
     if (!m_sessions.contains(sessionId) || newTitle.trimmed().isEmpty()) return false;
     auto& session = m_sessions[sessionId];
-    if (session.manualTitle || !session.title.startsWith("新对话")) return false;
-    session.title     = newTitle.trimmed();
-    session.updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+    // 只覆盖"还没标题"的会话：手动改名（manualTitle）和已经兜过预览串的都不再改。
+    if (session.manualTitle || !isPlaceholderSessionTitle(session.title)) return false;
+    session.title        = newTitle.trimmed();
+    // 标记成预览：DeepSeek 原生标题回来时必须能覆盖它。以前没有这个标记，
+    // 于是响应里的标题被 applyNativeSessionTitle() 的"已有标题就不覆盖"判成已存在 ——
+    // 真机上就是"开与不开没区别"（列表里永远是发送时那句用户原话）。
+    session.previewTitle = true;
+    session.updatedAt    = QDateTime::currentDateTime().toString(Qt::ISODate);
     saveSessions();
     emit sessionsChanged();
     return true;
@@ -5440,7 +5901,75 @@ bool ChatBot::searchConfigured() const {
     return false;
 }
 
-bool ChatBot::getNativeSearchActive() const { return usesResponsesApi() && m_nativeWebSearchEnabled; }
+bool ChatBot::getNativeSearchActive() const {
+    // DeepSeek 原生联网工具同样接管上层搜索服务：开启后上层「搜索服务」冻结为「DeepSeek 原生」，
+    // 用户原来的 provider 选择只保留在配置里、不做任何改写，所以切回别的模型或关掉该能力就自动解冻。
+    // 适配生效时只认“模型原生联网工具”这一个开关，避免残留的 nativeWebSearchEnabled 造成假冻结。
+    if (deepseekAdapterActive()) return m_capNativeWebTools;
+    return usesResponsesApi() && m_nativeWebSearchEnabled;
+}
+
+// -----------------------------------------------------------------------
+// DeepSeek 官方 API 适配
+// -----------------------------------------------------------------------
+
+bool ChatBot::deepseekAdapterActive() const {
+    // 唯一判定点：模型开了适配开关 **且** endpoint 指向官方域名。
+    // 域名是硬门槛——中转/第三方端点收到 DeepSeek 专有字段会直接 400。
+    return m_deepseekAdapter && isOfficialHttps(QUrl(m_apiEndpoint), QStringLiteral("api.deepseek.com"));
+}
+
+bool ChatBot::getDeepseekAdapterActive() const { return deepseekAdapterActive(); }
+bool ChatBot::getDeepseekWebToolsActive() const { return deepseekAdapterActive() && m_capNativeWebTools; }
+bool ChatBot::getDeepseekSessionTitleActive() const { return deepseekAdapterActive() && m_capSessionTitle; }
+bool ChatBot::getFileParsingActive() const { return deepseekAdapterActive() && m_capFileParsing; }
+
+bool ChatBot::deepseekCitationStrippingActive() const {
+    // 只有联网工具/阅读链接的回答才需要剥内联角标；普通模型（含数学、数组内容）行为保持不变。
+    return deepseekAdapterActive() && (m_capNativeWebTools || m_capReadUrl);
+}
+
+QString ChatBot::sanitizeAnswerText(const QString& text) const {
+    if (text.isEmpty() || !deepseekCitationStrippingActive()) return text;
+    return stripInlineCitationMarkers(text);
+}
+
+bool ChatBot::nativeTitleRequestWanted() const {
+    if (!getDeepseekSessionTitleActive()) return false;
+    // 「会话标题」这个模型能力开关本身就是授权，不再要求外层 ai.auto_title.enabled：
+    // 后者默认是 false（见 Config 默认值），再要求它等于让原生标题默认永远静默 ——
+    // 真机反馈"开了没区别"的一半原因就是这个。冻结语义也没变：原生标题生效期间
+    // requestAutoTitle() 会跳过本会话，不需要外层开关来"关掉"本地标题模型。
+    // 官方文档核对（2026-11-22）：请求体是 "title": {"enabled": true}，
+    // Chat Completions 流式取最后一个 chunk 的 choices[0].delta.title、非流式取
+    // choices[0].message.title；Responses/Messages 取顶层 title 或 response.title ——
+    // 与本文件的 extractSessionTitle() 一致。
+    if (!m_sessions.contains(m_currentSessionId)) return false;
+    const auto& session = m_sessions[m_currentSessionId];
+    if (session.manualTitle || session.completedRounds > 0
+        || (!session.previewTitle && !isPlaceholderSessionTitle(session.title)))
+        return false;
+    // 官方建议只在会话第一次请求上开启 title（响应最多多等 5 秒），每个会话只发一次。
+    return !m_nativeTitleRequested.contains(m_currentSessionId);
+}
+
+void ChatBot::applyNativeSessionTitle(const QString& title) {
+    const QString value = title.simplified();
+    if (value.isEmpty() || value.size() > 80 || value.contains("data:", Qt::CaseInsensitive)) return;
+    if (!m_sessions.contains(m_currentSessionId)) return;
+    auto& session = m_sessions[m_currentSessionId];
+    // 手动改名优先，与本地自动标题同样的保护；已经有真实标题也不覆盖。
+    // 但"发送时用用户原话兜出来的预览标题"必须能被覆盖：那条预览串在请求发出时就写进
+    // session.title 了，而原生标题要等响应回来，否则这里永远判定"已有标题"而丢弃。
+    if (session.manualTitle) return;
+    if (!isPlaceholderSessionTitle(session.title) && !session.previewTitle) return;
+    session.previewTitle = false;
+    session.title     = value.left(32);
+    session.updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+    saveSessions();
+    emit sessionsChanged();
+    info("已应用 DeepSeek 原生会话标题: {}", session.title.toStdString());
+}
 
 void ChatBot::setNativeSearchEnabled(bool v) {
     if (m_nativeSearchEnabled == v) return;
@@ -5460,6 +5989,12 @@ QString ChatBot::effectiveSearchKey() const {
 }
 
 void ChatBot::setSearchProvider(const QString& provider) {
+    // 上层「搜索服务」被模型原生联网工具冻结期间忽略切换（UI 也不可点选），
+    // 这样解冻后 ai.search.provider 仍是用户原来的选择，不需要备份/还原。
+    if (getDeepseekWebToolsActive()) {
+        info("忽略搜索服务切换：当前由 DeepSeek 原生联网工具接管（保留原选择）");
+        return;
+    }
     const QString p = (provider == "tavily" || provider == "deepseek") ? provider : "off";
     if (m_searchProvider == p) return;
     m_searchProvider = p;
@@ -5564,14 +6099,35 @@ void ChatBot::setTavilyConfig(const QString& configJson) {
 void ChatBot::injectToolDefinitions(QJsonObject& requestBody) {
     QJsonArray tools;
 
-    if (usesResponsesApi() && m_capImageGeneration)
+    const bool deepseekAdapter = deepseekAdapterActive();
+    // Anthropic Messages 兼容端点的服务端工具必须显式带 name（官方指南）
+    const bool anthropic = m_apiEndpoint.contains(QStringLiteral("/messages"), Qt::CaseInsensitive);
+
+    if (deepseekAdapter && m_capNativeWebTools && m_nativeSearchEnabled) {
+        QJsonObject tool{
+            {"type", QStringLiteral("deepseek_web_search")}
+        };
+        if (anthropic) tool["name"] = QStringLiteral("deepseek_web_search");
+        tools.append(tool);
+    }
+
+    if (deepseekAdapter && m_capReadUrl) {
+        QJsonObject tool{
+            {"type", QStringLiteral("deepseek_read_url")}
+        };
+        if (anthropic) tool["name"] = QStringLiteral("deepseek_read_url");
+        tools.append(tool);
+    }
+
+    // 服务端工具互斥：DeepSeek 原生工具存在时不能再声明 web_search / image_generation（官方会 400）
+    if (!deepseekAdapter && usesResponsesApi() && m_capImageGeneration)
         tools.append(
             QJsonObject{
                 {"type", "image_generation"}
         }
         );
 
-    if (getNativeSearchActive() && m_nativeSearchEnabled)
+    if (!deepseekAdapter && getNativeSearchActive() && m_nativeSearchEnabled)
         tools.append(
             QJsonObject{
                 {"type", "web_search"}

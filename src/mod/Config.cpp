@@ -140,7 +140,8 @@ Config::Config() : Logger("Config") {
             {"low_voice", false},
             {"no_auto_pron", false},
             {"fast_hide_music", false},
-            {"fast_mute", false}
+            {"fast_mute", false},
+            {"boot_mute", false}
         }},
         {"serv", {
             {"ssh_autorun", false},
@@ -176,6 +177,9 @@ Config::Config() : Logger("Config") {
         }},
         {"ai", {
             {"auto_send_scan", true},
+            // 扫描结束后的默认行为：send / input / capture / off
+            // （auto_send_scan 仅作为旧版回退兼容字段继续写，见 KeyBoard::setScanBehavior）
+            {"scan_behavior", "send"},
             {"speech_assistant", false},
             {"streaming", true},
             {"bubble_render_mode", "full"},
@@ -193,13 +197,19 @@ Config::Config() : Logger("Config") {
                     {"reasoningEffort", ""},
                     {"nativeWebSearchEnabled", false},
                     {"nativeWebSearchProvider", "auto"},
+                    {"deepseekAdapter", false},
                     {"capabilities", json{
                         {"text",      true},
                         {"vision",    false},
                         {"audio",     false},
                         {"toolCall",  false},
                         {"reasoning",       false},
-                        {"imageGeneration", false}
+                        {"imageGeneration", false},
+                        {"nativeWebTools",  false},
+                        {"fileParsing",     false},
+                        {"readUrl",         false},
+                        {"sessionTitle",    false},
+                        {"metaMarker",      false}
                     }},
                     {"extraParams", ""},
                     {"proxyVisionModelId", ""},
@@ -220,6 +230,20 @@ Config::Config() : Logger("Config") {
                 }
             })},
             {"activePromptId", "default"},
+            // 需求 10：DeepSeek 语音识别接管。
+            //   enabled           接管开关（默认关闭；关闭时不装任何 hook，行为与原生一致）
+            //   deepseek_api_key  本页专用 key；为空时依次回退到 ai.search.deepseek_api_key
+            //                     和当前活动模型（且其 endpoint 指向 api.deepseek.com）的 apiKey
+            //   model             仅作记录，接口路径固定是 /v1/tools/asr
+            //   timeout_ms        单次识别等待上限
+            //   max_record_ms     单次采集上限（DeepSeek 接口本身限制 120 秒）
+            {"asr", {
+                {"enabled", false},
+                {"deepseek_api_key", ""},
+                {"model", "deepseek-asr"},
+                {"timeout_ms", 20000},
+                {"max_record_ms", 45000}
+            }},
             {"search", {
                 {"provider", "off"},
                 {"enabled", false},
@@ -408,6 +432,9 @@ bool Config::_load() {
     }
     mData                       = std::move(tmp);
     const bool legacyAiUpgraded = _upgrade_legacy_ai_defaults(mData);
+    // ai.auto_send_scan(bool) → ai.scan_behavior(string)。必须在
+    // _fill_missing_defaults 之前跑：默认值一旦先写进去，老的"关闭"状态会被抹成 send。
+    const bool scanBehaviorUpgraded = _upgrade_scan_behavior(mData);
     // Older capture defaults exported both native representations of the same scan.
     // Migrate once; an explicit full-image choice made afterwards must survive restarts.
     bool captureCropUpgraded = false;
@@ -420,11 +447,29 @@ bool Config::_load() {
         capture["region_defaults_version"] = 1;
         captureCropUpgraded = true;
     }
-    if (_fill_missing_defaults(mData, mDefaults) || legacyAiUpgraded || captureCropUpgraded) {
+    if (_fill_missing_defaults(mData, mDefaults) || legacyAiUpgraded || captureCropUpgraded
+        || scanBehaviorUpgraded) {
         info("Filling missing default keys, saving...");
         _save();
     }
     info("Successfully loaded configuration.");
+    return true;
+}
+
+// 「扫描结果快速发送」布尔开关升级为四态「默认扫描行为」。
+// 老配置只有 auto_send_scan：true → send，false → off。已经存在 scan_behavior 的配置
+// 一律不碰（用户在新版里选过 input/capture 之后不能因为老字段被改回去）。
+bool Config::_upgrade_scan_behavior(json& data) {
+    if (!data.contains("ai") || !data["ai"].is_object()) return false;
+    auto& ai = data["ai"];
+    if (ai.contains("scan_behavior") && ai["scan_behavior"].is_string()) return false;
+
+    std::string behavior = "send";
+    if (ai.contains("auto_send_scan") && ai["auto_send_scan"].is_boolean()) {
+        behavior = ai["auto_send_scan"].get<bool>() ? "send" : "off";
+    }
+    ai["scan_behavior"] = behavior;
+    info("扫描结果处理方式已迁移为 scan_behavior={}", behavior);
     return true;
 }
 

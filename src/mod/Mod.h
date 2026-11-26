@@ -23,6 +23,7 @@ class Mod : public QObject, public Singleton<Mod> {
     Q_PROPERTY(QString buildInfo READ getBuildInfoStr NOTIFY buildInfoChanged)
     Q_PROPERTY(bool voiceChatEnabled READ getVoiceChatEnabled WRITE setVoiceChatEnabled NOTIFY voiceChatEnabledChanged)
     Q_PROPERTY(QString pendingVoiceChatText READ getPendingVoiceChatText WRITE setPendingVoiceChatText NOTIFY pendingVoiceChatTextChanged)
+    Q_PROPERTY(QString pendingAiFollowupContext READ getPendingAiFollowupContext WRITE setPendingAiFollowupContext NOTIFY pendingAiFollowupContextChanged)
     Q_PROPERTY(bool applicationRestartPending READ isApplicationRestartPending NOTIFY applicationRestartPendingChanged)
 
 public:
@@ -32,6 +33,7 @@ public:
     Q_SIGNAL void buildInfoChanged();
     Q_SIGNAL void voiceChatEnabledChanged();
     Q_SIGNAL void pendingVoiceChatTextChanged();
+    Q_SIGNAL void pendingAiFollowupContextChanged();
     Q_SIGNAL void applicationRestartPendingChanged();
 
     void onUiCompleted() const;
@@ -67,6 +69,10 @@ public:
     void setVoiceChatEnabled(bool enabled);
     QString getPendingVoiceChatText() const;
     void setPendingVoiceChatText(const QString& text);
+    /// 词典页"追问AI"跳转时携带的上下文（JSON 字符串，纯内存、不落盘）。
+    /// 只由 YDictPage.qml 写入、ChatAssistant.qml 一次性取走；取走后清空。
+    QString getPendingAiFollowupContext() const;
+    void setPendingAiFollowupContext(const QString& context);
 
 private:
     friend Singleton<Mod>;
@@ -78,6 +84,7 @@ private:
     std::string mClassName        = "mod";
     bool        mVoiceChatEnabled = false;
     QString     mPendingVoiceChatText;
+    QString     mPendingAiFollowupContext;
     bool        mApplicationRestartPending = false;
 };
 

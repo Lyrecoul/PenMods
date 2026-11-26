@@ -67,6 +67,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.build_player && 90 || 45 }}
     container:
       image: archlinux:latest
 
@@ -76,9 +77,12 @@ jobs:
           pacman -Syu --noconfirm
           # unzip/perl 只有构建内嵌播放器插件时才会用到（openssl3 是 zip 包、OpenSSL 用 perl），
           # 但装在容器里成本几乎为零，手动构建时不必再来一次 "no extractor found"
+          # python-pip/python-setuptools/python-wheel 让 xmake-repo 的 python/fetch.lua 直接复用系统 python3，
+          # 避免从源码编 python（开启 PGO 的 CPython 在容器里会卡死或失败，从而连带卡死配置）
           pacman -S --noconfirm \
             base-devel git zig wget curl \
-            python3 ninja cmake nasm libxcrypt lame opencc qt5-tools qt5-base qt6-declarative \
+            python3 python-pip python-setuptools python-wheel \
+            ninja cmake nasm libxcrypt lame opencc qt5-tools qt5-base qt6-declarative \
             unzip perl openssl python-certifi
 
       - name: 安装 aarch64-linux-gnu 工具链
@@ -172,6 +176,8 @@ jobs:
           sed -i \
             's|format("COMMAND\\n      %s/bin/opencc_dict", path.unix(package:dep("opencc"):installdir()))|"COMMAND\\n      /bin/opencc_dict"|g' \
             ~/.xmake/repositories/xmake-repo/packages/o/opencc/xmake.lua
+          # 兜底：若需要从源码回退编 python（例如手动开启 build_player 且命中特定版本要求），去掉易在容器内挂起/失败的 PGO
+          sed -i 's|, "--enable-optimizations"||g' ~/.xmake/repositories/xmake-repo/packages/p/python/xmake.lua
           xmake f \
             --qt="${{ env.QT_DIR }}" \
             --arch=arm64-v8a \
